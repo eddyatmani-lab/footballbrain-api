@@ -241,6 +241,26 @@ app.get("/leagues", async (req, res) => {
     });
   }
 });
+app.get("/status", async (req, res) => {
+  try {
+    const response = await axios.get(
+      "https://v3.football.api-sports.io/status",
+      {
+        headers: {
+          "x-apisports-key":
+            process.env.API_FOOTBALL_KEY,
+        },
+      }
+    );
+
+    res.json(response.data);
+  } catch (error) {
+    res.json(
+      error.response?.data ||
+      error.message
+    );
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
