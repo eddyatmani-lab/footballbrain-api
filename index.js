@@ -227,6 +227,20 @@ app.get("/fixtures-test", async (req, res) => {
     );
   }
 });
+app.get("/leagues", async (req, res) => {
+  try {
+    const response = await callApiFootball("/leagues");
+
+    res.json({
+      count: response.data.response.length,
+      data: response.data.response.slice(0, 20),
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error.response?.data || error.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
