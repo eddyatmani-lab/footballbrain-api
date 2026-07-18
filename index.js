@@ -371,11 +371,12 @@ app.get("/internal/match/:fixtureId/context", async (req, res) => {
     const awayTeamId = fixture.teams?.away?.id;
 
     const [
-      homeStatsResponse,
-      awayStatsResponse,
-      homeRecentResponse,
-      awayRecentResponse,
-    ] = await Promise.all([
+  homeStatsResponse,
+  awayStatsResponse,
+  homeRecentResponse,
+  awayRecentResponse,
+  h2hResponse,
+] = await Promise.all([
       callApiFootball("/teams/statistics", {
         league: leagueId,
         season,
@@ -399,7 +400,13 @@ app.get("/internal/match/:fixtureId/context", async (req, res) => {
         last: 5,
         timezone: "Europe/Paris",
       }),
-    ]);
+    callApiFootball("/fixtures/headtohead", {
+  h2h: `${homeTeamId}-${awayTeamId}`,
+  last: 10,
+  timezone: "Europe/Paris",
+}),
+
+      ]);
 
     function simplifyRecentMatch(item, teamId) {
       const isHome = item.teams?.home?.id === teamId;
@@ -439,7 +446,29 @@ app.get("/internal/match/:fixtureId/context", async (req, res) => {
 
     const awayRecentMatches =
       awayRecentResponse.data?.response || [];
+const h2hMatches =
+  h2hResponse.data?.response || [];
 
+const headToHead = h2hMatches.map((item) => ({
+  fixtureId: item.fixture?.id,
+  date: item.fixture?.date,
+  competition: item.league?.name,
+
+  homeTeam: {
+    id: item.teams?.home?.id,
+    name: item.teams?.home?.name,
+  },
+
+  awayTeam: {
+    id: item.teams?.away?.id,
+    name: item.teams?.away?.name,
+  },
+
+  goals: {
+    home: item.goals?.home,
+    away: item.goals?.away,
+  },
+}));
     return res.json({
       ok: true,
 
@@ -465,7 +494,8 @@ app.get("/internal/match/:fixtureId/context", async (req, res) => {
         awayRecentForm: awayRecentMatches.map((item) =>
           simplifyRecentMatch(item, awayTeamId)
         ),
-      },
+     headToHead,
+ },
     });
   } catch (error) {
     return res.status(error.response?.status || 500).json({
