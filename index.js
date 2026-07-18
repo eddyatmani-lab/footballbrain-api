@@ -581,7 +581,9 @@ const homeRecentForm =
 
 const awayRecentForm =
   awayRecentResponse.data?.response || [];
+const rawOdds = oddsResponse.data?.response || [];
 
+const market = summarizeMatchWinnerOdds(rawOdds);
 const footballBrain = computeFootballBrainScore(
   homeRecentForm.map((m) => ({
     result:
@@ -614,8 +616,7 @@ const result = {
     awayRecentForm,
     headToHead: h2hResponse.data?.response || [],
     odds: {
-      count: oddsResponse.data?.results || 0,
-      data: oddsResponse.data?.response || [],
+      market,
     },
     footballBrain,
   },
@@ -663,6 +664,67 @@ function computeFootballBrainScore(
     homeScore,
     awayScore,
     advantage: homeScore - awayScore,
+  };
+}
+function summarizeMatchWinnerOdds(oddsData) {
+  const homeOdds = [];
+  const drawOdds = [];
+  const awayOdds = [];
+
+  for (const fixtureOdds of oddsData) {
+    for (const bookmaker of fixtureOdds.bookmakers || []) {
+      const matchWinner = (bookmaker.bets || []).find(
+        (bet) => bet.name === "Match Winner"
+      );
+
+      if (!matchWinner) continue;
+
+      for (const item of matchWinner.values || []) {
+        const odd = Number(item.odd);
+
+        if (!Number.isFinite(odd)) continue;
+
+        if (item.value === "Home") homeOdds.push(odd);
+        if (item.value === "Draw") drawOdds.push(odd);
+        if (item.value === "Away") awayOdds.push(odd);
+      }
+    }
+  }
+
+  const average = (values) => {
+    if (values.length === 0) return null;
+
+    return Number(
+      (
+        values.reduce((sum, value) => sum + value, 0) /
+        values.length
+      ).toFixed(2)
+    );
+  };
+
+  const home = average(homeOdds);
+  const draw = average(drawOdds);
+  const away = average(awayOdds);
+
+  const availableOdds = [
+    { key: "home", odd: home },
+    { key: "draw", odd: draw },
+    { key: "away", odd: away },
+  ].filter((item) => item.odd !== null);
+
+  const favorite =
+    availableOdds.length > 0
+      ? availableOdds.reduce((best, current) =>
+          current.odd < best.odd ? current : best
+        ).key
+      : null;
+
+  return {
+    homeAverageOdd: home,
+    drawAverageOdd: draw,
+    awayAverageOdd: away,
+    marketFavorite: favorite,
+    bookmakersUsed: homeOdds.length,
   };
 }
 app.listen(PORT, () => {
