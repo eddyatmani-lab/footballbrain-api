@@ -563,7 +563,30 @@ app.get("/internal/analyze/:fixtureId", async (req, res) => {
         fixture: fixtureId,
       }),
     ]);
+const homeRecentForm =
+  homeRecentResponse.data?.response || [];
 
+const awayRecentForm =
+  awayRecentResponse.data?.response || [];
+
+const footballBrain = computeFootballBrainScore(
+  homeRecentForm.map((m) => ({
+    result:
+      m.teams.home.id === homeTeamId
+        ? (m.goals.home > m.goals.away ? "W" :
+           m.goals.home < m.goals.away ? "L" : "D")
+        : (m.goals.away > m.goals.home ? "W" :
+           m.goals.away < m.goals.home ? "L" : "D"),
+  })),
+  awayRecentForm.map((m) => ({
+    result:
+      m.teams.home.id === awayTeamId
+        ? (m.goals.home > m.goals.away ? "W" :
+           m.goals.home < m.goals.away ? "L" : "D")
+        : (m.goals.away > m.goals.home ? "W" :
+           m.goals.away < m.goals.home ? "L" : "D"),
+  }))
+);
     return res.json({
       ok: true,
       analysis: {
@@ -576,11 +599,8 @@ app.get("/internal/analyze/:fixtureId", async (req, res) => {
           league: fixture.league,
         },
 
-        homeRecentForm:
-          homeRecentResponse.data?.response || [],
-
-        awayRecentForm:
-          awayRecentResponse.data?.response || [],
+        homeRecentForm,
+awayRecentForm,
 
         headToHead:
           h2hResponse.data?.response || [],
