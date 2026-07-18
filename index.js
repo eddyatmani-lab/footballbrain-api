@@ -602,6 +602,11 @@ const footballBrain = computeFootballBrainScore(
            m.goals.away < m.goals.home ? "L" : "D"),
   }))
 );
+const footballBrainDecision =
+  computeFootballBrainDecision(
+    footballBrain,
+    market
+  );
 const result = {
   ok: true,
   analysis: {
@@ -619,7 +624,8 @@ const result = {
       market,
     
     footballBrain,
-  },
+  footballBrainDecision,
+},
 };
 
 analysisCache.set(fixtureId, {
@@ -888,6 +894,180 @@ function summarizeMatchWinnerOdds(oddsData) {
     )[0]?.key;
 
   return result;
+}
+function computeFootballBrainDecision(footballBrain, market) {
+  const homeFormScore = footballBrain.homeScore || 0;
+  const awayFormScore = footballBrain.awayScore || 0;
+
+  const totalFormScore = homeFormScore + awayFormScore;
+
+  let homeFormProbability =
+    totalFormScore > 0
+      ? homeFormScore / totalFormScore
+      : 0.5;
+
+  let awayFormProbability =
+    totalFormScore > 0
+      ? awayFormScore / totalFormScore
+      : 0.5;
+
+  const homeOdd = market?.homeAverageOdd;
+  const drawOdd = market?.drawAverageOdd;
+  const awayOdd = market?.awayAverageOdd;
+
+  let homeMarketProbability =
+    homeOdd && homeOdd > 0
+      ? 1 / homeOdd
+      : 0.33;
+
+  let drawMarketProbability =
+    drawOdd && drawOdd > 0
+      ? 1 / drawOdd
+      : 0.33;
+
+  let awayMarketProbability =
+    awayOdd && awayOdd > 0
+      ? 1 / awayOdd
+      : 0.33;
+
+  const marketTotal =
+    homeMarketProbability +
+    drawMarketProbability +
+    awayMarketProbability;
+
+  homeMarketProbability /= marketTotal;
+  drawMarketProbability /= marketTotal;
+  awayMarketProbability /= marketTotal;
+
+  const homeProbability =
+    homeFormProbability * 0.45 +
+    homeMarketProbability * 0.55;
+
+  const awayProbability =
+    awayFormProbability * 0.45 +
+    awayMarketProbability * 0.55;
+
+  let drawProbability =
+    drawMarketProbability * 0.8 + 0.05;
+
+  const probabilityTotal =
+    homeProbability +
+    drawProbability +
+    awayProbability;
+
+  const probabilities = {
+    home: Number(
+      ((homeProbability / probabilityTotal) * 100).toFixed(1)
+    ),
+    draw: Number(
+      ((drawProbability / probabilityTotal) * 100).toFixed(1)
+    ),
+    away: Number(
+      ((awayProbability / probabilityTotal) * 100).toFixed(1)
+    ),
+  };
+
+  const options = [
+    {
+      key: "home",
+      probability: probabilities.home,
+      odd: homeOdd,
+    },
+    {
+      key: "draw",
+      probability: probabilities.draw,
+      odd: drawOdd,
+    },
+    {
+      key: "away",
+      probability: probabilities.away,
+      odd: awayOdd,
+    },
+  ];
+
+  const bestOption = options.reduce((best, current) =>
+    current.probability > best.probability
+      ? current
+      : best
+  );
+
+  const secondProbability = options
+    .map((item) => item.probability)
+    .sort((a, b) => b - a)[1];
+
+  const probabilityGap =
+    bestOption.probability - secondProbability;
+
+  const confidence = Math.min(
+    90,
+    Math.max(
+      40,
+      Math.round(
+        bestOption.probability +
+        probabilityGap * 1.5
+      )
+    )
+  );
+
+  let risk = "élevé";
+
+  if (confidence >= 75) {
+    risk = "faible";
+  } else if (confidence >= 60) {
+    risk = "modéré";
+  }
+
+  const fairOdd =
+    bestOption.probability > 0
+      ? Number(
+          (100 / bestOption.probability).toFixed(2)
+        )
+      : null;
+
+  const value =
+    bestOption.odd && fairOdd
+      ? Number(
+          (
+            ((bestOption.odd / fairOdd) - 1) *
+            100
+          ).toFixed(1)
+        )
+      : null;
+
+  const labelMap = {
+    home: "Victoire domicile",
+    draw: "Match nul",
+    away: "Victoire extérieur",
+  };
+
+  let decision = labelMap[bestOption.key];
+
+  if (
+    probabilities.home +
+      probabilities.draw >=
+    70
+  ) {
+    decision = "1X";
+  }
+
+  if (
+    probabilities.away +
+      probabilities.draw >=
+    70
+  ) {
+    decision = "X2";
+  }
+
+  return {
+    probabilities,
+    decision,
+    confidence,
+    risk,
+    fairOdd,
+    marketOdd: bestOption.odd || null,
+    value,
+    selectedOutcome: bestOption.key,
+  };
 }
 app.listen(PORT, () => {
   console.log(
