@@ -261,6 +261,85 @@ app.get("/status", async (req, res) => {
     );
   }
 });
+app.get("/internal/match/:fixtureId", async (req, res) => {
+  try {
+    const fixtureId = Number(req.params.fixtureId);
+
+    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "fixtureId invalide",
+      });
+    }
+
+    const response = await callApiFootball("/fixtures", {
+      id: fixtureId,
+      timezone: "Europe/Paris",
+    });
+
+    const apiData = response.data;
+
+    if (
+      apiData.errors &&
+      Object.keys(apiData.errors).length > 0
+    ) {
+      return res.status(502).json({
+        ok: false,
+        error: apiData.errors,
+      });
+    }
+
+    const item = apiData.response?.[0];
+
+    if (!item) {
+      return res.status(404).json({
+        ok: false,
+        error: "Match introuvable",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      match: {
+        fixtureId: item.fixture?.id,
+        date: item.fixture?.date,
+        timestamp: item.fixture?.timestamp,
+        status: item.fixture?.status,
+        venue: item.fixture?.venue,
+
+        league: {
+          id: item.league?.id,
+          name: item.league?.name,
+          season: item.league?.season,
+          round: item.league?.round,
+          logo: item.league?.logo,
+        },
+
+        homeTeam: {
+          id: item.teams?.home?.id,
+          name: item.teams?.home?.name,
+          logo: item.teams?.home?.logo,
+        },
+
+        awayTeam: {
+          id: item.teams?.away?.id,
+          name: item.teams?.away?.name,
+          logo: item.teams?.away?.logo,
+        },
+
+        goals: item.goals,
+        score: item.score,
+      },
+    });
+  } catch (error) {
+    return res.status(error.response?.status || 500).json({
+      ok: false,
+      error:
+        error.response?.data ||
+        error.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
