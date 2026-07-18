@@ -1276,6 +1276,104 @@ function saveFootballBrainPrediction(analysis) {
 
   return true;
 }
+function computeHistoryStats(history) {
+  const totalPredictions = history.length;
+
+  const completed = history.filter(
+    (item) => item.result?.status === "COMPLETED"
+  );
+
+  const noBet = history.filter(
+    (item) => item.prediction?.betStatus === "NO_BET"
+  ).length;
+
+  const settledBets = completed.filter(
+    (item) =>
+      item.prediction?.betStatus !== "NO_BET" &&
+      typeof item.result?.won === "boolean"
+  );
+
+  const wins = settledBets.filter(
+    (item) => item.result.won === true
+  ).length;
+
+  const losses = settledBets.filter(
+    (item) => item.result.won === false
+  ).length;
+
+  const totalProfit = settledBets.reduce(
+    (sum, item) =>
+      sum + Number(item.result?.profit || 0),
+    0
+  );
+
+  const totalStake = settledBets.length;
+
+  const winRate =
+    settledBets.length > 0
+      ? Number(
+          (
+            (wins / settledBets.length) *
+            100
+          ).toFixed(1)
+        )
+      : 0;
+
+  const roi =
+    totalStake > 0
+      ? Number(
+          (
+            (totalProfit / totalStake) *
+            100
+          ).toFixed(1)
+        )
+      : 0;
+
+  const averageConfidence =
+    totalPredictions > 0
+      ? Number(
+          (
+            history.reduce(
+              (sum, item) =>
+                sum +
+                Number(
+                  item.prediction?.confidence || 0
+                ),
+              0
+            ) / totalPredictions
+          ).toFixed(1)
+        )
+      : 0;
+
+  const decisions = history.reduce(
+    (acc, item) => {
+      const decision =
+        item.prediction?.decision || "Inconnue";
+
+      acc[decision] =
+        (acc[decision] || 0) + 1;
+
+      return acc;
+    },
+    {}
+  );
+
+  return {
+    totalPredictions,
+    completedPredictions: completed.length,
+    pendingPredictions:
+      totalPredictions - completed.length,
+    noBet,
+    settledBets: settledBets.length,
+    wins,
+    losses,
+    winRate,
+    totalProfit: Number(totalProfit.toFixed(2)),
+    roi,
+    averageConfidence,
+    decisions,
+  };
+}
 app.get("/internal/history", (req, res) => {
   const history = readPredictionHistory();
 
@@ -1284,6 +1382,24 @@ app.get("/internal/history", (req, res) => {
     count: history.length,
     history,
   });
+});
+app.get("/internal/stats", (req, res) => {
+  try {
+    const history = readPredictionHistory();
+
+    const stats =
+      computeHistoryStats(history);
+
+    return res.json({
+      ok: true,
+      stats,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
 });
 app.listen(PORT, () => {
   console.log(
