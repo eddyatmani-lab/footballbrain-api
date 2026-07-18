@@ -585,27 +585,65 @@ const homeRecentForm =
 
 const awayRecentForm =
   awayRecentResponse.data?.response || [];
+const getTeamResult = (match, teamId) => {
+  const isHome =
+    match.teams?.home?.id === teamId;
+
+  const goalsFor = isHome
+    ? match.goals?.home
+    : match.goals?.away;
+
+  const goalsAgainst = isHome
+    ? match.goals?.away
+    : match.goals?.home;
+
+  if (goalsFor > goalsAgainst) return "W";
+  if (goalsFor < goalsAgainst) return "L";
+
+  return "D";
+};
+
+const homeResults = homeRecentForm.map(
+  (match) => getTeamResult(match, homeTeamId)
+);
+
+const awayResults = awayRecentForm.map(
+  (match) => getTeamResult(match, awayTeamId)
+);
 const rawOdds = oddsResponse.data?.response || [];
 
 const market = summarizeMatchWinnerOdds(rawOdds);
-const footballBrain = computeFootballBrainScore(
-  homeRecentForm.map((m) => ({
-    result:
-      m.teams.home.id === homeTeamId
-        ? (m.goals.home > m.goals.away ? "W" :
-           m.goals.home < m.goals.away ? "L" : "D")
-        : (m.goals.away > m.goals.home ? "W" :
-           m.goals.away < m.goals.home ? "L" : "D"),
-  })),
-  awayRecentForm.map((m) => ({
-    result:
-      m.teams.home.id === awayTeamId
-        ? (m.goals.home > m.goals.away ? "W" :
-           m.goals.home < m.goals.away ? "L" : "D")
-        : (m.goals.away > m.goals.home ? "W" :
-           m.goals.away < m.goals.home ? "L" : "D"),
-  }))
-);
+const baseFootballBrain =
+  computeFootballBrainScore(
+    homeResults.map((result) => ({ result })),
+    awayResults.map((result) => ({ result }))
+  );
+
+const phaseOneContext =
+  computePhaseOneContext({
+    match: {
+      league: fixture.league,
+    },
+    homeResults,
+    awayResults,
+    market,
+    baseScore: baseFootballBrain,
+  });
+
+const footballBrain = {
+  homeScore:
+    phaseOneContext.adjustedHomeScore,
+
+  awayScore:
+    phaseOneContext.adjustedAwayScore,
+
+  advantage:
+    phaseOneContext.adjustedAdvantage,
+
+  baseScore: baseFootballBrain,
+
+  context: phaseOneContext,
+};
 const footballBrainDecision =
   computeFootballBrainDecision(
     footballBrain,
@@ -1401,6 +1439,125 @@ app.get("/internal/stats", (req, res) => {
     });
   }
 });
+function computePhaseOneContext({
+  match,
+  homeResults,
+  awayResults,
+  market,
+  baseScore,
+}) {
+  // Avantage fixe pour l'équipe à domicile
+  const homeAdvantageBonus = 2;
+
+  function countWinningStreak(results) {
+    let streak = 0;
+
+    for (const result of results) {
+      if (result !== "W") break;
+      streak += 1;
+    }
+
+    return streak;
+  }
+
+  const homeWinningStreak =
+    countWinningStreak(homeResults);
+
+  const awayWinningStreak =
+    countWinningStreak(awayResults);
+
+  // Bonus limité à 3 points
+  const homeStreakBonus =
+    Math.min(homeWinningStreak, 3);
+
+  const awayStreakBonus =
+    Math.min(awayWinningStreak, 3);
+
+  const leagueName =
+    match?.league?.name || "";
+
+  const round =
+    match?.league?.round || "";
+
+  let matchImportance = "normale";
+  let importanceScore = 1;
+
+  if (
+    leagueName.includes("Champions League") ||
+    leagueName.includes("Europa League")
+  ) {
+    matchImportance = "élevée";
+    importanceScore = 2;
+  }
+
+  if (
+    round.includes("Final") ||
+    round.includes("Semi") ||
+    round.includes("Quarter")
+  ) {
+    matchImportance = "très élevée";
+    importanceScore = 3;
+  }
+
+  if (leagueName.includes("Friendlies")) {
+    matchImportance = "faible";
+    importanceScore = 0;
+  }
+
+  const adjustedHomeScore =
+    baseScore.homeScore +
+    homeAdvantageBonus +
+    homeStreakBonus;
+
+  const adjustedAwayScore =
+    baseScore.awayScore +
+    awayStreakBonus;
+
+  let footballBrainFavorite = "draw";
+
+  if (adjustedHomeScore > adjustedAwayScore) {
+    footballBrainFavorite = "home";
+  }
+
+  if (adjustedAwayScore > adjustedHomeScore) {
+    footballBrainFavorite = "away";
+  }
+
+  const marketFavorite =
+    market?.marketFavorite || null;
+
+  const marketAgreement =
+    marketFavorite !== null &&
+    footballBrainFavorite === marketFavorite;
+
+  return {
+    adjustedHomeScore,
+    adjustedAwayScore,
+    adjustedAdvantage:
+      adjustedHomeScore - adjustedAwayScore,
+
+    homeAdvantageBonus,
+
+    winningStreaks: {
+      home: homeWinningStreak,
+      away: awayWinningStreak,
+    },
+
+    streakBonuses: {
+      home: homeStreakBonus,
+      away: awayStreakBonus,
+    },
+
+    matchImportance,
+    importanceScore,
+
+    marketAgreement: {
+      agrees: marketAgreement,
+      marketFavorite,
+      footballBrainFavorite,
+    },
+  };
+}
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
