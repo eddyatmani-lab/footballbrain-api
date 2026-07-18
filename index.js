@@ -370,31 +370,101 @@ app.get("/internal/match/:fixtureId/context", async (req, res) => {
     const homeTeamId = fixture.teams?.home?.id;
     const awayTeamId = fixture.teams?.away?.id;
 
-    const [homeStatsResponse, awayStatsResponse] = await Promise.all([
+    const [
+      homeStatsResponse,
+      awayStatsResponse,
+      homeRecentResponse,
+      awayRecentResponse,
+    ] = await Promise.all([
       callApiFootball("/teams/statistics", {
         league: leagueId,
         season,
         team: homeTeamId,
       }),
+
       callApiFootball("/teams/statistics", {
         league: leagueId,
         season,
         team: awayTeamId,
       }),
+
+      callApiFootball("/fixtures", {
+        team: homeTeamId,
+        last: 5,
+        timezone: "Europe/Paris",
+      }),
+
+      callApiFootball("/fixtures", {
+        team: awayTeamId,
+        last: 5,
+        timezone: "Europe/Paris",
+      }),
     ]);
+
+    function simplifyRecentMatch(item, teamId) {
+      const isHome = item.teams?.home?.id === teamId;
+
+      const goalsFor = isHome
+        ? item.goals?.home
+        : item.goals?.away;
+
+      const goalsAgainst = isHome
+        ? item.goals?.away
+        : item.goals?.home;
+
+      let result = "D";
+
+      if (goalsFor > goalsAgainst) {
+        result = "W";
+      } else if (goalsFor < goalsAgainst) {
+        result = "L";
+      }
+
+      return {
+        fixtureId: item.fixture?.id,
+        date: item.fixture?.date,
+        competition: item.league?.name,
+        opponent: isHome
+          ? item.teams?.away?.name
+          : item.teams?.home?.name,
+        location: isHome ? "home" : "away",
+        goalsFor,
+        goalsAgainst,
+        result,
+      };
+    }
+
+    const homeRecentMatches =
+      homeRecentResponse.data?.response || [];
+
+    const awayRecentMatches =
+      awayRecentResponse.data?.response || [];
 
     return res.json({
       ok: true,
+
       match: {
         fixtureId,
+        date: fixture.fixture?.date,
         league: fixture.league,
         homeTeam: fixture.teams?.home,
         awayTeam: fixture.teams?.away,
-        date: fixture.fixture?.date,
       },
+
       internalContext: {
-        homeTeamStatistics: homeStatsResponse.data?.response || null,
-        awayTeamStatistics: awayStatsResponse.data?.response || null,
+        homeTeamStatistics:
+          homeStatsResponse.data?.response || null,
+
+        awayTeamStatistics:
+          awayStatsResponse.data?.response || null,
+
+        homeRecentForm: homeRecentMatches.map((item) =>
+          simplifyRecentMatch(item, homeTeamId)
+        ),
+
+        awayRecentForm: awayRecentMatches.map((item) =>
+          simplifyRecentMatch(item, awayTeamId)
+        ),
       },
     });
   } catch (error) {
