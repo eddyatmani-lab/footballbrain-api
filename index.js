@@ -529,6 +529,52 @@ app.get("/internal/odds/:fixtureId", async (req, res) => {
     });
   }
 });
+app.get("/internal/analyze/:fixtureId", async (req, res) => {
+  try {
+    const fixtureId = Number(req.params.fixtureId);
+
+    const context = await axios.get(
+      `${process.env.BASE_URL}/internal/match/${fixtureId}/context`
+    );
+
+    const odds = await axios.get(
+      `${process.env.BASE_URL}/internal/odds/${fixtureId}`
+    );
+
+    res.json({
+      ok: true,
+
+      analysis: {
+        fixtureId,
+
+        homeForm:
+          context.data.internalContext.homeRecentForm,
+
+        awayForm:
+          context.data.internalContext.awayRecentForm,
+
+        homeStats:
+          context.data.internalContext
+            .homeTeamStatistics?.form,
+
+        awayStats:
+          context.data.internalContext
+            .awayTeamStatistics?.form,
+
+        h2h:
+          context.data.internalContext.headToHead,
+
+        bookmakers:
+          odds.data.count,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
