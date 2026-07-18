@@ -1,16 +1,24 @@
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const { Pool } = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
 const analysisCache = new Map();
-const ANALYSIS_CACHE_TTL = 60 * 60 * 1000; // 1 heure
+const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
 
 const API_BASE_URL =
   "https://v3.football.api-sports.io";
-const fs = require("fs");
-const path = require("path");
 
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
 const HISTORY_FILE = path.join(__dirname, "predictions-history.json");
 
 function getApiKey() {
@@ -1742,6 +1750,24 @@ function computePhaseTwoContext({
     },
   };
 }
+app.get("/internal/db-test", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT NOW() AS current_time"
+    );
+
+    return res.json({
+      ok: true,
+      database: "connected",
+      time: result.rows[0].current_time,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
