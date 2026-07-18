@@ -519,7 +519,7 @@ app.get("/internal/analyze/:fixtureId", async (req, res) => {
         error: "fixtureId invalide",
       });
     }
-app.get("/internal/analyze/:fixtureId", async (req, res) => {
+
    const cached = analysisCache.get(fixtureId);
 
 if (
@@ -620,6 +620,7 @@ const result = {
     footballBrain,
   },
 };
+
 analysisCache.set(fixtureId, {
   createdAt: Date.now(),
   data: result,
@@ -629,15 +630,7 @@ return res.json({
   ...result,
   cached: false,
 });
-analysisCache.set(fixtureId, {
-  createdAt: Date.now(),
-  data: result,
-});
 
-return res.json({
-  ...result,
-  cached: false,
-});
   } catch (error) {
     return res.status(error.response?.status || 500).json({
       ok: false,
