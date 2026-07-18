@@ -607,6 +607,16 @@ const footballBrainDecision =
     footballBrain,
     market
   );
+const headToHead =
+  h2hResponse.data?.response || [];
+
+const footballBrainRating =
+  computeFootballBrainRating({
+    footballBrain,
+    footballBrainDecision,
+    market,
+    headToHead,
+  });
 const result = {
   ok: true,
   analysis: {
@@ -619,12 +629,12 @@ const result = {
     },
     homeRecentForm,
     awayRecentForm,
-    headToHead: h2hResponse.data?.response || [],
-    
+    headToHead,
       market,
     
     footballBrain,
   footballBrainDecision,
+footballBrainRating,
 },
 };
 
@@ -1101,6 +1111,8 @@ return {
   selectedOutcome: bestOption.key,
 };
 }
+cd %USERPROFILE%\footballbrain-api
+notepad index.js
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
