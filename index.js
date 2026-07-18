@@ -1111,8 +1111,77 @@ return {
   selectedOutcome: bestOption.key,
 };
 }
-cd %USERPROFILE%\footballbrain-api
-notepad index.js
+function computeFootballBrainRating({
+  footballBrain,
+  footballBrainDecision,
+  market,
+  headToHead,
+}) {
+  const homeScore = footballBrain?.homeScore || 0;
+  const awayScore = footballBrain?.awayScore || 0;
+  const totalFormScore = homeScore + awayScore;
+
+  const formScore =
+    totalFormScore > 0
+      ? Math.round(
+          (Math.max(homeScore, awayScore) /
+            totalFormScore) *
+            100
+        )
+      : 50;
+
+  const marketScore =
+    footballBrainDecision?.selectedOutcome ===
+    market?.marketFavorite
+      ? 80
+      : 45;
+
+  let h2hScore = 50;
+
+  if (Array.isArray(headToHead) && headToHead.length > 0) {
+    const draws = headToHead.filter(
+      (match) =>
+        match.goals?.home === match.goals?.away
+    ).length;
+
+    h2hScore = Math.round(
+      (draws / headToHead.length) * 100
+    );
+  }
+
+  const valueScore =
+    footballBrainDecision?.value === null
+      ? 50
+      : Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round(
+              50 + footballBrainDecision.value * 2
+            )
+          )
+        );
+
+  const confidenceScore =
+    footballBrainDecision?.confidence || 50;
+
+  const globalScore = Math.round(
+    formScore * 0.3 +
+      marketScore * 0.25 +
+      h2hScore * 0.15 +
+      valueScore * 0.15 +
+      confidenceScore * 0.15
+  );
+
+  return {
+    form: formScore,
+    market: marketScore,
+    h2h: h2hScore,
+    value: valueScore,
+    confidence: confidenceScore,
+    global: globalScore,
+  };
+}
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
