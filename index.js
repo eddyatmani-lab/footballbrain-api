@@ -1768,6 +1768,95 @@ app.get("/internal/db-test", async (req, res) => {
     });
   }
 });
+async function initializeDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS teams (
+      id SERIAL PRIMARY KEY,
+      api_team_id INTEGER UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      country TEXT,
+      logo TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS elo_ratings (
+      id SERIAL PRIMARY KEY,
+      team_id INTEGER UNIQUE NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      rating NUMERIC(8,2) NOT NULL DEFAULT 1500,
+      matches_played INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS elo_history (
+      id SERIAL PRIMARY KEY,
+      team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      fixture_id INTEGER NOT NULL,
+      rating_before NUMERIC(8,2) NOT NULL,
+      rating_after NUMERIC(8,2) NOT NULL,
+      rating_change NUMERIC(8,2) NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS predictions (
+      id SERIAL PRIMARY KEY,
+      fixture_id INTEGER UNIQUE NOT NULL,
+      fixture_date TIMESTAMPTZ,
+      league_id INTEGER,
+      league_name TEXT,
+      home_team_id INTEGER,
+      home_team_name TEXT,
+      away_team_id INTEGER,
+      away_team_name TEXT,
+
+      decision TEXT,
+      selected_outcome TEXT,
+      bet_status TEXT,
+      confidence NUMERIC(5,2),
+      risk TEXT,
+
+      home_probability NUMERIC(5,2),
+      draw_probability NUMERIC(5,2),
+      away_probability NUMERIC(5,2),
+
+      fair_odd NUMERIC(8,2),
+      market_odd NUMERIC(8,2),
+      value_percentage NUMERIC(8,2),
+
+      explanation TEXT,
+
+      result_status TEXT DEFAULT 'PENDING',
+      home_goals INTEGER,
+      away_goals INTEGER,
+      won BOOLEAN,
+      profit NUMERIC(10,2),
+
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+}
+app.get("/internal/db-init", async (req, res) => {
+  try {
+    await initializeDatabase();
+
+    return res.json({
+      ok: true,
+      message: "Tables FootballBrain créées",
+      tables: [
+        "teams",
+        "elo_ratings",
+        "elo_history",
+        "predictions",
+      ],
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
