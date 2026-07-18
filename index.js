@@ -507,71 +507,97 @@ const headToHead = h2hMatches.map((item) => ({
     });
   }
 });
-app.get("/internal/odds/:fixtureId", async (req, res) => {
-  try {
-    const fixtureId = Number(req.params.fixtureId);
-
-    const response = await callApiFootball("/odds", {
-      fixture: fixtureId,
-    });
-
-    res.json({
-      ok: true,
-      count: response.data?.results || 0,
-      data: response.data?.response || [],
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error:
-        error.response?.data ||
-        error.message,
-    });
-  }
-});
 app.get("/internal/analyze/:fixtureId", async (req, res) => {
   try {
     const fixtureId = Number(req.params.fixtureId);
 
-    const context = await axios.get(
-      `${process.env.BASE_URL}/internal/match/${fixtureId}/context`
-    );
+    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "fixtureId invalide",
+      });
+    }
 
-    const odds = await axios.get(
-      `${process.env.BASE_URL}/internal/odds/${fixtureId}`
-    );
+    const fixtureResponse = await callApiFootball("/fixtures", {
+      id: fixtureId,
+      timezone: "Europe/Paris",
+    });
 
-    res.json({
+    const fixture = fixtureResponse.data?.response?.[0];
+
+    if (!fixture) {
+      return res.status(404).json({
+        ok: false,
+        error: "Match introuvable",
+      });
+    }
+
+    const homeTeamId = fixture.teams?.home?.id;
+    const awayTeamId = fixture.teams?.away?.id;
+
+    const [
+      homeRecentResponse,
+      awayRecentResponse,
+      h2hResponse,
+      oddsResponse,
+    ] = await Promise.all([
+      callApiFootball("/fixtures", {
+        team: homeTeamId,
+        last: 5,
+        timezone: "Europe/Paris",
+      }),
+
+      callApiFootball("/fixtures", {
+        team: awayTeamId,
+        last: 5,
+        timezone: "Europe/Paris",
+      }),
+
+      callApiFootball("/fixtures/headtohead", {
+        h2h: `${homeTeamId}-${awayTeamId}`,
+        last: 10,
+        timezone: "Europe/Paris",
+      }),
+
+      callApiFootball("/odds", {
+        fixture: fixtureId,
+      }),
+    ]);
+
+    return res.json({
       ok: true,
-
       analysis: {
         fixtureId,
 
-        homeForm:
-          context.data.internalContext.homeRecentForm,
+        match: {
+          date: fixture.fixture?.date,
+          homeTeam: fixture.teams?.home,
+          awayTeam: fixture.teams?.away,
+          league: fixture.league,
+        },
 
-        awayForm:
-          context.data.internalContext.awayRecentForm,
+        homeRecentForm:
+          homeRecentResponse.data?.response || [],
 
-        homeStats:
-          context.data.internalContext
-            .homeTeamStatistics?.form,
+        awayRecentForm:
+          awayRecentResponse.data?.response || [],
 
-        awayStats:
-          context.data.internalContext
-            .awayTeamStatistics?.form,
+        headToHead:
+          h2hResponse.data?.response || [],
 
-        h2h:
-          context.data.internalContext.headToHead,
-
-        bookmakers:
-          odds.data.count,
+        odds: {
+          count: oddsResponse.data?.results || 0,
+          data: oddsResponse.data?.response || [],
+        },
       },
     });
   } catch (error) {
-    res.status(500).json({
+    return res.status(error.response?.status || 500).json({
       ok: false,
-      error: error.message,
+      error:
+        error.apiData ||
+        error.response?.data ||
+        error.message,
     });
   }
 });
