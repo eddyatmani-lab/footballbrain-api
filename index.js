@@ -1042,37 +1042,64 @@ function computeFootballBrainDecision(footballBrain, market) {
 
 let decision = labelMap[bestOption.key];
 let reason = "Issue la plus probable selon FootballBrain";
+let valueLevel = "aucune";
+let betStatus = "NO_BET";
+
+if (value !== null) {
+  if (value >= 10) {
+    valueLevel = "forte";
+    betStatus = "VALUE_BET";
+  } else if (value >= 5) {
+    valueLevel = "intéressante";
+    betStatus = "VALUE_BET";
+  } else if (value >= 3) {
+    valueLevel = "faible";
+    betStatus = "À_SURVEILLER";
+  }
+}
 
 if (
   probabilities.home + probabilities.draw >= 70
 ) {
   decision = "1X";
-  reason = "Le scénario domicile ou nul dépasse 70 %";
+  reason = "La probabilité combinée domicile ou nul dépasse 70 %";
 }
 
 if (
   probabilities.away + probabilities.draw >= 70
 ) {
   decision = "X2";
-  reason = "Le scénario extérieur ou nul dépasse 70 %";
+  reason = "La probabilité combinée extérieur ou nul dépasse 70 %";
 }
 
-if (value !== null && value < 3) {
+if (value === null || value < 3) {
   decision = "Pas de pari";
-  reason = "La cote proposée est trop faible par rapport à la cote juste";
+  reason =
+    "La cote proposée n'offre pas suffisamment de value selon FootballBrain";
+  betStatus = "NO_BET";
 }
 
-  return {
-    probabilities,
-    decision,
-reason,
-    confidence,
-    risk,
-    fairOdd,
-    marketOdd: bestOption.odd || null,
-    value,
-    selectedOutcome: bestOption.key,
-  };
+const selectedLabel = labelMap[bestOption.key]; 
+
+const explanation =
+  decision === "Pas de pari"
+    ? `${selectedLabel} est actuellement le scénario le plus probable à ${bestOption.probability} %, mais la cote de ${bestOption.odd ?? "N/A"} est inférieure à la cote juste estimée à ${fairOdd ?? "N/A"}. FootballBrain ne détecte donc pas de value suffisante.`
+    : `FootballBrain recommande ${decision}. La probabilité estimée est de ${bestOption.probability} %, avec une cote juste de ${fairOdd ?? "N/A"} et une value de ${value ?? "N/A"} %.`;
+
+return {
+  probabilities,
+  decision,
+  reason,
+  explanation,
+  betStatus,
+  valueLevel,
+  confidence,
+  risk,
+  fairOdd,
+  marketOdd: bestOption.odd || null,
+  value,
+  selectedOutcome: bestOption.key,
+};
 }
 app.listen(PORT, () => {
   console.log(
