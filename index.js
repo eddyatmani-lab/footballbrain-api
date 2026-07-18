@@ -3,6 +3,8 @@ const axios = require("axios");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const analysisCache = new Map();
+const ANALYSIS_CACHE_TTL = 60 * 60 * 1000; // 1 heure
 
 const API_BASE_URL =
   "https://v3.football.api-sports.io";
@@ -517,8 +519,19 @@ app.get("/internal/analyze/:fixtureId", async (req, res) => {
         error: "fixtureId invalide",
       });
     }
+app.get("/internal/analyze/:fixtureId", async (req, res) => {
+   const cached = analysisCache.get(fixtureId);
 
-    const fixtureResponse = await callApiFootball("/fixtures", {
+if (
+  cached &&
+  Date.now() - cached.createdAt < ANALYSIS_CACHE_TTL
+) {
+  return res.json({
+    ...cached.data,
+    cached: true,
+  });
+}
+ const fixtureResponse = await callApiFootball("/fixtures", {
       id: fixtureId,
       timezone: "Europe/Paris",
     });
@@ -587,31 +600,44 @@ const footballBrain = computeFootballBrainScore(
            m.goals.away < m.goals.home ? "L" : "D"),
   }))
 );
-    return res.json({
-      ok: true,
-      analysis: {
-        fixtureId,
+const result = {
+  ok: true,
+  analysis: {
+    fixtureId,
+    match: {
+      date: fixture.fixture?.date,
+      homeTeam: fixture.teams?.home,
+      awayTeam: fixture.teams?.away,
+      league: fixture.league,
+    },
+    homeRecentForm,
+    awayRecentForm,
+    headToHead: h2hResponse.data?.response || [],
+    odds: {
+      count: oddsResponse.data?.results || 0,
+      data: oddsResponse.data?.response || [],
+    },
+    footballBrain,
+  },
+};
+analysisCache.set(fixtureId, {
+  createdAt: Date.now(),
+  data: result,
+});
 
-        match: {
-          date: fixture.fixture?.date,
-          homeTeam: fixture.teams?.home,
-          awayTeam: fixture.teams?.away,
-          league: fixture.league,
-        },
+return res.json({
+  ...result,
+  cached: false,
+});
+analysisCache.set(fixtureId, {
+  createdAt: Date.now(),
+  data: result,
+});
 
-        homeRecentForm,
-awayRecentForm,
-
-        headToHead:
-          h2hResponse.data?.response || [],
-
-        odds: {
-          count: oddsResponse.data?.results || 0,
-          data: oddsResponse.data?.response || [],
-        },
-      footballBrain,
-},
-    });
+return res.json({
+  ...result,
+  cached: false,
+});
   } catch (error) {
     return res.status(error.response?.status || 500).json({
       ok: false,
