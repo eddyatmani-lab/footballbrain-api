@@ -557,6 +557,8 @@ if (
       awayRecentResponse,
       h2hResponse,
       oddsResponse,
+injuriesResponse,
+lineupsResponse,
     ] = await Promise.all([
       callApiFootball("/fixtures", {
         team: homeTeamId,
@@ -579,6 +581,13 @@ if (
       callApiFootball("/odds", {
         fixture: fixtureId,
       }),
+callApiFootball("/injuries", {
+  fixture: fixtureId,
+}),
+
+callApiFootball("/fixtures/lineups", {
+  fixture: fixtureId,
+}),
     ]);
 const homeRecentForm =
   homeRecentResponse.data?.response || [];
@@ -629,20 +638,46 @@ const phaseOneContext =
     market,
     baseScore: baseFootballBrain,
   });
+const injuries =
+  injuriesResponse.data?.response || [];
+
+const lineups =
+  lineupsResponse.data?.response || [];
+
+const phaseTwoContext =
+  computePhaseTwoContext({
+    fixture,
+    homeRecentForm,
+    awayRecentForm,
+    injuries,
+    lineups,
+  });
 
 const footballBrain = {
   homeScore:
-    phaseOneContext.adjustedHomeScore,
+    phaseOneContext.adjustedHomeScore +
+    phaseTwoContext.scoreAdjustment.home,
 
   awayScore:
-    phaseOneContext.adjustedAwayScore,
+    phaseOneContext.adjustedAwayScore +
+    phaseTwoContext.scoreAdjustment.away,
 
   advantage:
-    phaseOneContext.adjustedAdvantage,
+    (
+      phaseOneContext.adjustedHomeScore +
+      phaseTwoContext.scoreAdjustment.home
+    ) -
+    (
+      phaseOneContext.adjustedAwayScore +
+      phaseTwoContext.scoreAdjustment.away
+    ),
 
   baseScore: baseFootballBrain,
 
-  context: phaseOneContext,
+  context: {
+    phaseOne: phaseOneContext,
+    phaseTwo: phaseTwoContext,
+  },
 };
 const footballBrainDecision =
   computeFootballBrainDecision(
@@ -1555,6 +1590,155 @@ function computePhaseOneContext({
       agrees: marketAgreement,
       marketFavorite,
       footballBrainFavorite,
+    },
+  };
+}
+function computePhaseTwoContext({
+  fixture,
+  homeRecentForm,
+  awayRecentForm,
+  injuries,
+  lineups,
+}) {
+  const homeTeamId = fixture.teams?.home?.id;
+  const awayTeamId = fixture.teams?.away?.id;
+
+  const homeInjuries = injuries.filter(
+    (item) => item.team?.id === homeTeamId
+  );
+
+  const awayInjuries = injuries.filter(
+    (item) => item.team?.id === awayTeamId
+  );
+
+  function injuryWeight(item) {
+    const type = String(item.player?.type || "").toLowerCase();
+    const reason = String(
+      item.player?.reason || item.player?.type || ""
+    ).toLowerCase();
+
+    if (type.includes("suspension")) return 2;
+
+    if (
+      reason.includes("knee") ||
+      reason.includes("hamstring") ||
+      reason.includes("fracture")
+    ) {
+      return 2;
+    }
+
+    return 1;
+  }
+
+  const homeInjuryPenalty = Math.min(
+    6,
+    homeInjuries.reduce(
+      (sum, item) => sum + injuryWeight(item),
+      0
+    )
+  );
+
+  const awayInjuryPenalty = Math.min(
+    6,
+    awayInjuries.reduce(
+      (sum, item) => sum + injuryWeight(item),
+      0
+    )
+  );
+
+  function getRestDays(recentMatches, kickoffDate) {
+    const latestFinishedMatch = recentMatches.find(
+      (item) =>
+        item.fixture?.status?.short === "FT" &&
+        item.fixture?.date
+    );
+
+    if (!latestFinishedMatch) return null;
+
+    const kickoff = new Date(kickoffDate);
+    const previousMatch = new Date(
+      latestFinishedMatch.fixture.date
+    );
+
+    const difference =
+      kickoff.getTime() - previousMatch.getTime();
+
+    return Math.max(
+      0,
+      Math.floor(difference / (1000 * 60 * 60 * 24))
+    );
+  }
+
+  const homeRestDays = getRestDays(
+    homeRecentForm,
+    fixture.fixture?.date
+  );
+
+  const awayRestDays = getRestDays(
+    awayRecentForm,
+    fixture.fixture?.date
+  );
+
+  function fatiguePenalty(restDays) {
+    if (restDays === null) return 0;
+    if (restDays <= 2) return 3;
+    if (restDays <= 4) return 2;
+    if (restDays <= 6) return 1;
+    return 0;
+  }
+
+  const homeFatiguePenalty =
+    fatiguePenalty(homeRestDays);
+
+  const awayFatiguePenalty =
+    fatiguePenalty(awayRestDays);
+
+  const homeLineup = lineups.find(
+    (item) => item.team?.id === homeTeamId
+  );
+
+  const awayLineup = lineups.find(
+    (item) => item.team?.id === awayTeamId
+  );
+
+  const homeLineupConfirmed =
+    Array.isArray(homeLineup?.startXI) &&
+    homeLineup.startXI.length >= 11;
+
+  const awayLineupConfirmed =
+    Array.isArray(awayLineup?.startXI) &&
+    awayLineup.startXI.length >= 11;
+
+  return {
+    injuries: {
+      homeCount: homeInjuries.length,
+      awayCount: awayInjuries.length,
+      homePenalty: homeInjuryPenalty,
+      awayPenalty: awayInjuryPenalty,
+    },
+
+    fatigue: {
+      homeRestDays,
+      awayRestDays,
+      homePenalty: homeFatiguePenalty,
+      awayPenalty: awayFatiguePenalty,
+    },
+
+    lineups: {
+      homeConfirmed: homeLineupConfirmed,
+      awayConfirmed: awayLineupConfirmed,
+      homeFormation: homeLineup?.formation || null,
+      awayFormation: awayLineup?.formation || null,
+    },
+
+    scoreAdjustment: {
+      home:
+        -homeInjuryPenalty -
+        homeFatiguePenalty,
+
+      away:
+        -awayInjuryPenalty -
+        awayFatiguePenalty,
     },
   };
 }
