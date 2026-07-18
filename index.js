@@ -340,6 +340,73 @@ app.get("/internal/match/:fixtureId", async (req, res) => {
     });
   }
 });
+app.get("/internal/match/:fixtureId/context", async (req, res) => {
+  try {
+    const fixtureId = Number(req.params.fixtureId);
+
+    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "fixtureId invalide",
+      });
+    }
+
+    const fixtureResponse = await callApiFootball("/fixtures", {
+      id: fixtureId,
+      timezone: "Europe/Paris",
+    });
+
+    const fixture = fixtureResponse.data?.response?.[0];
+
+    if (!fixture) {
+      return res.status(404).json({
+        ok: false,
+        error: "Match introuvable",
+      });
+    }
+
+    const leagueId = fixture.league?.id;
+    const season = fixture.league?.season;
+    const homeTeamId = fixture.teams?.home?.id;
+    const awayTeamId = fixture.teams?.away?.id;
+
+    const [homeStatsResponse, awayStatsResponse] = await Promise.all([
+      callApiFootball("/teams/statistics", {
+        league: leagueId,
+        season,
+        team: homeTeamId,
+      }),
+      callApiFootball("/teams/statistics", {
+        league: leagueId,
+        season,
+        team: awayTeamId,
+      }),
+    ]);
+
+    return res.json({
+      ok: true,
+      match: {
+        fixtureId,
+        league: fixture.league,
+        homeTeam: fixture.teams?.home,
+        awayTeam: fixture.teams?.away,
+        date: fixture.fixture?.date,
+      },
+      internalContext: {
+        homeTeamStatistics: homeStatsResponse.data?.response || null,
+        awayTeamStatistics: awayStatsResponse.data?.response || null,
+      },
+    });
+  } catch (error) {
+    return res.status(error.response?.status || 500).json({
+      ok: false,
+      error:
+        error.apiData ||
+        error.response?.data ||
+        error.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
