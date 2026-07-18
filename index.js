@@ -507,6 +507,28 @@ const headToHead = h2hMatches.map((item) => ({
     });
   }
 });
+app.get("/internal/odds/:fixtureId", async (req, res) => {
+  try {
+    const fixtureId = Number(req.params.fixtureId);
+
+    const response = await callApiFootball("/odds", {
+      fixture: fixtureId,
+    });
+
+    res.json({
+      ok: true,
+      count: response.data?.results || 0,
+      data: response.data?.response || [],
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error:
+        error.response?.data ||
+        error.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
