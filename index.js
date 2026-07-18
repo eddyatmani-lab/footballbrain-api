@@ -1797,7 +1797,8 @@ async function initializeDatabase() {
       rating_change NUMERIC(8,2) NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
-
+CREATE UNIQUE INDEX IF NOT EXISTS elo_history_team_fixture_unique
+ON elo_history (team_id, fixture_id);
     CREATE TABLE IF NOT EXISTS predictions (
       id SERIAL PRIMARY KEY,
       fixture_id INTEGER UNIQUE NOT NULL,
@@ -1941,6 +1942,491 @@ async function savePredictionToDatabase(analysis) {
     ]
   );
 }
+async function upsertTeam(team, country = null) {
+  const result = await pool.query(
+    `
+      INSERT INTO teams (
+        api_team_id,
+        name,
+        country,
+        logo,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, NOW())
+
+      ON CONFLICT (api_team_id)
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        country = COALESCE(EXCLUDED.country, teams.country),
+        logo = EXCLUDED.logo,
+        updated_at = NOW()
+
+      RETURNING *
+    `,
+    [
+      team.id,
+      team.name,
+      country,
+      team.logo || null,
+    ]
+  );
+
+  return result.rows[0];
+}
+
+async function getOrCreateTeamElo(teamDatabaseId) {
+  const result = await pool.query(
+    `
+      INSERT INTO elo_ratings (
+        team_id,
+        rating,
+        matches_played
+      )
+      VALUES ($1, 1500, 0)
+
+      ON CONFLICT (team_id)
+      DO UPDATE SET
+        team_id = EXCLUDED.team_id
+
+      RETURNING *
+    `,
+    [teamDatabaseId]
+  );
+
+  return result.rows[0];
+}
+
+function calculateExpectedElo(ratingA, ratingB) {
+  return 1 / (
+    1 + Math.pow(10, (ratingB - ratingA) / 400)
+  );
+}
+
+function calculateEloResult(homeGoals, awayGoals) {
+  if (homeGoals > awayGoals) {
+    return {
+      homeResult: 1,
+      awayResult: 0,
+    };
+  }
+
+  if (homeGoals < awayGoals) {
+    return {
+      homeResult: 0,
+      awayResult: 1,
+    };
+  }
+
+  return {
+    homeResult: 0.5,
+    awayResult: 0.5,
+  };
+}
+
+async function updateEloFromFinishedFixture(fixture) {
+  const status = fixture.fixture?.status?.short;
+
+  if (!["FT", "AET", "PEN"].includes(status)) {
+    throw new Error(
+      "Le match n'est pas encore terminé"
+    );
+  }
+
+  const fixtureId = fixture.fixture.id;
+
+  const homeApiTeam = fixture.teams.home;
+  const awayApiTeam = fixture.teams.away;
+
+  const homeGoals = fixture.goals?.home;
+  const awayGoals = fixture.goals?.away;
+
+  if (
+    !Number.isFinite(homeGoals) ||
+    !Number.isFinite(awayGoals)
+  ) {
+    throw new Error(
+      "Le score final du match est indisponible"
+    );
+  }
+
+  const homeTeam = await upsertTeam(
+    homeApiTeam,
+    fixture.league?.country || null
+  );
+
+  const awayTeam = await upsertTeam(
+    awayApiTeam,
+    fixture.league?.country || null
+  );
+
+  const homeElo = await getOrCreateTeamElo(
+    homeTeam.id
+  );
+
+  const awayElo = await getOrCreateTeamElo(
+    awayTeam.id
+  );
+
+  const alreadyProcessed = await pool.query(
+    `
+      SELECT id
+      FROM elo_history
+      WHERE fixture_id = $1
+      LIMIT 1
+    `,
+    [fixtureId]
+  );
+
+  if (alreadyProcessed.rows.length > 0) {
+    return {
+      alreadyProcessed: true,
+
+      home: {
+        team: homeTeam.name,
+        rating: Number(homeElo.rating),
+      },
+
+      away: {
+        team: awayTeam.name,
+        rating: Number(awayElo.rating),
+      },
+    };
+  }
+
+  const homeRatingBefore =
+    Number(homeElo.rating);
+
+  const awayRatingBefore =
+    Number(awayElo.rating);
+
+  const expectedHome = calculateExpectedElo(
+    homeRatingBefore + 60,
+    awayRatingBefore
+  );
+
+  const expectedAway = 1 - expectedHome;
+
+  const {
+    homeResult,
+    awayResult,
+  } = calculateEloResult(
+    homeGoals,
+    awayGoals
+  );
+
+  const K_FACTOR = 32;
+
+  const homeChange = Number(
+    (
+      K_FACTOR *
+      (homeResult - expectedHome)
+    ).toFixed(2)
+  );
+
+  const awayChange = Number(
+    (
+      K_FACTOR *
+      (awayResult - expectedAway)
+    ).toFixed(2)
+  );
+
+  const homeRatingAfter = Number(
+    (homeRatingBefore + homeChange).toFixed(2)
+  );
+
+  const awayRatingAfter = Number(
+    (awayRatingBefore + awayChange).toFixed(2)
+  );
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    await client.query(
+      `
+        UPDATE elo_ratings
+        SET
+          rating = $1,
+          matches_played = matches_played + 1,
+          updated_at = NOW()
+        WHERE team_id = $2
+      `,
+      [
+        homeRatingAfter,
+        homeTeam.id,
+      ]
+    );
+
+    await client.query(
+      `
+        UPDATE elo_ratings
+        SET
+          rating = $1,
+          matches_played = matches_played + 1,
+          updated_at = NOW()
+        WHERE team_id = $2
+      `,
+      [
+        awayRatingAfter,
+        awayTeam.id,
+      ]
+    );
+
+    await client.query(
+      `
+        INSERT INTO elo_history (
+          team_id,
+          fixture_id,
+          rating_before,
+          rating_after,
+          rating_change
+        )
+        VALUES
+          ($1, $2, $3, $4, $5),
+          ($6, $2, $7, $8, $9)
+      `,
+      [
+        homeTeam.id,
+        fixtureId,
+        homeRatingBefore,
+        homeRatingAfter,
+        homeChange,
+
+        awayTeam.id,
+        awayRatingBefore,
+        awayRatingAfter,
+        awayChange,
+      ]
+    );
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  return {
+    alreadyProcessed: false,
+
+    fixtureId,
+
+    score: {
+      home: homeGoals,
+      away: awayGoals,
+    },
+
+    home: {
+      teamId: homeApiTeam.id,
+      team: homeTeam.name,
+      ratingBefore: homeRatingBefore,
+      ratingAfter: homeRatingAfter,
+      change: homeChange,
+    },
+
+    away: {
+      teamId: awayApiTeam.id,
+      team: awayTeam.name,
+      ratingBefore: awayRatingBefore,
+      ratingAfter: awayRatingAfter,
+      change: awayChange,
+    },
+  };
+}
+app.get(
+  "/internal/elo/process/:fixtureId",
+  async (req, res) => {
+    try {
+      const fixtureId =
+        Number(req.params.fixtureId);
+
+      if (
+        !Number.isInteger(fixtureId) ||
+        fixtureId <= 0
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "fixtureId invalide",
+        });
+      }
+
+      const response =
+        await callApiFootball(
+          "/fixtures",
+          {
+            id: fixtureId,
+            timezone: "Europe/Paris",
+          }
+        );
+
+      const fixture =
+        response.data?.response?.[0];
+
+      if (!fixture) {
+        return res.status(404).json({
+          ok: false,
+          error: "Match introuvable",
+        });
+      }
+
+      const eloResult =
+        await updateEloFromFinishedFixture(
+          fixture
+        );
+
+      return res.json({
+        ok: true,
+        elo: eloResult,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
+    }
+  }
+);
+app.get(
+  "/internal/team/:apiTeamId",
+  async (req, res) => {
+    try {
+      const apiTeamId =
+        Number(req.params.apiTeamId);
+
+      const result = await pool.query(
+        `
+          SELECT
+            t.api_team_id,
+            t.name,
+            t.country,
+            t.logo,
+            e.rating,
+            e.matches_played,
+            e.updated_at
+          FROM teams t
+          LEFT JOIN elo_ratings e
+            ON e.team_id = t.id
+          WHERE t.api_team_id = $1
+        `,
+        [apiTeamId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "Équipe absente du classement Elo",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        team: result.rows[0],
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
+    }
+  }
+);
+app.get(
+  "/internal/team/:apiTeamId",
+  async (req, res) => {
+    try {
+      const apiTeamId =
+        Number(req.params.apiTeamId);
+
+      const result = await pool.query(
+        `
+          SELECT
+            t.api_team_id,
+            t.name,
+            t.country,
+            t.logo,
+            e.rating,
+            e.matches_played,
+            e.updated_at
+          FROM teams t
+          LEFT JOIN elo_ratings e
+            ON e.team_id = t.id
+          WHERE t.api_team_id = $1
+        `,
+        [apiTeamId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "Équipe absente du classement Elo",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        team: result.rows[0],
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
+    }
+  }
+);
+app.get(
+  "/internal/elo-rankings",
+  async (req, res) => {
+    try {
+      const limit = Math.min(
+        100,
+        Math.max(
+          1,
+          Number(req.query.limit) || 50
+        )
+      );
+
+      const result = await pool.query(
+        `
+          SELECT
+            t.api_team_id,
+            t.name,
+            t.country,
+            t.logo,
+            e.rating,
+            e.matches_played,
+            e.updated_at
+          FROM elo_ratings e
+          JOIN teams t
+            ON t.id = e.team_id
+          ORDER BY e.rating DESC
+          LIMIT $1
+        `,
+        [limit]
+      );
+
+      return res.json({
+        ok: true,
+        count: result.rows.length,
+        rankings: result.rows.map(
+          (team, index) => ({
+            rank: index + 1,
+            ...team,
+          })
+        ),
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
+    }
+  }
+);
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
