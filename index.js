@@ -2735,7 +2735,18 @@ async function updatePendingPredictions(limit = 20) {
 app.get(
   "/internal/cron/update-results",
   async (req, res) => {
-    try {
+    const secret = req.query.secret;
+
+if (
+  !process.env.INTERNAL_CRON_SECRET ||
+  secret !== process.env.INTERNAL_CRON_SECRET
+) {
+  return res.status(401).json({
+    ok: false,
+    error: "Accès refusé",
+  });
+}
+try {
       const limit = Math.min(
         50,
         Math.max(
