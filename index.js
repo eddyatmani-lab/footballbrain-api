@@ -1153,19 +1153,7 @@ if (value !== null) {
   }
 }
 
-if (
-  probabilities.home + probabilities.draw >= 70
-) {
-  decision = "1X";
-  reason = "La probabilité combinée domicile ou nul dépasse 70 %";
-}
 
-if (
-  probabilities.away + probabilities.draw >= 70
-) {
-  decision = "X2";
-  reason = "La probabilité combinée extérieur ou nul dépasse 70 %";
-}
 
 if (value === null || value < 3) {
   decision = "Pas de pari";
