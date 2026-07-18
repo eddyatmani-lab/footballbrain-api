@@ -1040,27 +1040,32 @@ function computeFootballBrainDecision(footballBrain, market) {
     away: "Victoire extérieur",
   };
 
-  let decision = labelMap[bestOption.key];
+let decision = labelMap[bestOption.key];
+let reason = "Issue la plus probable selon FootballBrain";
 
-  if (
-    probabilities.home +
-      probabilities.draw >=
-    70
-  ) {
-    decision = "1X";
-  }
+if (
+  probabilities.home + probabilities.draw >= 70
+) {
+  decision = "1X";
+  reason = "Le scénario domicile ou nul dépasse 70 %";
+}
 
-  if (
-    probabilities.away +
-      probabilities.draw >=
-    70
-  ) {
-    decision = "X2";
-  }
+if (
+  probabilities.away + probabilities.draw >= 70
+) {
+  decision = "X2";
+  reason = "Le scénario extérieur ou nul dépasse 70 %";
+}
+
+if (value !== null && value < 3) {
+  decision = "Pas de pari";
+  reason = "La cote proposée est trop faible par rapport à la cote juste";
+}
 
   return {
     probabilities,
     decision,
+reason,
     confidence,
     risk,
     fairOdd,
