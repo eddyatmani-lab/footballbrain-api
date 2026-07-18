@@ -615,9 +615,9 @@ const result = {
     homeRecentForm,
     awayRecentForm,
     headToHead: h2hResponse.data?.response || [],
-    odds: {
+    
       market,
-    },
+    
     footballBrain,
   },
 };
@@ -726,6 +726,168 @@ function summarizeMatchWinnerOdds(oddsData) {
     marketFavorite: favorite,
     bookmakersUsed: homeOdds.length,
   };
+}
+app.get("/internal/injuries/:fixtureId", async (req, res) => {
+  try {
+    const fixtureId = Number(req.params.fixtureId);
+
+    const fixture = await callApiFootball("/fixtures", {
+      id: fixtureId,
+    });
+
+    const match = fixture.data.response?.[0];
+
+    if (!match) {
+      return res.status(404).json({
+        ok: false,
+        error: "Match introuvable",
+      });
+    }
+
+    const [home, away] = await Promise.all([
+      callApiFootball("/injuries", {
+        team: match.teams.home.id,
+        season: match.league.season,
+      }),
+      callApiFootball("/injuries", {
+        team: match.teams.away.id,
+        season: match.league.season,
+      }),
+    ]);
+
+    res.json({
+      ok: true,
+      home: home.data.response,
+      away: away.data.response,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
+app.get("/internal/lineups/:fixtureId", async (req, res) => {
+  try {
+    const fixtureId = Number(req.params.fixtureId);
+
+    const response = await callApiFootball(
+      "/fixtures/lineups",
+      {
+        fixture: fixtureId,
+      }
+    );
+
+    res.json({
+      ok: true,
+      count: response.data.results,
+      lineups: response.data.response,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
+app.get("/internal/predictions/:fixtureId", async (req, res) => {
+  try {
+    const fixtureId = Number(req.params.fixtureId);
+
+    const fixture = await callApiFootball("/fixtures", {
+      id: fixtureId,
+    });
+
+    const match = fixture.data.response?.[0];
+
+    const response = await callApiFootball(
+      "/predictions",
+      {
+        fixture: fixtureId,
+      }
+    );
+
+    res.json({
+      ok: true,
+      prediction:
+        response.data.response?.[0] || null,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
+function summarizeMatchWinnerOdds(oddsData) {
+  const home = [];
+  const draw = [];
+  const away = [];
+
+  oddsData.forEach((fixture) => {
+    (fixture.bookmakers || []).forEach(
+      (bookmaker) => {
+        const bet = (
+          bookmaker.bets || []
+        ).find(
+          (b) => b.name === "Match Winner"
+        );
+
+        if (!bet) return;
+
+        bet.values.forEach((value) => {
+          const odd = Number(value.odd);
+
+          if (value.value === "Home")
+            home.push(odd);
+
+          if (value.value === "Draw")
+            draw.push(odd);
+
+          if (value.value === "Away")
+            away.push(odd);
+        });
+      }
+    );
+  });
+
+  const avg = (arr) =>
+    arr.length
+      ? Number(
+          (
+            arr.reduce((a, b) => a + b, 0) /
+            arr.length
+          ).toFixed(2)
+        )
+      : null;
+
+  const result = {
+    homeAverageOdd: avg(home),
+    drawAverageOdd: avg(draw),
+    awayAverageOdd: avg(away),
+  };
+
+  const values = [
+    {
+      key: "home",
+      value: result.homeAverageOdd,
+    },
+    {
+      key: "draw",
+      value: result.drawAverageOdd,
+    },
+    {
+      key: "away",
+      value: result.awayAverageOdd,
+    },
+  ].filter((x) => x.value);
+
+  result.marketFavorite =
+    values.sort(
+      (a, b) => a.value - b.value
+    )[0]?.key;
+
+  return result;
 }
 app.listen(PORT, () => {
   console.log(
