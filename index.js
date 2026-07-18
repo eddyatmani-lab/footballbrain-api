@@ -8,6 +8,10 @@ const ANALYSIS_CACHE_TTL = 60 * 60 * 1000; // 1 heure
 
 const API_BASE_URL =
   "https://v3.football.api-sports.io";
+const fs = require("fs");
+const path = require("path");
+
+const HISTORY_FILE = path.join(__dirname, "predictions-history.json");
 
 function getApiKey() {
   const apiKey =
@@ -637,7 +641,7 @@ const result = {
 footballBrainRating,
 },
 };
-
+saveFootballBrainPrediction(result.analysis);
 analysisCache.set(fixtureId, {
   createdAt: Date.now(),
   data: result,
@@ -1182,6 +1186,105 @@ function computeFootballBrainRating({
     global: globalScore,
   };
 }
+function readPredictionHistory() {
+  try {
+    if (!fs.existsSync(HISTORY_FILE)) {
+      return [];
+    }
+
+    const content = fs.readFileSync(HISTORY_FILE, "utf8");
+
+    return content ? JSON.parse(content) : [];
+  } catch (error) {
+    console.error("Erreur lecture historique :", error.message);
+    return [];
+  }
+}
+
+function savePredictionHistory(history) {
+  fs.writeFileSync(
+    HISTORY_FILE,
+    JSON.stringify(history, null, 2),
+    "utf8"
+  );
+}
+
+function saveFootballBrainPrediction(analysis) {
+  const history = readPredictionHistory();
+
+  const alreadyExists = history.some(
+    (item) => item.fixtureId === analysis.fixtureId
+  );
+
+  if (alreadyExists) {
+    return false;
+  }
+
+  history.push({
+    fixtureId: analysis.fixtureId,
+    createdAt: new Date().toISOString(),
+
+    match: {
+      date: analysis.match?.date,
+      homeTeam: analysis.match?.homeTeam?.name,
+      awayTeam: analysis.match?.awayTeam?.name,
+      league: analysis.match?.league?.name,
+    },
+
+    prediction: {
+      probabilities:
+        analysis.footballBrainDecision?.probabilities,
+
+      decision:
+        analysis.footballBrainDecision?.decision,
+
+      selectedOutcome:
+        analysis.footballBrainDecision?.selectedOutcome,
+
+      confidence:
+        analysis.footballBrainDecision?.confidence,
+
+      risk:
+        analysis.footballBrainDecision?.risk,
+
+      fairOdd:
+        analysis.footballBrainDecision?.fairOdd,
+
+      marketOdd:
+        analysis.footballBrainDecision?.marketOdd,
+
+      value:
+        analysis.footballBrainDecision?.value,
+
+      betStatus:
+        analysis.footballBrainDecision?.betStatus,
+
+      explanation:
+        analysis.footballBrainDecision?.explanation,
+    },
+
+    result: {
+      status: "PENDING",
+      homeGoals: null,
+      awayGoals: null,
+      won: null,
+      profit: null,
+    },
+  });
+
+  savePredictionHistory(history);
+
+  return true;
+}
+app.get("/internal/history", (req, res) => {
+  const history = readPredictionHistory();
+
+  return res.json({
+    ok: true,
+    count: history.length,
+    history,
+  });
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
