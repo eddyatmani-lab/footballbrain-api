@@ -2770,6 +2770,85 @@ try {
     }
   }
 );
+app.get("/public/analysis/:fixtureId", async (req, res) => {
+  try {
+    const fixtureId = Number(req.params.fixtureId);
+
+    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "fixtureId invalide",
+      });
+    }
+
+    const result = await pool.query(
+      `
+        SELECT
+          fixture_id,
+          fixture_date,
+          league_name,
+          home_team_name,
+          away_team_name,
+          decision,
+          bet_status,
+          confidence,
+          risk,
+          home_probability,
+          draw_probability,
+          away_probability,
+          value_percentage,
+          explanation,
+          result_status
+        FROM predictions
+        WHERE fixture_id = $1
+        LIMIT 1
+      `,
+      [fixtureId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "Analyse indisponible",
+      });
+    }
+
+    const item = result.rows[0];
+
+    return res.json({
+      ok: true,
+
+      match: {
+        fixtureId: item.fixture_id,
+        date: item.fixture_date,
+        league: item.league_name,
+        homeTeam: item.home_team_name,
+        awayTeam: item.away_team_name,
+      },
+
+      analysis: {
+        decision: item.decision,
+        betStatus: item.bet_status,
+        probabilities: {
+          home: Number(item.home_probability),
+          draw: Number(item.draw_probability),
+          away: Number(item.away_probability),
+        },
+        confidence: Number(item.confidence),
+        risk: item.risk,
+        value: Number(item.value_percentage),
+        explanation: item.explanation,
+      },
+
+      status: item.result_status,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
