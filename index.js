@@ -1464,16 +1464,128 @@ app.get("/internal/history", async (req, res) => {
     });
   }
 });
-app.get("/internal/stats", (req, res) => {
+app.get("/internal/stats", async (req, res) => {
   try {
-    const history = readPredictionHistory();
+    const result = await pool.query(`
+      SELECT
+        COUNT(*)::INTEGER AS total_predictions,
 
-    const stats =
-      computeHistoryStats(history);
+        COUNT(*) FILTER (
+          WHERE result_status = 'COMPLETED'
+        )::INTEGER AS completed_predictions,
+
+        COUNT(*) FILTER (
+          WHERE result_status = 'PENDING'
+        )::INTEGER AS pending_predictions,
+
+        COUNT(*) FILTER (
+          WHERE bet_status = 'NO_BET'
+        )::INTEGER AS no_bet,
+
+        COUNT(*) FILTER (
+          WHERE result_status = 'COMPLETED'
+            AND bet_status <> 'NO_BET'
+            AND won IS NOT NULL
+        )::INTEGER AS settled_bets,
+
+        COUNT(*) FILTER (
+          WHERE won = TRUE
+        )::INTEGER AS wins,
+
+        COUNT(*) FILTER (
+          WHERE won = FALSE
+        )::INTEGER AS losses,
+
+        COALESCE(
+          SUM(profit) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND bet_status <> 'NO_BET'
+          ),
+          0
+        )::NUMERIC AS total_profit,
+
+        COALESCE(
+          AVG(confidence),
+          0
+        )::NUMERIC AS average_confidence
+      FROM predictions
+    `);
+
+    const row = result.rows[0];
+
+    const settledBets =
+      Number(row.settled_bets);
+
+    const wins = Number(row.wins);
+    const totalProfit =
+      Number(row.total_profit);
+
+    const winRate =
+      settledBets > 0
+        ? Number(
+            (
+              (wins / settledBets) *
+              100
+            ).toFixed(1)
+          )
+        : 0;
+
+    // Chaque pari réglé représente une mise de 1 unité.
+    const roi =
+      settledBets > 0
+        ? Number(
+            (
+              (totalProfit / settledBets) *
+              100
+            ).toFixed(1)
+          )
+        : 0;
+
+    const decisionsResult =
+      await pool.query(`
+        SELECT
+          decision,
+          COUNT(*)::INTEGER AS count
+        FROM predictions
+        GROUP BY decision
+        ORDER BY count DESC
+      `);
+
+    const decisions = {};
+
+    for (const item of decisionsResult.rows) {
+      decisions[
+        item.decision || "Inconnue"
+      ] = Number(item.count);
+    }
 
     return res.json({
       ok: true,
-      stats,
+      stats: {
+        totalPredictions:
+          Number(row.total_predictions),
+        completedPredictions:
+          Number(row.completed_predictions),
+        pendingPredictions:
+          Number(row.pending_predictions),
+        noBet:
+          Number(row.no_bet),
+        settledBets,
+        wins,
+        losses:
+          Number(row.losses),
+        winRate,
+        totalProfit:
+          Number(totalProfit.toFixed(2)),
+        roi,
+        averageConfidence:
+          Number(
+            Number(
+              row.average_confidence
+            ).toFixed(1)
+          ),
+        decisions,
+      },
     });
   } catch (error) {
     return res.status(500).json({
@@ -2418,6 +2530,226 @@ app.get(
             ...team,
           })
         ),
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
+    }
+  }
+);
+function settlePrediction(prediction, fixture) {
+  const homeGoals = fixture.goals?.home;
+  const awayGoals = fixture.goals?.away;
+
+  if (
+    !Number.isFinite(homeGoals) ||
+    !Number.isFinite(awayGoals)
+  ) {
+    throw new Error("Score final indisponible");
+  }
+
+  let actualOutcome = "draw";
+
+  if (homeGoals > awayGoals) {
+    actualOutcome = "home";
+  } else if (awayGoals > homeGoals) {
+    actualOutcome = "away";
+  }
+
+  const isNoBet =
+    prediction.bet_status === "NO_BET";
+
+  if (isNoBet) {
+    return {
+      homeGoals,
+      awayGoals,
+      actualOutcome,
+      won: null,
+      profit: 0,
+    };
+  }
+
+  const won =
+    prediction.selected_outcome === actualOutcome;
+
+  const marketOdd =
+    Number(prediction.market_odd);
+
+  // Mise fixe virtuelle : 1 unité
+  const profit = won
+    ? Number((marketOdd - 1).toFixed(2))
+    : -1;
+
+  return {
+    homeGoals,
+    awayGoals,
+    actualOutcome,
+    won,
+    profit,
+  };
+}
+async function updatePendingPredictions(limit = 20) {
+  const pendingResult = await pool.query(
+    `
+      SELECT *
+      FROM predictions
+      WHERE result_status = 'PENDING'
+        AND fixture_date <= NOW()
+      ORDER BY fixture_date ASC
+      LIMIT $1
+    `,
+    [limit]
+  );
+
+  const summary = {
+    checked: 0,
+    completed: 0,
+    stillPending: 0,
+    errors: 0,
+    items: [],
+  };
+
+  for (const prediction of pendingResult.rows) {
+    summary.checked += 1;
+
+    try {
+      const response = await callApiFootball(
+        "/fixtures",
+        {
+          id: prediction.fixture_id,
+          timezone: "Europe/Paris",
+        }
+      );
+
+      const fixture =
+        response.data?.response?.[0];
+
+      if (!fixture) {
+        throw new Error("Match introuvable");
+      }
+
+      const status =
+        fixture.fixture?.status?.short;
+
+      const finishedStatuses = [
+        "FT",
+        "AET",
+        "PEN",
+      ];
+
+      if (!finishedStatuses.includes(status)) {
+        summary.stillPending += 1;
+
+        summary.items.push({
+          fixtureId: prediction.fixture_id,
+          status,
+          updated: false,
+        });
+
+        continue;
+      }
+
+      const settlement = settlePrediction(
+        prediction,
+        fixture
+      );
+
+      const client = await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        await client.query(
+          `
+            UPDATE predictions
+            SET
+              result_status = 'COMPLETED',
+              home_goals = $1,
+              away_goals = $2,
+              won = $3,
+              profit = $4,
+              updated_at = NOW()
+            WHERE fixture_id = $5
+              AND result_status = 'PENDING'
+          `,
+          [
+            settlement.homeGoals,
+            settlement.awayGoals,
+            settlement.won,
+            settlement.profit,
+            prediction.fixture_id,
+          ]
+        );
+
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+
+      // Cette fonction possède déjà une protection
+      // contre le double traitement d'un même match.
+      const elo =
+        await updateEloFromFinishedFixture(
+          fixture
+        );
+
+      summary.completed += 1;
+
+      summary.items.push({
+        fixtureId: prediction.fixture_id,
+        status,
+        score: {
+          home: settlement.homeGoals,
+          away: settlement.awayGoals,
+        },
+        selectedOutcome:
+          prediction.selected_outcome,
+        actualOutcome:
+          settlement.actualOutcome,
+        betStatus:
+          prediction.bet_status,
+        won: settlement.won,
+        profit: settlement.profit,
+        eloProcessed:
+          !elo.alreadyProcessed,
+        updated: true,
+      });
+    } catch (error) {
+      summary.errors += 1;
+
+      summary.items.push({
+        fixtureId: prediction.fixture_id,
+        updated: false,
+        error: error.message,
+      });
+    }
+  }
+
+  return summary;
+}
+app.get(
+  "/internal/cron/update-results",
+  async (req, res) => {
+    try {
+      const limit = Math.min(
+        50,
+        Math.max(
+          1,
+          Number(req.query.limit) || 20
+        )
+      );
+
+      const summary =
+        await updatePendingPredictions(limit);
+
+      return res.json({
+        ok: true,
+        summary,
       });
     } catch (error) {
       return res.status(500).json({
