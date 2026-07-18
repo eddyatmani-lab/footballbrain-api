@@ -589,7 +589,8 @@ app.get("/internal/analyze/:fixtureId", async (req, res) => {
           count: oddsResponse.data?.results || 0,
           data: oddsResponse.data?.response || [],
         },
-      },
+      footballBrain,
+},
     });
   } catch (error) {
     return res.status(error.response?.status || 500).json({
@@ -601,6 +602,30 @@ app.get("/internal/analyze/:fixtureId", async (req, res) => {
     });
   }
 });
+function computeFootballBrainScore(
+  homeRecent,
+  awayRecent
+) {
+  const scoreMap = {
+    W: 3,
+    D: 1,
+    L: 0,
+  };
+
+  const getScore = (matches) =>
+    matches.reduce((sum, match) => {
+      return sum + scoreMap[match.result];
+    }, 0);
+
+  const homeScore = getScore(homeRecent);
+  const awayScore = getScore(awayRecent);
+
+  return {
+    homeScore,
+    awayScore,
+    advantage: homeScore - awayScore,
+  };
+}
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
