@@ -722,7 +722,7 @@ const result = {
 footballBrainRating,
 },
 };
-saveFootballBrainPrediction(result.analysis);
+await savePredictionToDatabase(result.analysis);
 analysisCache.set(fixtureId, {
   createdAt: Date.now(),
   data: result,
@@ -1455,14 +1455,26 @@ function computeHistoryStats(history) {
     decisions,
   };
 }
-app.get("/internal/history", (req, res) => {
-  const history = readPredictionHistory();
+app.get("/internal/history", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM predictions
+      ORDER BY fixture_date DESC NULLS LAST,
+               created_at DESC
+    `);
 
-  return res.json({
-    ok: true,
-    count: history.length,
-    history,
-  });
+    return res.json({
+      ok: true,
+      count: result.rows.length,
+      history: result.rows,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
 });
 app.get("/internal/stats", (req, res) => {
   try {
@@ -1857,6 +1869,90 @@ app.get("/internal/db-init", async (req, res) => {
     });
   }
 });
+async function savePredictionToDatabase(analysis) {
+  const decision =
+    analysis.footballBrainDecision || {};
+
+  const probabilities =
+    decision.probabilities || {};
+
+  await pool.query(
+    `
+      INSERT INTO predictions (
+        fixture_id,
+        fixture_date,
+        league_id,
+        league_name,
+        home_team_id,
+        home_team_name,
+        away_team_id,
+        away_team_name,
+        decision,
+        selected_outcome,
+        bet_status,
+        confidence,
+        risk,
+        home_probability,
+        draw_probability,
+        away_probability,
+        fair_odd,
+        market_odd,
+        value_percentage,
+        explanation
+      )
+      VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9, $10,
+        $11, $12, $13, $14, $15,
+        $16, $17, $18, $19, $20
+      )
+      ON CONFLICT (fixture_id)
+      DO UPDATE SET
+        fixture_date = EXCLUDED.fixture_date,
+        league_id = EXCLUDED.league_id,
+        league_name = EXCLUDED.league_name,
+        home_team_id = EXCLUDED.home_team_id,
+        home_team_name = EXCLUDED.home_team_name,
+        away_team_id = EXCLUDED.away_team_id,
+        away_team_name = EXCLUDED.away_team_name,
+        decision = EXCLUDED.decision,
+        selected_outcome = EXCLUDED.selected_outcome,
+        bet_status = EXCLUDED.bet_status,
+        confidence = EXCLUDED.confidence,
+        risk = EXCLUDED.risk,
+        home_probability = EXCLUDED.home_probability,
+        draw_probability = EXCLUDED.draw_probability,
+        away_probability = EXCLUDED.away_probability,
+        fair_odd = EXCLUDED.fair_odd,
+        market_odd = EXCLUDED.market_odd,
+        value_percentage = EXCLUDED.value_percentage,
+        explanation = EXCLUDED.explanation,
+        updated_at = NOW()
+    `,
+    [
+      analysis.fixtureId,
+      analysis.match?.date || null,
+      analysis.match?.league?.id || null,
+      analysis.match?.league?.name || null,
+      analysis.match?.homeTeam?.id || null,
+      analysis.match?.homeTeam?.name || null,
+      analysis.match?.awayTeam?.id || null,
+      analysis.match?.awayTeam?.name || null,
+      decision.decision || null,
+      decision.selectedOutcome || null,
+      decision.betStatus || null,
+      decision.confidence ?? null,
+      decision.risk || null,
+      probabilities.home ?? null,
+      probabilities.draw ?? null,
+      probabilities.away ?? null,
+      decision.fairOdd ?? null,
+      decision.marketOdd ?? null,
+      decision.value ?? null,
+      decision.explanation || null,
+    ]
+  );
+}
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
