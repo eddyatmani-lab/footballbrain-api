@@ -633,18 +633,13 @@ const rawOdds = oddsResponse.data?.response || [];
 
 const market = summarizeMatchWinnerOdds(rawOdds);
 
-const poissonModel = {
-  expectedGoals: {
-    home: 1.3,
-    away: 1.1,
-  },
-
-  probabilities: {
-    home: 40,
-    draw: 28,
-    away: 32,
-  },
-};
+const poissonModel =
+  computePoissonModel({
+    homeRecentForm,
+    awayRecentForm,
+    homeTeamId,
+    awayTeamId,
+  });
 
 const monteCarloModel =
   FootballMonteCarlo(
@@ -662,14 +657,6 @@ const monteCarloModel =
           poissonModel.expectedGoals.home,
         xgAway:
           poissonModel.expectedGoals.away,
-      },
-      prediction: {
-        homeProb:
-          poissonModel.probabilities.home,
-        drawProb:
-          poissonModel.probabilities.draw,
-        awayProb:
-          poissonModel.probabilities.away,
       },
     },
     10000,
@@ -3555,6 +3542,114 @@ function computeFootballBrainPickScore({
     },
 
     hasOdds,
+  };
+}
+function computePoissonModel({
+  homeRecentForm,
+  awayRecentForm,
+  homeTeamId,
+  awayTeamId,
+}) {
+  function computeTeamAverages(matches, teamId) {
+    if (!Array.isArray(matches) || matches.length === 0) {
+      return {
+        goalsForAverage: 1,
+        goalsAgainstAverage: 1,
+      };
+    }
+
+    let goalsForTotal = 0;
+    let goalsAgainstTotal = 0;
+    let validMatches = 0;
+
+    for (const match of matches) {
+      const isHome =
+        match.teams?.home?.id === teamId;
+
+      const goalsFor = isHome
+        ? match.goals?.home
+        : match.goals?.away;
+
+      const goalsAgainst = isHome
+        ? match.goals?.away
+        : match.goals?.home;
+
+      if (
+        !Number.isFinite(goalsFor) ||
+        !Number.isFinite(goalsAgainst)
+      ) {
+        continue;
+      }
+
+      goalsForTotal += goalsFor;
+      goalsAgainstTotal += goalsAgainst;
+      validMatches += 1;
+    }
+
+    if (validMatches === 0) {
+      return {
+        goalsForAverage: 1,
+        goalsAgainstAverage: 1,
+      };
+    }
+
+    return {
+      goalsForAverage:
+        goalsForTotal / validMatches,
+
+      goalsAgainstAverage:
+        goalsAgainstTotal / validMatches,
+    };
+  }
+
+  const homeAverages =
+    computeTeamAverages(
+      homeRecentForm,
+      homeTeamId
+    );
+
+  const awayAverages =
+    computeTeamAverages(
+      awayRecentForm,
+      awayTeamId
+    );
+
+  const expectedHomeGoals = Number(
+    (
+      (
+        homeAverages.goalsForAverage +
+        awayAverages.goalsAgainstAverage
+      ) / 2
+    ).toFixed(2)
+  );
+
+  const expectedAwayGoals = Number(
+    (
+      (
+        awayAverages.goalsForAverage +
+        homeAverages.goalsAgainstAverage
+      ) / 2
+    ).toFixed(2)
+  );
+
+  return {
+    expectedGoals: {
+      home: Math.max(0.05, expectedHomeGoals),
+      away: Math.max(0.05, expectedAwayGoals),
+      total: Number(
+        (
+          expectedHomeGoals +
+          expectedAwayGoals
+        ).toFixed(2)
+      ),
+    },
+
+    source: "recent-form-goals",
+    quality:
+      homeRecentForm.length >= 5 &&
+      awayRecentForm.length >= 5
+        ? "medium"
+        : "low",
   };
 }
 app.listen(PORT, () => {
