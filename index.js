@@ -3122,15 +3122,86 @@ const priorityLeagueIds = [
   203, // Süper Lig
   253, // MLS
 ];
-     const priorityFixtures = fixtures.filter(
-  (fixture) =>
+     function getFixturePriorityScore(fixture) {
+  const leagueId = fixture.league?.id;
+  const round = String(
+    fixture.league?.round || ""
+  ).toLowerCase();
+
+  let score = 0;
+
+  // Priorité par compétition
+  const leaguePriority = {
+    2: 100,   // Champions League
+    3: 90,    // Europa League
+    848: 80,  // Conference League
+    39: 75,   // Premier League
+    140: 75,  // La Liga
+    135: 75,  // Serie A
+    78: 75,   // Bundesliga
+    61: 75,   // Ligue 1
+    94: 65,   // Primeira Liga
+    88: 65,   // Eredivisie
+    203: 60,  // Süper Lig
+    253: 55,  // MLS
+  };
+
+  score += leaguePriority[leagueId] || 0;
+
+  // Bonus selon le tour
+  if (round.includes("final")) {
+    score += 30;
+  } else if (round.includes("semi")) {
+    score += 25;
+  } else if (round.includes("quarter")) {
+    score += 20;
+  } else if (round.includes("play-off")) {
+    score += 15;
+  } else if (round.includes("qualifying")) {
+    score += 10;
+  }
+
+  // Bonus si les équipes sont bien identifiées
+  if (
+    fixture.teams?.home?.id &&
+    fixture.teams?.away?.id
+  ) {
+    score += 5;
+  }
+
+  // Bonus si le stade est connu
+  if (fixture.fixture?.venue?.name) {
+    score += 2;
+  }
+
+  // Bonus si l'heure du match est disponible
+  if (fixture.fixture?.date) {
+    score += 2;
+  }
+
+  return score;
+}
+
+const priorityFixtures = fixtures
+  .filter((fixture) =>
     priorityLeagueIds.includes(
       fixture.league?.id
     )
-);
+  )
+  .map((fixture) => ({
+    fixture,
+    priorityScore:
+      getFixturePriorityScore(fixture),
+  }))
+  .sort(
+    (a, b) =>
+      b.priorityScore - a.priorityScore
+  );
 
 const selectedFixtures =
-  priorityFixtures.slice(0, limit);
+  priorityFixtures
+    .slice(0, limit)
+    .map((item) => item.fixture);
 
       const summary = {
         date: requestedDate,
@@ -3164,18 +3235,30 @@ selected: selectedFixtures.length,
 
           summary.analyzed += 1;
 
-          summary.items.push({
-            fixtureId,
-            homeTeam:
-              fixture.teams?.home?.name,
-            awayTeam:
-              fixture.teams?.away?.name,
-            decision:
-              response.data?.analysis
-                ?.footballBrainDecision
-                ?.decision || null,
-            success: true,
-          });
+          const priorityItem =
+  priorityFixtures.find(
+    (item) =>
+      item.fixture.fixture?.id === fixtureId
+  );
+
+summary.items.push({
+  fixtureId,
+  homeTeam:
+    fixture.teams?.home?.name,
+  awayTeam:
+    fixture.teams?.away?.name,
+  league:
+    fixture.league?.name,
+  round:
+    fixture.league?.round,
+  priorityScore:
+    priorityItem?.priorityScore || 0,
+  decision:
+    response.data?.analysis
+      ?.footballBrainDecision
+      ?.decision || null,
+  success: true,
+});
         } catch (error) {
           summary.failed += 1;
 
