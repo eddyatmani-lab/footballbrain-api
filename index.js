@@ -742,7 +742,8 @@ const footballBrain = {
 const footballBrainDecision =
   computeFootballBrainDecision(
     footballBrain,
-    market
+    market,
+    monteCarloModel
   );
 const monteCarloAgreement = {
   favorite:
@@ -1064,7 +1065,11 @@ function summarizeMatchWinnerOdds(oddsData) {
 
   return result;
 }
-function computeFootballBrainDecision(footballBrain, market) {
+function computeFootballBrainDecision(
+  footballBrain,
+  market,
+  monteCarloModel
+) {
   const homeFormScore = footballBrain.homeScore || 0;
   const awayFormScore = footballBrain.awayScore || 0;
 
@@ -1107,18 +1112,48 @@ function computeFootballBrainDecision(footballBrain, market) {
   homeMarketProbability /= marketTotal;
   drawMarketProbability /= marketTotal;
   awayMarketProbability /= marketTotal;
+const monteCarloHome =
+  Number(monteCarloModel?.homeWin);
 
+const monteCarloDraw =
+  Number(monteCarloModel?.draw);
+
+const monteCarloAway =
+  Number(monteCarloModel?.awayWin);
+
+const monteCarloAvailable =
+  Number.isFinite(monteCarloHome) &&
+  Number.isFinite(monteCarloDraw) &&
+  Number.isFinite(monteCarloAway);
+
+const monteCarloHomeProbability =
+  monteCarloAvailable
+    ? monteCarloHome / 100
+    : homeMarketProbability;
+
+const monteCarloDrawProbability =
+  monteCarloAvailable
+    ? monteCarloDraw / 100
+    : drawMarketProbability;
+
+const monteCarloAwayProbability =
+  monteCarloAvailable
+    ? monteCarloAway / 100
+    : awayMarketProbability;
   const homeProbability =
-    homeFormProbability * 0.45 +
-    homeMarketProbability * 0.55;
+  homeFormProbability * 0.35 +
+  homeMarketProbability * 0.4 +
+  monteCarloHomeProbability * 0.25;
 
-  const awayProbability =
-    awayFormProbability * 0.45 +
-    awayMarketProbability * 0.55;
+const awayProbability =
+  awayFormProbability * 0.35 +
+  awayMarketProbability * 0.4 +
+  monteCarloAwayProbability * 0.25;
 
-  let drawProbability =
-    drawMarketProbability * 0.8 + 0.05;
-
+let drawProbability =
+  drawMarketProbability * 0.5 +
+  monteCarloDrawProbability * 0.4 +
+  0.03;
   const probabilityTotal =
     homeProbability +
     drawProbability +
@@ -1256,6 +1291,15 @@ return {
   marketOdd: bestOption.odd || null,
   value,
   selectedOutcome: bestOption.key,
+monteCarlo: {
+  available: monteCarloAvailable,
+  favorite:
+    monteCarloFavorite?.key || null,
+  probability:
+    monteCarloFavorite?.probability || null,
+  agrees:
+    monteCarloAgreement,
+},
 };
 }
 function computeFootballBrainRating({
