@@ -1277,7 +1277,33 @@ const explanation =
   decision === "Pas de pari"
     ? `${selectedLabel} est actuellement le scénario le plus probable à ${bestOption.probability} %, mais la cote de ${bestOption.odd ?? "N/A"} est inférieure à la cote juste estimée à ${fairOdd ?? "N/A"}. FootballBrain ne détecte donc pas de value suffisante.`
     : `FootballBrain recommande ${decision}. La probabilité estimée est de ${bestOption.probability} %, avec une cote juste de ${fairOdd ?? "N/A"} et une value de ${value ?? "N/A"} %.`;
+const monteCarloFavorite = [
+  {
+    key: "home",
+    probability: monteCarloHome,
+  },
+  {
+    key: "draw",
+    probability: monteCarloDraw,
+  },
+  {
+    key: "away",
+    probability: monteCarloAway,
+  },
+]
+  .filter((item) =>
+    Number.isFinite(item.probability)
+  )
+  .sort(
+    (a, b) =>
+      b.probability - a.probability
+  )[0] || null;
 
+const monteCarloAgreement =
+  monteCarloFavorite
+    ? monteCarloFavorite.key ===
+      bestOption.key
+    : null;
 return {
   probabilities,
   decision,
