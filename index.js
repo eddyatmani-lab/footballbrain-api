@@ -3241,22 +3241,58 @@ selected: selectedFixtures.length,
       item.fixture.fixture?.id === fixtureId
   );
 
+const priorityItem =
+  priorityFixtures.find(
+    (item) =>
+      item.fixture.fixture?.id === fixtureId
+  );
+
+const analysis =
+  response.data?.analysis || {};
+
+const decision =
+  analysis.footballBrainDecision || {};
+
+const market =
+  analysis.market || {};
+
 summary.items.push({
   fixtureId,
+
   homeTeam:
     fixture.teams?.home?.name,
+
   awayTeam:
     fixture.teams?.away?.name,
+
   league:
     fixture.league?.name,
+
   round:
     fixture.league?.round,
+
+  kickoff:
+    fixture.fixture?.date,
+
   priorityScore:
     priorityItem?.priorityScore || 0,
+
+  hasOdds:
+    market.homeAverageOdd !== null &&
+    market.homeAverageOdd !== undefined,
+
+  confidence:
+    Number(decision.confidence || 0),
+
+  value:
+    decision.value === null ||
+    decision.value === undefined
+      ? -999
+      : Number(decision.value),
+
   decision:
-    response.data?.analysis
-      ?.footballBrainDecision
-      ?.decision || null,
+    decision.decision || null,
+
   success: true,
 });
         } catch (error) {
@@ -3275,7 +3311,25 @@ summary.items.push({
           });
         }
       }
+summary.items.sort((a, b) => {
+  if (b.priorityScore !== a.priorityScore) {
+    return b.priorityScore - a.priorityScore;
+  }
 
+  if (b.hasOdds !== a.hasOdds) {
+    return Number(b.hasOdds) - Number(a.hasOdds);
+  }
+
+  if (b.confidence !== a.confidence) {
+    return b.confidence - a.confidence;
+  }
+
+  if (b.value !== a.value) {
+    return b.value - a.value;
+  }
+
+  return new Date(a.kickoff) - new Date(b.kickoff);
+});
       return res.json({
         ok: true,
         summary,
