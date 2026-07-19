@@ -702,6 +702,12 @@ const footballBrainRating =
     market,
     headToHead,
   });
+const footballBrainPickScore =
+  computeFootballBrainPickScore({
+    decision: footballBrainDecision,
+    market,
+    footballBrain,
+  });
 const result = {
   ok: true,
   analysis: {
@@ -720,6 +726,7 @@ const result = {
     footballBrain,
   footballBrainDecision,
 footballBrainRating,
+footballBrainPickScore,
 },
 };
 await savePredictionToDatabase(result.analysis);
@@ -3251,6 +3258,8 @@ const decision =
 
 const market =
   analysis.market || {};
+const pickScore =
+  analysis.footballBrainPickScore || {};
 
 summary.items.push({
   fixtureId,
@@ -3285,7 +3294,11 @@ summary.items.push({
     decision.value === undefined
       ? -999
       : Number(decision.value),
+footballBrainScore:
+  Number(pickScore.score || 0),
 
+footballBrainLevel:
+  pickScore.level || null,
   decision:
     decision.decision || null,
 
@@ -3315,7 +3328,15 @@ summary.items.sort((a, b) => {
   if (b.hasOdds !== a.hasOdds) {
     return Number(b.hasOdds) - Number(a.hasOdds);
   }
-
+if (
+  b.footballBrainScore !==
+  a.footballBrainScore
+) {
+  return (
+    b.footballBrainScore -
+    a.footballBrainScore
+  );
+}
   if (b.confidence !== a.confidence) {
     return b.confidence - a.confidence;
   }
@@ -3340,6 +3361,153 @@ summary.items.sort((a, b) => {
     }
   }
 );
+function computeFootballBrainPickScore({
+  decision,
+  market,
+  footballBrain,
+}) {
+  const confidence =
+    Number(decision?.confidence || 0);
+
+  const value =
+    Number(decision?.value || 0);
+
+  const phaseOne =
+    footballBrain?.context?.phaseOne || {};
+
+  const phaseTwo =
+    footballBrain?.context?.phaseTwo || {};
+
+  // 30 points maximum pour la confiance
+  const confidencePoints = Math.min(
+    30,
+    Math.max(0, confidence * 0.3)
+  );
+
+  // 25 points maximum pour la value
+  let valuePoints = 0;
+
+  if (value >= 15) {
+    valuePoints = 25;
+  } else if (value >= 10) {
+    valuePoints = 20;
+  } else if (value >= 5) {
+    valuePoints = 15;
+  } else if (value >= 3) {
+    valuePoints = 8;
+  }
+
+  // 15 points si les cotes sont disponibles
+  const hasOdds =
+    Number.isFinite(
+      Number(market?.homeAverageOdd)
+    ) ||
+    Number.isFinite(
+      Number(market?.drawAverageOdd)
+    ) ||
+    Number.isFinite(
+      Number(market?.awayAverageOdd)
+    );
+
+  const oddsPoints = hasOdds ? 15 : 0;
+
+  // 10 points selon l’accord avec le marché
+  const marketAgreement =
+    phaseOne?.marketAgreement?.agrees;
+
+  const marketAgreementPoints =
+    marketAgreement === true ? 10 : 5;
+
+  // 10 points pour la qualité des données
+  let dataQualityPoints = 0;
+
+  if (
+    phaseTwo?.fatigue?.homeRestDays !== null &&
+    phaseTwo?.fatigue?.awayRestDays !== null
+  ) {
+    dataQualityPoints += 4;
+  }
+
+  if (
+    typeof phaseTwo?.injuries?.homeCount ===
+      "number" &&
+    typeof phaseTwo?.injuries?.awayCount ===
+      "number"
+  ) {
+    dataQualityPoints += 3;
+  }
+
+  if (
+    phaseTwo?.lineups?.homeConfirmed &&
+    phaseTwo?.lineups?.awayConfirmed
+  ) {
+    dataQualityPoints += 3;
+  }
+
+  // 10 points liés au statut final
+  let decisionPoints = 0;
+
+  if (decision?.betStatus === "VALUE_BET") {
+    decisionPoints = 10;
+  } else if (
+    decision?.betStatus === "À_SURVEILLER"
+  ) {
+    decisionPoints = 5;
+  }
+
+  const score = Math.round(
+    confidencePoints +
+      valuePoints +
+      oddsPoints +
+      marketAgreementPoints +
+      dataQualityPoints +
+      decisionPoints
+  );
+
+  let level = "PAS DE PARI";
+
+  if (score >= 90) {
+    level = "EXCELLENT";
+  } else if (score >= 80) {
+    level = "TRÈS FORT";
+  } else if (score >= 70) {
+    level = "INTÉRESSANT";
+  } else if (score >= 60) {
+    level = "À SURVEILLER";
+  }
+
+  // Sécurité : aucun pari recommandé sans cotes
+  if (!hasOdds) {
+    level = "DONNÉES INCOMPLÈTES";
+  }
+
+  // Sécurité : une value insuffisante reste un NO BET
+  if (
+    decision?.betStatus === "NO_BET"
+  ) {
+    level = "PAS DE PARI";
+  }
+
+  return {
+    score,
+    level,
+
+    breakdown: {
+      confidence:
+        Number(confidencePoints.toFixed(1)),
+      value: valuePoints,
+      odds: oddsPoints,
+      marketAgreement:
+        marketAgreementPoints,
+      dataQuality:
+        dataQualityPoints,
+      decision:
+        decisionPoints,
+    },
+
+    hasOdds,
+  };
+}
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
