@@ -3108,14 +3108,35 @@ app.get(
           Number(req.query.limit) || 10
         )
       );
+const priorityLeagueIds = [
+  2,   // UEFA Champions League
+  3,   // UEFA Europa League
+  848, // UEFA Conference League
+  39,  // Premier League
+  140, // La Liga
+  135, // Serie A
+  78,  // Bundesliga
+  61,  // Ligue 1
+  94,  // Primeira Liga
+  88,  // Eredivisie
+  203, // Süper Lig
+  253, // MLS
+];
+     const priorityFixtures = fixtures.filter(
+  (fixture) =>
+    priorityLeagueIds.includes(
+      fixture.league?.id
+    )
+);
 
-      const selectedFixtures =
-        fixtures.slice(0, limit);
+const selectedFixtures =
+  priorityFixtures.slice(0, limit);
 
       const summary = {
         date: requestedDate,
         fixturesFound: fixtures.length,
-        selected: selectedFixtures.length,
+        priorityFixturesFound: priorityFixtures.length,
+selected: selectedFixtures.length,
         analyzed: 0,
         failed: 0,
         items: [],
