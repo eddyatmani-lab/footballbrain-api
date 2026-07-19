@@ -664,6 +664,23 @@ const monteCarloModel =
       seed: fixtureId,
     }
   );
+const monteCarloFavorite = [
+  {
+    key: "home",
+    probability: monteCarloModel.homeWin,
+  },
+  {
+    key: "draw",
+    probability: monteCarloModel.draw,
+  },
+  {
+    key: "away",
+    probability: monteCarloModel.awayWin,
+  },
+].sort(
+  (a, b) =>
+    b.probability - a.probability
+)[0];
 
 const baseFootballBrain =
   computeFootballBrainScore(
@@ -727,6 +744,19 @@ const footballBrainDecision =
     footballBrain,
     market
   );
+const monteCarloAgreement = {
+  favorite:
+    monteCarloFavorite.key,
+
+  probability:
+    Number(
+      monteCarloFavorite.probability
+    ),
+
+  agreesWithDecision:
+    monteCarloFavorite.key ===
+    footballBrainDecision.selectedOutcome,
+};
 const headToHead =
   h2hResponse.data?.response || [];
 
@@ -759,6 +789,7 @@ const result = {
       market,
     poissonModel,
 monteCarloModel,
+monteCarloAgreement,
     footballBrain,
   footballBrainDecision,
 footballBrainRating,
