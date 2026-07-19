@@ -3235,11 +3235,7 @@ selected: selectedFixtures.length,
 
           summary.analyzed += 1;
 
-          const priorityItem =
-  priorityFixtures.find(
-    (item) =>
-      item.fixture.fixture?.id === fixtureId
-  );
+         
 
 const priorityItem =
   priorityFixtures.find(
