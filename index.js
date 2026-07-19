@@ -633,13 +633,18 @@ const rawOdds = oddsResponse.data?.response || [];
 
 const market = summarizeMatchWinnerOdds(rawOdds);
 
-const poissonModel =
-  computePoissonModel({
-    homeRecentForm,
-    awayRecentForm,
-    homeTeamId,
-    awayTeamId,
-  });
+const poissonModel = {
+  expectedGoals: {
+    home: 1.3,
+    away: 1.1,
+  },
+
+  probabilities: {
+    home: 40,
+    draw: 28,
+    away: 32,
+  },
+};
 
 const monteCarloModel =
   FootballMonteCarlo(
