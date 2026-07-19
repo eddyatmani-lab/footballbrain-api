@@ -3591,15 +3591,39 @@ function computeFootballBrainPickScore({
   ) {
     decisionPoints = 5;
   }
+const monteCarlo =
+  decision?.monteCarlo || {};
 
-  const score = Math.round(
-    confidencePoints +
-      valuePoints +
-      oddsPoints +
-      marketAgreementPoints +
-      dataQualityPoints +
-      decisionPoints
-  );
+let monteCarloPoints = 0;
+
+if (monteCarlo.available) {
+  if (monteCarlo.agrees === true) {
+    monteCarloPoints = 10;
+  } else if (monteCarlo.agrees === false) {
+    monteCarloPoints = -5;
+  }
+
+  if (
+    Number(monteCarlo.probability) >= 70 &&
+    monteCarlo.agrees === true
+  ) {
+    monteCarloPoints = 15;
+  }
+}
+  const rawScore = Math.round(
+  confidencePoints +
+    valuePoints +
+    oddsPoints +
+    marketAgreementPoints +
+    dataQualityPoints +
+    decisionPoints +
+    monteCarloPoints
+);
+
+const score = Math.max(
+  0,
+  Math.min(100, rawScore)
+);
 
   let level = "PAS DE PARI";
 
@@ -3640,7 +3664,8 @@ function computeFootballBrainPickScore({
         dataQualityPoints,
       decision:
         decisionPoints,
-    },
+    monteCarlo: monteCarloPoints,
+},
 
     hasOdds,
   };
