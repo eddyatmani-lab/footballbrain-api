@@ -3062,6 +3062,130 @@ app.get("/public/daily-picks", async (req, res) => {
     });
   }
 });
+app.get(
+  "/internal/cron/analyze-daily",
+  async (req, res) => {
+    const secret = req.query.secret;
+
+    if (
+      !process.env.INTERNAL_CRON_SECRET ||
+      secret !== process.env.INTERNAL_CRON_SECRET
+    ) {
+      return res.status(401).json({
+        ok: false,
+        error: "Accès refusé",
+      });
+    }
+
+    try {
+      const requestedDate =
+        req.query.date ||
+        new Date().toISOString().slice(0, 10);
+
+      const dateFormat = /^\d{4}-\d{2}-\d{2}$/;
+
+      if (!dateFormat.test(requestedDate)) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "La date doit être au format YYYY-MM-DD",
+        });
+      }
+
+      const fixturesResponse =
+        await callApiFootball("/fixtures", {
+          date: requestedDate,
+          timezone: "Europe/Paris",
+        });
+
+      const fixtures =
+        fixturesResponse.data?.response || [];
+
+      const limit = Math.min(
+        20,
+        Math.max(
+          1,
+          Number(req.query.limit) || 10
+        )
+      );
+
+      const selectedFixtures =
+        fixtures.slice(0, limit);
+
+      const summary = {
+        date: requestedDate,
+        fixturesFound: fixtures.length,
+        selected: selectedFixtures.length,
+        analyzed: 0,
+        failed: 0,
+        items: [],
+      };
+
+      const baseUrl =
+        process.env.PUBLIC_API_URL ||
+        `http://127.0.0.1:${PORT}`;
+
+      for (const fixture of selectedFixtures) {
+        const fixtureId =
+          fixture.fixture?.id;
+
+        if (!fixtureId) {
+          continue;
+        }
+
+        try {
+          const response = await axios.get(
+            `${baseUrl}/internal/analyze/${fixtureId}`,
+            {
+              timeout: 120000,
+            }
+          );
+
+          summary.analyzed += 1;
+
+          summary.items.push({
+            fixtureId,
+            homeTeam:
+              fixture.teams?.home?.name,
+            awayTeam:
+              fixture.teams?.away?.name,
+            decision:
+              response.data?.analysis
+                ?.footballBrainDecision
+                ?.decision || null,
+            success: true,
+          });
+        } catch (error) {
+          summary.failed += 1;
+
+          summary.items.push({
+            fixtureId,
+            homeTeam:
+              fixture.teams?.home?.name,
+            awayTeam:
+              fixture.teams?.away?.name,
+            success: false,
+            error:
+              error.response?.data ||
+              error.message,
+          });
+        }
+      }
+
+      return res.json({
+        ok: true,
+        summary,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          error.response?.data ||
+          error.message,
+      });
+    }
+  }
+);
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
