@@ -3,7 +3,9 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
-
+const {
+  FootballMonteCarlo,
+} = require("./FootballMonteCarlo");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -630,6 +632,47 @@ const awayResults = awayRecentForm.map(
 const rawOdds = oddsResponse.data?.response || [];
 
 const market = summarizeMatchWinnerOdds(rawOdds);
+
+const poissonModel =
+  computePoissonModel({
+    homeRecentForm,
+    awayRecentForm,
+    homeTeamId,
+    awayTeamId,
+  });
+
+const monteCarloModel =
+  FootballMonteCarlo(
+    {
+      id: fixtureId,
+      xg_home:
+        poissonModel.expectedGoals.home,
+      xg_away:
+        poissonModel.expectedGoals.away,
+    },
+    {
+      match: {
+        id: fixtureId,
+        xgHome:
+          poissonModel.expectedGoals.home,
+        xgAway:
+          poissonModel.expectedGoals.away,
+      },
+      prediction: {
+        homeProb:
+          poissonModel.probabilities.home,
+        drawProb:
+          poissonModel.probabilities.draw,
+        awayProb:
+          poissonModel.probabilities.away,
+      },
+    },
+    10000,
+    {
+      seed: fixtureId,
+    }
+  );
+
 const baseFootballBrain =
   computeFootballBrainScore(
     homeResults.map((result) => ({ result })),
@@ -722,7 +765,8 @@ const result = {
     awayRecentForm,
     headToHead,
       market,
-    
+    poissonModel,
+monteCarloModel,
     footballBrain,
   footballBrainDecision,
 footballBrainRating,
