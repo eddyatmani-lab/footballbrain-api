@@ -1,6 +1,10 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
+require("dotenv").config();
+
+const PORT =
+  Number(process.env.PORT) || 3000;
 const {
   computeAdvancedXGModel,
 } = require("./src/services/FootballXGModel");
@@ -11,7 +15,7 @@ const {
   FootballMonteCarlo,
 } = require("./FootballMonteCarlo");
 const app = express();
-const PORT = process.env.PORT || 3000;
+
 
 const analysisCache = new Map();
 const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
@@ -4287,11 +4291,7 @@ app.get("/test-fixtures", async (req, res) => {
     });
   }
 });
-app.listen(PORT, () => {
-  console.log(
-    `Server running on port ${PORT}`
-  );
-});
+
 
 
 
@@ -8394,8 +8394,9 @@ app.get(
     }
   }
 );
-app.listen(PORT, () => {
+
+app.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `Server running on port ${PORT}`
+    `FootballBrain API running on 0.0.0.0:${PORT}`
   );
 });
