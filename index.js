@@ -11,12 +11,19 @@ const {
 const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
+const cors = require("cors");
 const {
   FootballMonteCarlo,
 } = require("./FootballMonteCarlo");
 const app = express();
-
-
+app.use(
+  cors({
+    origin: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.use(express.json());
 const analysisCache = new Map();
 const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
 
