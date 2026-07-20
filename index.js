@@ -1627,7 +1627,7 @@ modelInputs: {
       awayFormProbability.toFixed(4)
     ),
   },
-decisionTrace,
+
   market: {
     home: Number(
       homeMarketProbability.toFixed(4)
@@ -1651,9 +1651,11 @@ decisionTrace,
       monteCarloAwayProbability.toFixed(4)
     ),
   },
-decisionTrace,
 },
-  monteCarlo: {
+
+decisionTrace,
+
+monteCarlo: {
   available: monteCarloAvailable,
   favorite:
     monteCarloFavorite?.key || null,
