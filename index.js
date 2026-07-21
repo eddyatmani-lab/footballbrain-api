@@ -7990,10 +7990,11 @@ app.get(
             monte_carlo_weight,
 
             decision_trace,
-            model_inputs,
+model_inputs,
+monte_carlo_model,
 
-            explanation,
-            updated_at
+explanation,
+updated_at
           FROM predictions
           WHERE fixture_id = $1
           LIMIT 1
@@ -8190,7 +8191,8 @@ app.get(
 
         modelInputs:
           prediction.model_inputs || {},
-
+monteCarloModel:
+  prediction.monte_carlo_model || null,
         decisionTrace:
           Array.isArray(
             prediction.decision_trace
