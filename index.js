@@ -998,11 +998,18 @@ const result = {
     footballBrainPickScore,
   },
 };
-
+console.log(
+  "AVANT SAUVEGARDE DB",
+  result?.analysis?.fixtureId ||
+    analysis?.fixtureId ||
+    null
+);
 await savePredictionToDatabase(
   result.analysis
 );
-
+console.log(
+  "APRES SAUVEGARDE DB"
+);
 analysisCache.set(fixtureId, {
   createdAt: Date.now(),
   data: result,
@@ -1128,32 +1135,18 @@ function summarizeMatchWinnerOdds(oddsData) {
 }
 app.get("/internal/injuries/:fixtureId", async (req, res) => {
   try {
-    const fixtureId = Number(req.params.fixtureId);
+        const [home, away] =
+  await Promise.all([
+    callApiFootball("/injuries", {
+      team: match.teams.home.id,
+      season: match.league.season,
+    }),
 
-    const fixture = await callApiFootball("/fixtures", {
-      id: fixtureId,
-    });
-
-    const match = fixture.data.response?.[0];
-
-    if (!match) {
-      return res.status(404).json({
-        ok: false,
-        error: "Match introuvable",
-      });
-    }
-
-    const [home, away] = await Promise.all([
-      callApiFootball("/injuries", {
-        team: match.teams.home.id,
-        season: match.league.season,
-      }),
-      callApiFootball("/injuries", {
-        team: match.teams.away.id,
-        season: match.league.season,
-      }),
-    ]);
-
+    callApiFootball("/injuries", {
+      team: match.teams.away.id,
+      season: match.league.season,
+    }),
+  ]);
     res.json({
       ok: true,
       home: home.data.response,
@@ -2478,6 +2471,8 @@ ADD COLUMN IF NOT EXISTS decision_trace JSONB;
 
 ALTER TABLE predictions
 ADD COLUMN IF NOT EXISTS model_inputs JSONB;
+ ALTER TABLE predictions
+ADD COLUMN IF NOT EXISTS monte_carlo_model JSONB;
       `);
 }
 app.get("/internal/db-init", async (req, res) => {
@@ -2502,7 +2497,8 @@ app.get("/internal/db-init", async (req, res) => {
   }
 });
 async function savePredictionToDatabase(analysis) {
-  const decision =
+ 
+    const decision =
     analysis.footballBrainDecision || {};
 
   const probabilities =
@@ -2520,8 +2516,12 @@ const decisionTrace =
 
 const modelInputs =
   decision.modelInputs || {};
-  await pool.query(
-    `
+  const monteCarloModel =
+  analysis.monteCarloModel || {};
+          
+              
+          await pool.query(
+   `
       INSERT INTO predictions (
         fixture_id,
         fixture_date,
@@ -2552,7 +2552,8 @@ form_weight,
 market_weight,
 monte_carlo_weight,
 decision_trace,
-model_inputs
+model_inputs,
+monte_carlo_model
       )
       VALUES (
   $1, $2, $3, $4, $5,
@@ -2560,7 +2561,8 @@ model_inputs
   $11, $12, $13, $14, $15,
   $16, $17, $18, $19, $20,
   $21, $22, $23, $24, $25,
-  $26, $27, $28, $29, $30
+  $26, $27, $28, $29, $30,
+  $31
 )
       ON CONFLICT (fixture_id)
       DO UPDATE SET
@@ -2593,6 +2595,8 @@ market_weight = EXCLUDED.market_weight,
 monte_carlo_weight = EXCLUDED.monte_carlo_weight,
 decision_trace = EXCLUDED.decision_trace,
 model_inputs = EXCLUDED.model_inputs,
+          monte_carlo_model =
+  EXCLUDED.monte_carlo_model,
       updated_at = NOW()
     `,
     [
@@ -2626,6 +2630,7 @@ weights.market ?? null,
 weights.monteCarlo ?? null,
 JSON.stringify(decisionTrace),
 JSON.stringify(modelInputs),
+JSON.stringify(monteCarloModel),
     ]
   );
 }
@@ -2646,7 +2651,9 @@ async function upsertTeam(team, country = null) {
         name = EXCLUDED.name,
         country = COALESCE(EXCLUDED.country, teams.country),
         logo = EXCLUDED.logo,
-        updated_at = NOW()
+        monte_carlo_model =
+  EXCLUDED.monte_carlo_model,
+      updated_at = NOW()
 
       RETURNING *
     `,
@@ -6205,201 +6212,7 @@ app.get("/internal/db-init", async (req, res) => {
     });
   }
 });
-async function savePredictionToDatabase(analysis) {
-  const decision =
-    analysis.footballBrainDecision || {};
 
-  const probabilities =
-    decision.probabilities || {};
-
-  const weights =
-    decision.weights || {};
-
-  const xgConfidence =
-    analysis.xgConfidence || {};
-
-  const decisionTrace =
-    Array.isArray(decision.decisionTrace)
-      ? decision.decisionTrace
-      : [];
-
-  const modelInputs =
-    decision.modelInputs || {};
-
-  await pool.query(
-    `
-      INSERT INTO predictions (
-        fixture_id,
-        fixture_date,
-        league_id,
-        league_name,
-        home_team_id,
-        home_team_name,
-        away_team_id,
-        away_team_name,
-        decision,
-        selected_outcome,
-        bet_status,
-        confidence,
-        risk,
-        home_probability,
-        draw_probability,
-        away_probability,
-        fair_odd,
-        market_odd,
-        value_percentage,
-        explanation,
-        official_xg_home,
-        official_xg_away,
-        xg_source,
-        xg_confidence_score,
-        xg_confidence_level,
-        form_weight,
-        market_weight,
-        monte_carlo_weight,
-        decision_trace,
-        model_inputs
-      )
-      VALUES (
-        $1, $2, $3, $4, $5,
-        $6, $7, $8, $9, $10,
-        $11, $12, $13, $14, $15,
-        $16, $17, $18, $19, $20,
-        $21, $22, $23, $24, $25,
-        $26, $27, $28, $29, $30
-      )
-      ON CONFLICT (fixture_id)
-      DO UPDATE SET
-        fixture_date =
-          EXCLUDED.fixture_date,
-
-        league_id =
-          EXCLUDED.league_id,
-
-        league_name =
-          EXCLUDED.league_name,
-
-        home_team_id =
-          EXCLUDED.home_team_id,
-
-        home_team_name =
-          EXCLUDED.home_team_name,
-
-        away_team_id =
-          EXCLUDED.away_team_id,
-
-        away_team_name =
-          EXCLUDED.away_team_name,
-
-        decision =
-          EXCLUDED.decision,
-
-        selected_outcome =
-          EXCLUDED.selected_outcome,
-
-        bet_status =
-          EXCLUDED.bet_status,
-
-        confidence =
-          EXCLUDED.confidence,
-
-        risk =
-          EXCLUDED.risk,
-
-        home_probability =
-          EXCLUDED.home_probability,
-
-        draw_probability =
-          EXCLUDED.draw_probability,
-
-        away_probability =
-          EXCLUDED.away_probability,
-
-        fair_odd =
-          EXCLUDED.fair_odd,
-
-        market_odd =
-          EXCLUDED.market_odd,
-
-        value_percentage =
-          EXCLUDED.value_percentage,
-
-        explanation =
-          EXCLUDED.explanation,
-
-        official_xg_home =
-          EXCLUDED.official_xg_home,
-
-        official_xg_away =
-          EXCLUDED.official_xg_away,
-
-        xg_source =
-          EXCLUDED.xg_source,
-
-        xg_confidence_score =
-          EXCLUDED.xg_confidence_score,
-
-        xg_confidence_level =
-          EXCLUDED.xg_confidence_level,
-
-        form_weight =
-          EXCLUDED.form_weight,
-
-        market_weight =
-          EXCLUDED.market_weight,
-
-        monte_carlo_weight =
-          EXCLUDED.monte_carlo_weight,
-
-        decision_trace =
-          EXCLUDED.decision_trace,
-
-        model_inputs =
-          EXCLUDED.model_inputs,
-
-        updated_at = NOW()
-    `,
-    [
-      analysis.fixtureId,
-      analysis.match?.date || null,
-      analysis.match?.league?.id || null,
-      analysis.match?.league?.name || null,
-      analysis.match?.homeTeam?.id || null,
-      analysis.match?.homeTeam?.name || null,
-      analysis.match?.awayTeam?.id || null,
-      analysis.match?.awayTeam?.name || null,
-
-      decision.decision || null,
-      decision.selectedOutcome || null,
-      decision.betStatus || null,
-      decision.confidence ?? null,
-      decision.risk || null,
-
-      probabilities.home ?? null,
-      probabilities.draw ?? null,
-      probabilities.away ?? null,
-
-      decision.fairOdd ?? null,
-      decision.marketOdd ?? null,
-      decision.value ?? null,
-      decision.explanation || null,
-
-      analysis.officialXgHome ?? null,
-      analysis.officialXgAway ?? null,
-      analysis.officialXgSource || null,
-
-      xgConfidence.score ?? null,
-      xgConfidence.level || null,
-
-      weights.form ?? null,
-      weights.market ?? null,
-      weights.monteCarlo ?? null,
-
-      JSON.stringify(decisionTrace),
-      JSON.stringify(modelInputs),
-    ]
-  );
-}
 async function upsertTeam(team, country = null) {
   const result = await pool.query(
     `
@@ -8403,7 +8216,36 @@ app.get(
     }
   }
 );
+app.get(
+  "/internal/db-migrate-montecarlo",
+  async (req, res) => {
+    try {
+      await pool.query(`
+        ALTER TABLE predictions
+        ADD COLUMN IF NOT EXISTS
+        monte_carlo_model JSONB;
+      `);
 
+      return res.json({
+        ok: true,
+        message:
+          "Colonne monte_carlo_model créée",
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR MIGRATION MONTE CARLO :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error.message ||
+          "Erreur inconnue",
+      });
+    }
+  }
+);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `FootballBrain API running on 0.0.0.0:${PORT}`
