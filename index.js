@@ -9096,6 +9096,176 @@ async function runAutomaticDailyAnalysis() {
     dailyAnalysisJobRunning = false;
   }
 }
+app.get(
+  "/internal/daily-analysis-status",
+  async (req, res) => {
+    try {
+      const requestedDate = String(
+        req.query.date || ""
+      ).trim();
+
+      const date =
+        requestedDate ||
+        getParisDateString();
+
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Date invalide. Format attendu : YYYY-MM-DD",
+        });
+      }
+
+      const result = await pool.query(
+        `
+          SELECT
+            fixture_id,
+            home_team_name,
+            away_team_name,
+
+            official_xg_home,
+            official_xg_away,
+
+            monte_carlo_model,
+            decision_trace,
+            model_inputs,
+            updated_at
+
+          FROM predictions
+
+          WHERE
+            fixture_date >=
+              $1::date
+
+            AND fixture_date <
+              $1::date +
+              INTERVAL '1 day'
+
+          ORDER BY fixture_date ASC
+        `,
+        [date]
+      );
+
+      const matches = result.rows.map(
+        (row) => {
+          const monteCarlo =
+            row.monte_carlo_model;
+
+          const hasXg =
+            row.official_xg_home !== null &&
+            row.official_xg_away !== null;
+
+          const hasMonteCarlo =
+            hasCompleteMonteCarlo(
+              monteCarlo
+            );
+
+          const hasDecisionTrace =
+            Array.isArray(
+              row.decision_trace
+            ) &&
+            row.decision_trace.length > 0;
+
+          const hasModelInputs =
+            row.model_inputs &&
+            typeof row.model_inputs ===
+              "object" &&
+            Object.keys(row.model_inputs)
+              .length > 0;
+
+          const complete =
+            hasXg &&
+            hasMonteCarlo &&
+            hasDecisionTrace &&
+            hasModelInputs;
+
+          return {
+            fixtureId:
+              Number(row.fixture_id),
+
+            homeTeam:
+              row.home_team_name,
+
+            awayTeam:
+              row.away_team_name,
+
+            complete,
+            hasXg,
+            hasMonteCarlo,
+            hasDecisionTrace,
+            hasModelInputs,
+
+            simulations:
+              Number(
+                monteCarlo?.simulations
+              ) || 0,
+
+            updatedAt:
+              row.updated_at,
+          };
+        }
+      );
+
+      const complete =
+        matches.filter(
+          (match) => match.complete
+        );
+
+      const incomplete =
+        matches.filter(
+          (match) => !match.complete
+        );
+
+      return res.json({
+        ok: true,
+        date,
+
+        summary: {
+          stored:
+            matches.length,
+
+          complete:
+            complete.length,
+
+          incomplete:
+            incomplete.length,
+
+          withXg:
+            matches.filter(
+              (match) => match.hasXg
+            ).length,
+
+          withMonteCarlo:
+            matches.filter(
+              (match) =>
+                match.hasMonteCarlo
+            ).length,
+
+          with10000Simulations:
+            matches.filter(
+              (match) =>
+                match.simulations ===
+                10000
+            ).length,
+        },
+
+        incomplete,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR DAILY ANALYSIS STATUS :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error.message ||
+          "Erreur inconnue",
+      });
+    }
+  }
+);
 app.listen(
   PORT,
   "0.0.0.0",
@@ -9118,6 +9288,6 @@ app.listen(
      */
     setInterval(() => {
       runAutomaticDailyAnalysis();
-    }, 60 * 60 * 1000);
+    }, 15 * 60 * 1000);
   }
 );
