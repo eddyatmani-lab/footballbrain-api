@@ -973,43 +973,98 @@ const result = {
       league: fixture.league,
     },
 
-    homeRecentForm,
+  homeRecentForm,
     awayRecentForm,
     headToHead,
     market,
-
     poissonModel,
     advancedXGModel,
     xgConfidence,
-
-    officialXgSource,
     officialXgHome,
-    officialXgAway,
-
+officialXgAway,
+officialXgSource,
     xgSource,
     xgQuality,
-
     monteCarloModel,
-    monteCarloAgreement,
 
+    context: {
+      injuries: {
+        available:
+          Array.isArray(injuries),
+        count:
+          Array.isArray(injuries)
+            ? injuries.length
+            : 0,
+        items:
+          Array.isArray(injuries)
+            ? injuries
+            : [],
+        impact:
+          phaseTwoContext?.injuryImpact ?? 0,
+      },
+
+      lineups: {
+        available:
+          Array.isArray(lineups) &&
+          lineups.length > 0,
+        count:
+          Array.isArray(lineups)
+            ? lineups.length
+            : 0,
+        items:
+          Array.isArray(lineups)
+            ? lineups
+            : [],
+        impact:
+          phaseTwoContext?.lineupImpact ?? 0,
+      },
+
+      fatigue: {
+        impact:
+          phaseTwoContext?.fatigueImpact ?? 0,
+      },
+
+      motivation: {
+        impact:
+          phaseTwoContext?.motivationImpact ?? 0,
+      },
+
+      phaseTwoContext:
+        phaseTwoContext || null,
+    },
+
+    monteCarloAgreement,
     footballBrain,
     footballBrainDecision,
     footballBrainRating,
     footballBrainPickScore,
   },
 };
-console.log(
-  "AVANT SAUVEGARDE DB",
-  result?.analysis?.fixtureId ||
-    analysis?.fixtureId ||
-    null
-);
+          
+
+
+console.log("CONTEXT DEBUG", {
+  keys: Object.keys(result.analysis || {}),
+  injuries:
+    result.analysis?.injuries ||
+    result.analysis?.injuriesSummary ||
+    result.analysis?.context?.injuries ||
+    null,
+  lineups:
+    result.analysis?.lineups ||
+    result.analysis?.lineupsSummary ||
+    result.analysis?.context?.lineups ||
+    null,
+  fatigue:
+    result.analysis?.fatigue ||
+    result.analysis?.fatigueSummary ||
+    result.analysis?.context?.fatigue ||
+    null,
+});
 await savePredictionToDatabase(
   result.analysis
 );
-console.log(
-  "APRES SAUVEGARDE DB"
-);
+
 analysisCache.set(fixtureId, {
   createdAt: Date.now(),
   data: result,
@@ -3512,138 +3567,7 @@ app.get("/public/analysis/:fixtureId", async (req, res) => {
     });
   }
 });
-app.get("/public/daily-picks", async (req, res) => {
-  try {
-    const requestedDate =
-      req.query.date ||
-      new Date().toISOString().slice(0, 10);
 
-    const dateFormat = /^\d{4}-\d{2}-\d{2}$/;
-
-    if (!dateFormat.test(requestedDate)) {
-      return res.status(400).json({
-        ok: false,
-        error: "La date doit être au format YYYY-MM-DD",
-      });
-    }
-
-    const result = await pool.query(
-      `
-        SELECT
-          fixture_id,
-          fixture_date,
-          league_name,
-          home_team_name,
-          away_team_name,
-          decision,
-          bet_status,
-          confidence,
-          risk,
-          home_probability,
-          draw_probability,
-          away_probability,
-          fair_odd,
-          market_odd,
-          value_percentage,
-          explanation,
-          result_status
-        FROM predictions
-        WHERE fixture_date >= $1::date
-          AND fixture_date < ($1::date + INTERVAL '1 day')
-        ORDER BY
-          CASE
-            WHEN bet_status = 'VALUE_BET' THEN 1
-            WHEN bet_status = 'À_SURVEILLER' THEN 2
-            WHEN bet_status = 'NO_BET' THEN 3
-            ELSE 4
-          END,
-          value_percentage DESC NULLS LAST,
-          confidence DESC NULLS LAST
-      `,
-      [requestedDate]
-    );
-
-    const picks = result.rows.map((item) => ({
-      fixtureId: item.fixture_id,
-
-      match: {
-        date: item.fixture_date,
-        league: item.league_name,
-        homeTeam: item.home_team_name,
-        awayTeam: item.away_team_name,
-      },
-
-      analysis: {
-        decision: item.decision,
-        betStatus: item.bet_status,
-        confidence: Number(item.confidence),
-        risk: item.risk,
-
-        probabilities: {
-          home: Number(item.home_probability),
-          draw: Number(item.draw_probability),
-          away: Number(item.away_probability),
-        },
-
-        fairOdd:
-          item.fair_odd === null
-            ? null
-            : Number(item.fair_odd),
-
-        marketOdd:
-          item.market_odd === null
-            ? null
-            : Number(item.market_odd),
-
-        value:
-          item.value_percentage === null
-            ? null
-            : Number(item.value_percentage),
-
-        explanation: item.explanation,
-      },
-
-      status: item.result_status,
-    }));
-
-    const valueBets = picks.filter(
-      (item) =>
-        item.analysis.betStatus === "VALUE_BET"
-    );
-
-    const watchlist = picks.filter(
-      (item) =>
-        item.analysis.betStatus === "À_SURVEILLER"
-    );
-
-    const noBet = picks.filter(
-      (item) =>
-        item.analysis.betStatus === "NO_BET"
-    );
-
-    return res.json({
-      ok: true,
-      date: requestedDate,
-      count: picks.length,
-
-      summary: {
-        valueBets: valueBets.length,
-        watchlist: watchlist.length,
-        noBet: noBet.length,
-      },
-
-      topPicks: valueBets.slice(0, 5),
-      watchlist,
-      noBet,
-      all: picks,
-    });
-  } catch (error) {
-    return res.status(500).json({
-      ok: false,
-      error: error.message,
-    });
-  }
-});
 app.get(
   "/internal/cron/analyze-daily",
   async (req, res) => {
@@ -5978,7 +5902,17 @@ function computePhaseTwoContext({
 
     return 1;
   }
-
+function getParisDateString() {
+  return new Intl.DateTimeFormat(
+    "en-CA",
+    {
+      timeZone: "Europe/Paris",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }
+  ).format(new Date());
+}
   const homeInjuryPenalty = Math.min(
     6,
     homeInjuries.reduce(
@@ -6091,7 +6025,16 @@ function computePhaseTwoContext({
     },
   };
 }
-
+function hasCompleteMonteCarlo(model) {
+  return Boolean(
+    model &&
+      Number(model.simulations) > 0 &&
+      Array.isArray(model.topScores) &&
+      model.topScores.length > 0 &&
+      Number.isFinite(Number(model.btts)) &&
+      Number.isFinite(Number(model.over25))
+  );
+}
 app.get("/internal/db-test", async (req, res) => {
   try {
     const result = await pool.query(
@@ -8236,6 +8179,695 @@ app.get(
     } catch (error) {
       console.error(
         "ERREUR MIGRATION MONTE CARLO :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error.message ||
+          "Erreur inconnue",
+      });
+    }
+  }
+);
+app.get(
+  "/public/daily-picks",
+  async (req, res) => {
+    try {
+      const requestedDate =
+        String(req.query.date || "").trim();
+
+      const date =
+        requestedDate || getParisDateString();
+
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(date)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Date invalide. Format attendu : YYYY-MM-DD",
+        });
+      }
+
+      const fixturesResponse =
+        await callApiFootball(
+          "/fixtures",
+          {
+            date,
+            timezone: "Europe/Paris",
+          }
+        );
+
+      const rawFixtures =
+        fixturesResponse.data?.response || [];
+
+      const fixtures = rawFixtures
+        .filter((item) => {
+          const fixtureId =
+            Number(item?.fixture?.id);
+
+          const homeName =
+            item?.teams?.home?.name;
+
+          const awayName =
+            item?.teams?.away?.name;
+
+          return (
+            Number.isInteger(fixtureId) &&
+            fixtureId > 0 &&
+            homeName &&
+            awayName
+          );
+        })
+        .sort((a, b) =>
+          String(
+            a?.fixture?.date || ""
+          ).localeCompare(
+            String(b?.fixture?.date || "")
+          )
+        );
+
+      const fixtureIds = fixtures.map(
+        (item) =>
+          Number(item.fixture.id)
+      );
+
+      let predictionRows = [];
+
+      if (fixtureIds.length > 0) {
+        const predictionsResult =
+          await pool.query(
+            `
+              SELECT
+                fixture_id,
+                decision,
+                selected_outcome,
+                bet_status,
+                confidence,
+                risk,
+                home_probability,
+                draw_probability,
+                away_probability,
+                fair_odd,
+                market_odd,
+                value_percentage,
+                explanation,
+                official_xg_home,
+                official_xg_away,
+                xg_source,
+                xg_confidence_score,
+                xg_confidence_level,
+                form_weight,
+                market_weight,
+                monte_carlo_weight,
+                decision_trace,
+                model_inputs,
+                monte_carlo_model,
+                updated_at
+              FROM predictions
+              WHERE fixture_id =
+                ANY($1::bigint[])
+            `,
+            [fixtureIds]
+          );
+
+        predictionRows =
+          predictionsResult.rows;
+      }
+
+      const predictionsByFixture =
+        new Map(
+          predictionRows.map(
+            (prediction) => [
+              Number(
+                prediction.fixture_id
+              ),
+              prediction,
+            ]
+          )
+        );
+
+      const matches = fixtures.map(
+        (item) => {
+          const fixtureId =
+            Number(item.fixture.id);
+
+          const prediction =
+            predictionsByFixture.get(
+              fixtureId
+            );
+
+          return {
+            fixtureId,
+            fixture_id: fixtureId,
+
+            date:
+              item.fixture?.date || null,
+
+            timestamp:
+              item.fixture?.timestamp ||
+              null,
+
+            status: {
+              long:
+                item.fixture?.status
+                  ?.long || null,
+              short:
+                item.fixture?.status
+                  ?.short || null,
+              elapsed:
+                item.fixture?.status
+                  ?.elapsed ?? null,
+            },
+
+            league: {
+              id:
+                item.league?.id || null,
+              name:
+                item.league?.name || null,
+              country:
+                item.league?.country ||
+                null,
+              logo:
+                item.league?.logo || null,
+              season:
+                item.league?.season ||
+                null,
+              round:
+                item.league?.round ||
+                null,
+            },
+
+            homeTeam: {
+              id:
+                item.teams?.home?.id ||
+                null,
+              name:
+                item.teams?.home?.name ||
+                "Domicile",
+              logo:
+                item.teams?.home?.logo ||
+                null,
+            },
+
+            awayTeam: {
+              id:
+                item.teams?.away?.id ||
+                null,
+              name:
+                item.teams?.away?.name ||
+                "Extérieur",
+              logo:
+                item.teams?.away?.logo ||
+                null,
+            },
+
+            goals: {
+              home:
+                item.goals?.home ?? null,
+              away:
+                item.goals?.away ?? null,
+            },
+
+            analysisAvailable:
+              Boolean(prediction),
+
+            prediction: prediction
+              ? {
+                  decision:
+                    prediction.decision,
+
+                  selectedOutcome:
+                    prediction.selected_outcome,
+
+                  betStatus:
+                    prediction.bet_status,
+
+                  confidence:
+                    Number(
+                      prediction.confidence
+                    ),
+
+                  risk:
+                    prediction.risk,
+
+                  probabilities: {
+                    home: Number(
+                      prediction.home_probability
+                    ),
+                    draw: Number(
+                      prediction.draw_probability
+                    ),
+                    away: Number(
+                      prediction.away_probability
+                    ),
+                  },
+
+                  fairOdd:
+                    prediction.fair_odd ==
+                    null
+                      ? null
+                      : Number(
+                          prediction.fair_odd
+                        ),
+
+                  marketOdd:
+                    prediction.market_odd ==
+                    null
+                      ? null
+                      : Number(
+                          prediction.market_odd
+                        ),
+
+                  value:
+                    prediction.value_percentage ==
+                    null
+                      ? null
+                      : Number(
+                          prediction.value_percentage
+                        ),
+
+                  explanation:
+                    prediction.explanation,
+                }
+              : null,
+
+            xg: prediction
+              ? {
+                  home:
+                    prediction.official_xg_home ==
+                    null
+                      ? null
+                      : Number(
+                          prediction.official_xg_home
+                        ),
+
+                  away:
+                    prediction.official_xg_away ==
+                    null
+                      ? null
+                      : Number(
+                          prediction.official_xg_away
+                        ),
+
+                  source:
+                    prediction.xg_source,
+
+                  confidence: {
+                    score:
+                      prediction.xg_confidence_score ==
+                      null
+                        ? null
+                        : Number(
+                            prediction.xg_confidence_score
+                          ),
+
+                    level:
+                      prediction.xg_confidence_level,
+                  },
+                }
+              : null,
+
+            weights: prediction
+              ? {
+                  form:
+                    prediction.form_weight ==
+                    null
+                      ? null
+                      : Number(
+                          prediction.form_weight
+                        ),
+
+                  market:
+                    prediction.market_weight ==
+                    null
+                      ? null
+                      : Number(
+                          prediction.market_weight
+                        ),
+
+                  monteCarlo:
+                    prediction.monte_carlo_weight ==
+                    null
+                      ? null
+                      : Number(
+                          prediction.monte_carlo_weight
+                        ),
+                }
+              : null,
+
+            monteCarloModel:
+              prediction?.monte_carlo_model ||
+              null,
+
+            decisionTrace:
+              Array.isArray(
+                prediction?.decision_trace
+              )
+                ? prediction.decision_trace
+                : [],
+
+            updatedAt:
+              prediction?.updated_at ||
+              null,
+          };
+        }
+      );
+
+      const analyzedMatches =
+        matches.filter(
+          (match) =>
+            match.analysisAvailable
+        );
+
+      return res.json({
+        ok: true,
+        date,
+
+        summary: {
+          fixtures:
+            matches.length,
+
+          analyzed:
+            analyzedMatches.length,
+
+          pending:
+            matches.length -
+            analyzedMatches.length,
+        },
+
+        matches,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /public/daily-picks :",
+        error
+      );
+
+            return res.status(500).json({
+        ok: false,
+        error:
+          error.message ||
+          "Erreur inconnue",
+      });
+    }
+  }
+);
+app.get(
+  "/internal/rebuild-daily-analysis",
+  async (req, res) => {
+    try {
+      const requestedDate = String(
+        req.query.date || ""
+      ).trim();
+
+      const date =
+        requestedDate ||
+        getParisDateString();
+
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(date)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Date invalide. Format attendu : YYYY-MM-DD",
+        });
+      }
+
+      const requestedLimit = Number(
+        req.query.limit
+      );
+
+      const limit = Math.min(
+        20,
+        Math.max(
+          1,
+          Number.isInteger(requestedLimit)
+            ? requestedLimit
+            : 10
+        )
+      );
+
+      const force =
+        String(req.query.force || "") ===
+        "1";
+
+      /*
+       * 1. Récupérer les fixtures du jour
+       */
+      const fixturesResponse =
+        await callApiFootball(
+          "/fixtures",
+          {
+            date,
+            timezone: "Europe/Paris",
+          }
+        );
+
+      const rawFixtures =
+        fixturesResponse.data?.response ||
+        [];
+
+      const excludedStatuses = [
+        "FT",
+        "AET",
+        "PEN",
+        "CANC",
+        "PST",
+        "ABD",
+        "AWD",
+        "WO",
+      ];
+
+      const fixtures = rawFixtures
+        .filter((item) => {
+          const fixtureId = Number(
+            item?.fixture?.id
+          );
+
+          const status = String(
+            item?.fixture?.status?.short ||
+              ""
+          ).toUpperCase();
+
+          return (
+            Number.isInteger(fixtureId) &&
+            fixtureId > 0 &&
+            item?.teams?.home?.name &&
+            item?.teams?.away?.name &&
+            !excludedStatuses.includes(
+              status
+            )
+          );
+        })
+        .slice(0, limit);
+
+      if (fixtures.length === 0) {
+        return res.json({
+          ok: true,
+          date,
+          summary: {
+            fixturesFound: 0,
+            alreadyComplete: 0,
+            rebuilt: 0,
+            failed: 0,
+          },
+          results: [],
+        });
+      }
+
+      const fixtureIds = fixtures.map(
+        (item) =>
+          Number(item.fixture.id)
+      );
+
+      /*
+       * 2. Lire les analyses existantes
+       */
+      const existingResult =
+        await pool.query(
+          `
+            SELECT
+              fixture_id,
+              monte_carlo_model
+            FROM predictions
+            WHERE fixture_id =
+              ANY($1::bigint[])
+          `,
+          [fixtureIds]
+        );
+
+      const existingByFixture =
+        new Map(
+          existingResult.rows.map(
+            (row) => [
+              Number(row.fixture_id),
+              row.monte_carlo_model,
+            ]
+          )
+        );
+
+      const alreadyComplete = [];
+      const fixturesToRebuild = [];
+
+      for (const fixture of fixtures) {
+        const fixtureId = Number(
+          fixture.fixture.id
+        );
+
+        const storedMonteCarlo =
+          existingByFixture.get(
+            fixtureId
+          );
+
+        if (
+          !force &&
+          hasCompleteMonteCarlo(
+            storedMonteCarlo
+          )
+        ) {
+          alreadyComplete.push({
+            fixtureId,
+            homeTeam:
+              fixture.teams.home.name,
+            awayTeam:
+              fixture.teams.away.name,
+          });
+        } else {
+          fixturesToRebuild.push(
+            fixture
+          );
+        }
+      }
+
+      /*
+       * 3. Relancer l’analyse complète
+       */
+      const baseUrl =
+        `${req.protocol}://${req.get(
+          "host"
+        )}`;
+
+      const results = [];
+
+      for (
+        const fixture of fixturesToRebuild
+      ) {
+        const fixtureId = Number(
+          fixture.fixture.id
+        );
+
+        const homeTeam =
+          fixture.teams.home.name;
+
+        const awayTeam =
+          fixture.teams.away.name;
+
+        try {
+          const response = await fetch(
+            `${baseUrl}/internal/analyze/${fixtureId}`,
+            {
+              method: "GET",
+              headers: {
+                Accept:
+                  "application/json",
+              },
+            }
+          );
+
+          const data =
+            await response.json();
+
+          if (
+            !response.ok ||
+            !data?.ok
+          ) {
+            throw new Error(
+              data?.message ||
+                data?.error ||
+                "Analyse impossible"
+            );
+          }
+
+          const monteCarloModel =
+            data?.analysis
+              ?.monteCarloModel ||
+            null;
+
+          const complete =
+            hasCompleteMonteCarlo(
+              monteCarloModel
+            );
+
+          if (!complete) {
+            throw new Error(
+              "L’analyse a réussi, mais le Monte Carlo complet est absent."
+            );
+          }
+
+          results.push({
+            fixtureId,
+            homeTeam,
+            awayTeam,
+            ok: true,
+            simulations:
+              monteCarloModel
+                .simulations,
+            btts:
+              monteCarloModel.btts,
+            over25:
+              monteCarloModel.over25,
+            topScores:
+              monteCarloModel.topScores,
+          });
+        } catch (error) {
+          results.push({
+            fixtureId,
+            homeTeam,
+            awayTeam,
+            ok: false,
+            error:
+              error.message ||
+              "Erreur inconnue",
+          });
+        }
+      }
+
+      const rebuilt =
+        results.filter(
+          (item) => item.ok
+        );
+
+      const failed =
+        results.filter(
+          (item) => !item.ok
+        );
+
+      return res.json({
+        ok: true,
+        date,
+        force,
+
+        summary: {
+          fixturesFound:
+            fixtures.length,
+          alreadyComplete:
+            alreadyComplete.length,
+          rebuilt:
+            rebuilt.length,
+          failed:
+            failed.length,
+        },
+
+        alreadyComplete,
+        results,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR REBUILD DAILY ANALYSIS :",
         error
       );
 
