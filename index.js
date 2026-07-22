@@ -2552,198 +2552,342 @@ app.get("/internal/db-init", async (req, res) => {
   }
 });
 async function savePredictionToDatabase(analysis) {
- 
-    const decision =
+  const decision =
     analysis.footballBrainDecision || {};
 
   const probabilities =
     decision.probabilities || {};
-const weights =
-  decision.weights || {};
 
-const xgConfidence =
-  analysis.xgConfidence || {};
+  const weights =
+    decision.weights || {};
 
-const decisionTrace =
-  Array.isArray(decision.decisionTrace)
-    ? decision.decisionTrace
-    : [];
+  const xgConfidence =
+    analysis.xgConfidence || {};
 
-const modelInputs =
-  decision.modelInputs || {};
+  const decisionTrace =
+    Array.isArray(decision.decisionTrace)
+      ? decision.decisionTrace
+      : [];
+
+  const modelInputs =
+    decision.modelInputs || {};
+
   const monteCarloModel =
-  analysis.monteCarloModel || {};
-          
-              
-          await pool.query(
-   `
-      INSERT INTO predictions (
-        fixture_id,
-        fixture_date,
-        league_id,
-        league_name,
-        home_team_id,
-        home_team_name,
-        away_team_id,
-        away_team_name,
-        decision,
-        selected_outcome,
-        bet_status,
-        confidence,
-        risk,
-        home_probability,
-        draw_probability,
-        away_probability,
-        fair_odd,
-        market_odd,
-        value_percentage,
-explanation,
-official_xg_home,
-official_xg_away,
-xg_source,
-xg_confidence_score,
-xg_confidence_level,
-form_weight,
-market_weight,
-monte_carlo_weight,
-decision_trace,
-model_inputs,
-monte_carlo_model
-      )
-      VALUES (
-  $1, $2, $3, $4, $5,
-  $6, $7, $8, $9, $10,
-  $11, $12, $13, $14, $15,
-  $16, $17, $18, $19, $20,
-  $21, $22, $23, $24, $25,
-  $26, $27, $28, $29, $30,
-  $31
-)
-      ON CONFLICT (fixture_id)
-      DO UPDATE SET
-        fixture_date = EXCLUDED.fixture_date,
-        league_id = EXCLUDED.league_id,
-        league_name = EXCLUDED.league_name,
-        home_team_id = EXCLUDED.home_team_id,
-        home_team_name = EXCLUDED.home_team_name,
-        away_team_id = EXCLUDED.away_team_id,
-        away_team_name = EXCLUDED.away_team_name,
-        decision = EXCLUDED.decision,
-        selected_outcome = EXCLUDED.selected_outcome,
-        bet_status = EXCLUDED.bet_status,
-        confidence = EXCLUDED.confidence,
-        risk = EXCLUDED.risk,
-        home_probability = EXCLUDED.home_probability,
-        draw_probability = EXCLUDED.draw_probability,
-        away_probability = EXCLUDED.away_probability,
-        fair_odd = EXCLUDED.fair_odd,
-        market_odd = EXCLUDED.market_odd,
-        value_percentage = EXCLUDED.value_percentage,
-        explanation = EXCLUDED.explanation,
-        official_xg_home = EXCLUDED.official_xg_home,
-official_xg_away = EXCLUDED.official_xg_away,
-xg_source = EXCLUDED.xg_source,
-xg_confidence_score = EXCLUDED.xg_confidence_score,
-xg_confidence_level = EXCLUDED.xg_confidence_level,
-form_weight = EXCLUDED.form_weight,
-market_weight = EXCLUDED.market_weight,
-monte_carlo_weight = EXCLUDED.monte_carlo_weight,
-decision_trace = EXCLUDED.decision_trace,
-model_inputs = EXCLUDED.model_inputs,
+    analysis.monteCarloModel || {};
+
+  const savedPrediction =
+    await pool.query(
+      `
+        INSERT INTO predictions (
+          fixture_id,
+          fixture_date,
+          league_id,
+          league_name,
+          home_team_id,
+          home_team_name,
+          away_team_id,
+          away_team_name,
+          decision,
+          selected_outcome,
+          bet_status,
+          confidence,
+          risk,
+          home_probability,
+          draw_probability,
+          away_probability,
+          fair_odd,
+          market_odd,
+          value_percentage,
+          explanation,
+          official_xg_home,
+          official_xg_away,
+          xg_source,
+          xg_confidence_score,
+          xg_confidence_level,
+          form_weight,
+          market_weight,
+          monte_carlo_weight,
+          decision_trace,
+          model_inputs,
+          monte_carlo_model
+        )
+        VALUES (
+          $1, $2, $3, $4, $5,
+          $6, $7, $8, $9, $10,
+          $11, $12, $13, $14, $15,
+          $16, $17, $18, $19, $20,
+          $21, $22, $23, $24, $25,
+          $26, $27, $28, $29, $30,
+          $31
+        )
+
+        ON CONFLICT (fixture_id)
+        DO UPDATE SET
+          fixture_date =
+            EXCLUDED.fixture_date,
+
+          league_id =
+            EXCLUDED.league_id,
+
+          league_name =
+            EXCLUDED.league_name,
+
+          home_team_id =
+            EXCLUDED.home_team_id,
+
+          home_team_name =
+            EXCLUDED.home_team_name,
+
+          away_team_id =
+            EXCLUDED.away_team_id,
+
+          away_team_name =
+            EXCLUDED.away_team_name,
+
+          decision =
+            EXCLUDED.decision,
+
+          selected_outcome =
+            EXCLUDED.selected_outcome,
+
+          bet_status =
+            EXCLUDED.bet_status,
+
+          confidence =
+            EXCLUDED.confidence,
+
+          risk =
+            EXCLUDED.risk,
+
+          home_probability =
+            EXCLUDED.home_probability,
+
+          draw_probability =
+            EXCLUDED.draw_probability,
+
+          away_probability =
+            EXCLUDED.away_probability,
+
+          fair_odd =
+            EXCLUDED.fair_odd,
+
+          market_odd =
+            EXCLUDED.market_odd,
+
+          value_percentage =
+            EXCLUDED.value_percentage,
+
+          explanation =
+            EXCLUDED.explanation,
+
+          official_xg_home =
+            EXCLUDED.official_xg_home,
+
+          official_xg_away =
+            EXCLUDED.official_xg_away,
+
+          xg_source =
+            EXCLUDED.xg_source,
+
+          xg_confidence_score =
+            EXCLUDED.xg_confidence_score,
+
+          xg_confidence_level =
+            EXCLUDED.xg_confidence_level,
+
+          form_weight =
+            EXCLUDED.form_weight,
+
+          market_weight =
+            EXCLUDED.market_weight,
+
+          monte_carlo_weight =
+            EXCLUDED.monte_carlo_weight,
+
+          decision_trace =
+            EXCLUDED.decision_trace,
+
+          model_inputs =
+            EXCLUDED.model_inputs,
+
           monte_carlo_model =
-  EXCLUDED.monte_carlo_model,
-      updated_at = NOW()
-    `,
-    [
-      analysis.fixtureId,
-      analysis.match?.date || null,
-      analysis.match?.league?.id || null,
-      analysis.match?.league?.name || null,
-      analysis.match?.homeTeam?.id || null,
-      analysis.match?.homeTeam?.name || null,
-      analysis.match?.awayTeam?.id || null,
-      analysis.match?.awayTeam?.name || null,
-      decision.decision || null,
-      decision.selectedOutcome || null,
-      decision.betStatus || null,
-      decision.confidence ?? null,
-      decision.risk || null,
-      probabilities.home ?? null,
-      probabilities.draw ?? null,
-      probabilities.away ?? null,
-      decision.fairOdd ?? null,
-      decision.marketOdd ?? null,
-      decision.value ?? null,
-      decision.explanation || null,
-        analysis.officialXgHome ?? null,
-analysis.officialXgAway ?? null,
-analysis.officialXgSource || null,
-xgConfidence.score ?? null,
-xgConfidence.level || null,
-weights.form ?? null,
-weights.market ?? null,
-weights.monteCarlo ?? null,
-JSON.stringify(decisionTrace),
-JSON.stringify(modelInputs),
-JSON.stringify(monteCarloModel),
-    ]
-  );
+            EXCLUDED.monte_carlo_model,
+
+          updated_at = NOW()
+
+        RETURNING
+          fixture_id,
+          official_xg_home,
+          official_xg_away,
+          monte_carlo_model,
+          decision_trace,
+          updated_at
+      `,
+      [
+        analysis.fixtureId,
+
+        analysis.match?.date || null,
+
+        analysis.match?.league?.id ||
+          null,
+
+        analysis.match?.league?.name ||
+          null,
+
+        analysis.match?.homeTeam?.id ||
+          null,
+
+        analysis.match?.homeTeam?.name ||
+          null,
+
+        analysis.match?.awayTeam?.id ||
+          null,
+
+        analysis.match?.awayTeam?.name ||
+          null,
+
+        decision.decision || null,
+
+        decision.selectedOutcome ||
+          null,
+
+        decision.betStatus || null,
+
+        decision.confidence ?? null,
+
+        decision.risk || null,
+
+        probabilities.home ?? null,
+
+        probabilities.draw ?? null,
+
+        probabilities.away ?? null,
+
+        decision.fairOdd ?? null,
+
+        decision.marketOdd ?? null,
+
+        decision.value ?? null,
+
+        decision.explanation || null,
+
+        analysis.officialXgHome ??
+          null,
+
+        analysis.officialXgAway ??
+          null,
+
+        analysis.officialXgSource ||
+          null,
+
+        xgConfidence.score ?? null,
+
+        xgConfidence.level || null,
+
+        weights.form ?? null,
+
+        weights.market ?? null,
+
+        weights.monteCarlo ?? null,
+
+        JSON.stringify(
+          decisionTrace
+        ),
+
+        JSON.stringify(
+          modelInputs
+        ),
+
+        JSON.stringify(
+          monteCarloModel
+        ),
+      ]
+    );
+
+  return savedPrediction.rows[0];
 }
-async function upsertTeam(team, country = null) {
-  const result = await pool.query(
-    `
-      INSERT INTO teams (
-        api_team_id,
-        name,
+
+async function upsertTeam(
+  team,
+  country = null
+) {
+  const result =
+    await pool.query(
+      `
+        INSERT INTO teams (
+          api_team_id,
+          name,
+          country,
+          logo,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          NOW()
+        )
+
+        ON CONFLICT (api_team_id)
+        DO UPDATE SET
+          name =
+            EXCLUDED.name,
+
+          country =
+            COALESCE(
+              EXCLUDED.country,
+              teams.country
+            ),
+
+          logo =
+            EXCLUDED.logo,
+
+          updated_at =
+            NOW()
+
+        RETURNING *
+      `,
+      [
+        team.id,
+        team.name,
         country,
-        logo,
-        updated_at
-      )
-      VALUES ($1, $2, $3, $4, NOW())
-
-      ON CONFLICT (api_team_id)
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        country = COALESCE(EXCLUDED.country, teams.country),
-        logo = EXCLUDED.logo,
-        monte_carlo_model =
-  EXCLUDED.monte_carlo_model,
-      updated_at = NOW()
-
-      RETURNING *
-    `,
-    [
-      team.id,
-      team.name,
-      country,
-      team.logo || null,
-    ]
-  );
+        team.logo || null,
+      ]
+    );
 
   return result.rows[0];
 }
 
-async function getOrCreateTeamElo(teamDatabaseId) {
-  const result = await pool.query(
-    `
-      INSERT INTO elo_ratings (
-        team_id,
-        rating,
-        matches_played
-      )
-      VALUES ($1, 1500, 0)
+async function getOrCreateTeamElo(
+  teamDatabaseId
+) {
+  const result =
+    await pool.query(
+      `
+        INSERT INTO elo_ratings (
+          team_id,
+          rating,
+          matches_played
+        )
+        VALUES (
+          $1,
+          1500,
+          0
+        )
 
-      ON CONFLICT (team_id)
-      DO UPDATE SET
-        team_id = EXCLUDED.team_id
+        ON CONFLICT (team_id)
+        DO UPDATE SET
+          team_id =
+            EXCLUDED.team_id
 
-      RETURNING *
-    `,
-    [teamDatabaseId]
-  );
+        RETURNING *
+      `,
+      [teamDatabaseId]
+    );
 
   return result.rows[0];
-}
+} 
 
 function calculateExpectedElo(ratingA, ratingB) {
   return 1 / (
@@ -8622,7 +8766,7 @@ app.get(
       );
 
       const limit = Math.min(
-        20,
+        30,
         Math.max(
           1,
           Number.isInteger(requestedLimit)
@@ -8683,7 +8827,7 @@ app.get(
             )
           );
         })
-        .slice(0, limit);
+        
 
       if (fixtures.length === 0) {
         return res.json({
@@ -8762,7 +8906,8 @@ app.get(
           );
         }
       }
-
+const selectedFixturesToRebuild =
+  fixturesToRebuild.slice(0, limit);
       /*
        * 3. Relancer l’analyse complète
        */
@@ -8774,8 +8919,9 @@ app.get(
       const results = [];
 
       for (
-        const fixture of fixturesToRebuild
-      ) {
+  const fixture of
+    selectedFixturesToRebuild
+) {
         const fixtureId = Number(
           fixture.fixture.id
         );
@@ -8900,8 +9046,78 @@ app.get(
     }
   }
 );
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `FootballBrain API running on 0.0.0.0:${PORT}`
-  );
-});
+let dailyAnalysisJobRunning = false;
+
+async function runAutomaticDailyAnalysis() {
+  if (dailyAnalysisJobRunning) {
+    console.log(
+      "ANALYSE QUOTIDIENNE : tâche déjà en cours"
+    );
+    return;
+  }
+
+  dailyAnalysisJobRunning = true;
+
+  try {
+    const url =
+      `http://127.0.0.1:${PORT}` +
+      `/internal/rebuild-daily-analysis` +
+      `?limit=20`;
+
+    console.log(
+      "ANALYSE QUOTIDIENNE : démarrage"
+    );
+
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+      },
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data?.ok) {
+      throw new Error(
+        data?.error ||
+          "Échec de l’analyse automatique"
+      );
+    }
+
+    console.log(
+      "ANALYSE QUOTIDIENNE : terminée",
+      data.summary
+    );
+  } catch (error) {
+    console.error(
+      "ERREUR ANALYSE QUOTIDIENNE :",
+      error.message
+    );
+  } finally {
+    dailyAnalysisJobRunning = false;
+  }
+}
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `FootballBrain API running on 0.0.0.0:${PORT}`
+    );
+
+    /*
+     * Premier contrôle 30 secondes
+     * après le démarrage du serveur.
+     */
+    setTimeout(() => {
+      runAutomaticDailyAnalysis();
+    }, 30_000);
+
+    /*
+     * Nouveau contrôle chaque heure.
+     * Les matchs déjà complets sont ignorés.
+     */
+    setInterval(() => {
+      runAutomaticDailyAnalysis();
+    }, 60 * 60 * 1000);
+  }
+);
