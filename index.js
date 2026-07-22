@@ -8572,9 +8572,29 @@ app.get(
           error.message ||
           "Erreur inconnue",
       });
-    }
+     }
   }
 );
+                      function getParisDateString() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Paris",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+function hasCompleteMonteCarlo(model) {
+  return Boolean(
+    model &&
+      Number(model.simulations) > 0 &&
+      Array.isArray(model.topScores) &&
+      model.topScores.length > 0 &&
+      Number.isFinite(Number(model.btts)) &&
+      Number.isFinite(Number(model.over25))
+  );
+}
+
 app.get(
   "/internal/rebuild-daily-analysis",
   async (req, res) => {
