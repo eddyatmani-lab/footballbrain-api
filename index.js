@@ -9266,6 +9266,36 @@ app.get(
     }
   }
 );
+app.get(
+  "/internal/migrate-analysis-context",
+  async (req, res) => {
+    try {
+      await pool.query(`
+        ALTER TABLE predictions
+        ADD COLUMN IF NOT EXISTS
+          analysis_context JSONB;
+      `);
+
+      return res.json({
+        ok: true,
+        message:
+          "Colonne analysis_context créée",
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR MIGRATION CONTEXT :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error.message ||
+          "Erreur inconnue",
+      });
+    }
+  }
+);
 app.listen(
   PORT,
   "0.0.0.0",
