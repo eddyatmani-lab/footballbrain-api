@@ -1004,20 +1004,42 @@ officialXgSource,
       },
 
       lineups: {
-        available:
-          Array.isArray(lineups) &&
-          lineups.length > 0,
-        count:
-          Array.isArray(lineups)
-            ? lineups.length
-            : 0,
-        items:
-          Array.isArray(lineups)
-            ? lineups
-            : [],
-        impact:
-          phaseTwoContext?.lineupImpact ?? 0,
-      },
+  available:
+    Array.isArray(lineups) &&
+    lineups.length > 0,
+
+  count:
+    Array.isArray(lineups)
+      ? lineups.length
+      : 0,
+
+  items:
+    Array.isArray(lineups)
+      ? lineups
+      : [],
+
+  homeFormation:
+    lineups?.[0]?.formation ||
+    null,
+
+  awayFormation:
+    lineups?.[1]?.formation ||
+    null,
+
+  homeConfirmed:
+    Boolean(
+      lineups?.[0]
+    ),
+
+  awayConfirmed:
+    Boolean(
+      lineups?.[1]
+    ),
+
+  impact:
+    phaseTwoContext?.lineupImpact ??
+    0,
+},
 
       fatigue: {
         impact:
@@ -2574,7 +2596,8 @@ async function savePredictionToDatabase(analysis) {
 
   const monteCarloModel =
     analysis.monteCarloModel || {};
-
+const analysisContext =
+  analysis.context || {};
   const savedPrediction =
     await pool.query(
       `
@@ -2608,8 +2631,9 @@ async function savePredictionToDatabase(analysis) {
           market_weight,
           monte_carlo_weight,
           decision_trace,
-          model_inputs,
-          monte_carlo_model
+model_inputs,
+monte_carlo_model,
+analysis_context
         )
         VALUES (
           $1, $2, $3, $4, $5,
@@ -2618,7 +2642,8 @@ async function savePredictionToDatabase(analysis) {
           $16, $17, $18, $19, $20,
           $21, $22, $23, $24, $25,
           $26, $27, $28, $29, $30,
-          $31
+          $31, $32
+
         )
 
         ON CONFLICT (fixture_id)
@@ -2712,7 +2737,8 @@ async function savePredictionToDatabase(analysis) {
 
           monte_carlo_model =
             EXCLUDED.monte_carlo_model,
-
+analysis_context =
+  EXCLUDED.analysis_context,
           updated_at = NOW()
 
         RETURNING
@@ -2720,6 +2746,7 @@ async function savePredictionToDatabase(analysis) {
           official_xg_home,
           official_xg_away,
           monte_carlo_model,
+        analysis_context,
           decision_trace,
           updated_at
       `,
@@ -2801,6 +2828,9 @@ async function savePredictionToDatabase(analysis) {
         JSON.stringify(
           monteCarloModel
         ),
+          JSON.stringify(
+  analysisContext
+),
       ]
     );
 
@@ -8079,7 +8109,7 @@ app.get(
             decision_trace,
 model_inputs,
 monte_carlo_model,
-
+analysis_context,
 explanation,
 updated_at
           FROM predictions
@@ -8280,6 +8310,12 @@ updated_at
           prediction.model_inputs || {},
 monteCarloModel:
   prediction.monte_carlo_model || null,
+    context:
+  prediction.analysis_context ||
+  null,
+    context:
+  prediction.analysis_context ||
+  {},
         decisionTrace:
           Array.isArray(
             prediction.decision_trace
