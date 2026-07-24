@@ -8403,15 +8403,18 @@ app.get(
       }
 
       const fixturesResponse =
-        await callApiFootball(
-          "/fixtures",
-          {
-            date,
-            timezone: "Europe/Paris",
-          }
-        );
+  await callApiFootball(
+    "/fixtures",
+    {
+      date,
+      timezone: "Europe/Paris",
+    }
+  );
 
-      const fixtures = rawFixtures
+const rawFixtures =
+  fixturesResponse.data?.response || [];
+
+const fixtures = rawFixtures
   .filter((item) => {
     const fixtureId =
       Number(item?.fixture?.id);
