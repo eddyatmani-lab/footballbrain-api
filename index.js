@@ -69,7 +69,7 @@ async function callApiFootball(
 
   return response;
 }
-function isFriendlyFixture(
+function isExcludedFixture(
   fixture = {}
 ) {
   const leagueName = String(
@@ -80,10 +80,70 @@ function isFriendlyFixture(
     .trim()
     .toLowerCase();
 
-  return (
-    leagueName.includes("friendl") ||
-    leagueName.includes("amical")
-  );
+  const homeTeamName = String(
+    fixture?.teams?.home?.name ||
+    fixture?.homeTeam?.name ||
+    fixture?.home_team_name ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const awayTeamName = String(
+    fixture?.teams?.away?.name ||
+    fixture?.awayTeam?.name ||
+    fixture?.away_team_name ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const combinedText =
+    `${leagueName} ${homeTeamName} ${awayTeamName}`;
+
+  /*
+   * Détecte :
+   * U17, U-17, U 17
+   * Under 17
+   * moins de 17 ans
+   *
+   * De U15 jusqu'à U23.
+   */
+  const youthAgePattern =
+    /\b(?:u[\s-]?(?:15|16|17|18|19|20|21|22|23)|under[\s-]?(?:15|16|17|18|19|20|21|22|23))\b/i;
+
+  const friendlyKeywords = [
+    "friendly",
+    "friendlies",
+    "amical",
+    "amicaux",
+  ];
+
+  const youthKeywords = [
+    "youth",
+    "junior",
+    "juniors",
+    "academy",
+    "academia",
+    "akademiya",
+    "primavera",
+    "juvenil",
+    "jeunes",
+    "espoirs",
+  ];
+
+  const isFriendly =
+    friendlyKeywords.some((keyword) =>
+      combinedText.includes(keyword)
+    );
+
+  const isYouth =
+    youthAgePattern.test(combinedText) ||
+    youthKeywords.some((keyword) =>
+      combinedText.includes(keyword)
+    );
+
+  return isFriendly || isYouth;
 }
 app.get("/", (req, res) => {
   res.json({
@@ -632,7 +692,7 @@ if (forceRefresh) {
       });
     }
 if (
-  isFriendlyFixture(fixture)
+  isExcludedFixture(fixture)
 ) {
   analysisCache.delete(
     fixtureId
@@ -5072,7 +5132,7 @@ if (
       });
     }
 if (
-  isFriendlyFixture(fixture)
+ isExcludedFixture(fixture)
 ) {
   analysisCache.delete(
     fixtureId
@@ -8415,7 +8475,7 @@ const fixtures = rawFixtures
       fixtureId > 0 &&
       Boolean(homeName) &&
       Boolean(awayName) &&
-      !isFriendlyFixture(item)
+      !isExcludedFixture(item)
     );
   })
   .sort((a, b) =>
@@ -8860,7 +8920,7 @@ app.get(
   !excludedStatuses.includes(
     status
   ) &&
-  !isFriendlyFixture(item)
+  !isExcludedFixture(item)
 );
   });
         
@@ -9530,7 +9590,7 @@ async function runLineupWatcher() {
     const fixturesToCheck =
   fixtures.filter((item) => {
     if (
-      isFriendlyFixture(item)
+      isExcludedFixture(item)
     ) {
       return false;
     }
