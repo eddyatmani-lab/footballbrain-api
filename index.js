@@ -10385,6 +10385,133 @@ async function checkDailyFullAnalysisSchedule() {
 /*
  * DÉMARRAGE DU SERVEUR
  */
+/*
+ * LEARNING — MATCHS TERMINÉS
+ *
+ * Retourne les prédictions terminées
+ * enregistrées dans PostgreSQL.
+ */
+app.get(
+  "/public/learning/finished",
+  async (req, res) => {
+    try {
+      const requestedLimit =
+        Number(req.query.limit);
+
+      const limit =
+        Number.isInteger(
+          requestedLimit
+        ) &&
+        requestedLimit > 0
+          ? Math.min(
+              requestedLimit,
+              1000
+            )
+          : 300;
+
+      const result =
+        await pool.query(
+          `
+            SELECT
+              id,
+              fixture_id,
+              fixture_date,
+
+              league_id,
+              league_name,
+
+              home_team_id,
+              home_team_name,
+              away_team_id,
+              away_team_name,
+
+              decision,
+              selected_outcome,
+              bet_status,
+
+              confidence,
+              risk,
+
+              home_probability,
+              draw_probability,
+              away_probability,
+
+              fair_odd,
+              market_odd,
+              value_percentage,
+
+              explanation,
+
+              result_status,
+              home_goals,
+              away_goals,
+              won,
+              profit,
+
+              official_xg_home,
+              official_xg_away,
+              xg_source,
+              xg_confidence_score,
+              xg_confidence_level,
+
+              form_weight,
+              market_weight,
+              monte_carlo_weight,
+
+              decision_trace,
+              model_inputs,
+              monte_carlo_model,
+              analysis_context,
+
+              created_at,
+              updated_at
+            FROM predictions
+            WHERE
+              result_status IS NOT NULL
+              AND LOWER(result_status)
+                IN (
+                  'win',
+                  'loss',
+                  'won',
+                  'lost',
+                  'completed',
+                  'finished'
+                )
+              AND home_goals IS NOT NULL
+              AND away_goals IS NOT NULL
+            ORDER BY
+              fixture_date DESC
+            LIMIT $1
+          `,
+          [limit]
+        );
+
+      return res.json({
+        ok: true,
+
+        count:
+          result.rows.length,
+
+        predictions:
+          result.rows,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /public/learning/finished :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        predictions: [],
+        count: 0,
+        error:
+          error.message ||
+          "Impossible de charger les prédictions terminées.",
+      });
+    }
+  }
+);
 app.listen(
   PORT,
   "0.0.0.0",
