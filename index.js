@@ -7335,138 +7335,7 @@ app.get("/public/analysis/:fixtureId", async (req, res) => {
     });
   }
 });
-app.get("/public/daily-picks", async (req, res) => {
-  try {
-    const requestedDate =
-      req.query.date ||
-      new Date().toISOString().slice(0, 10);
 
-    const dateFormat = /^\d{4}-\d{2}-\d{2}$/;
-
-    if (!dateFormat.test(requestedDate)) {
-      return res.status(400).json({
-        ok: false,
-        error: "La date doit être au format YYYY-MM-DD",
-      });
-    }
-
-    const result = await pool.query(
-      `
-        SELECT
-          fixture_id,
-          fixture_date,
-          league_name,
-          home_team_name,
-          away_team_name,
-          decision,
-          bet_status,
-          confidence,
-          risk,
-          home_probability,
-          draw_probability,
-          away_probability,
-          fair_odd,
-          market_odd,
-          value_percentage,
-          explanation,
-          result_status
-        FROM predictions
-        WHERE fixture_date >= $1::date
-          AND fixture_date < ($1::date + INTERVAL '1 day')
-        ORDER BY
-          CASE
-            WHEN bet_status = 'VALUE_BET' THEN 1
-            WHEN bet_status = 'À_SURVEILLER' THEN 2
-            WHEN bet_status = 'NO_BET' THEN 3
-            ELSE 4
-          END,
-          value_percentage DESC NULLS LAST,
-          confidence DESC NULLS LAST
-      `,
-      [requestedDate]
-    );
-
-    const picks = result.rows.map((item) => ({
-      fixtureId: item.fixture_id,
-
-      match: {
-        date: item.fixture_date,
-        league: item.league_name,
-        homeTeam: item.home_team_name,
-        awayTeam: item.away_team_name,
-      },
-
-      analysis: {
-        decision: item.decision,
-        betStatus: item.bet_status,
-        confidence: Number(item.confidence),
-        risk: item.risk,
-
-        probabilities: {
-          home: Number(item.home_probability),
-          draw: Number(item.draw_probability),
-          away: Number(item.away_probability),
-        },
-
-        fairOdd:
-          item.fair_odd === null
-            ? null
-            : Number(item.fair_odd),
-
-        marketOdd:
-          item.market_odd === null
-            ? null
-            : Number(item.market_odd),
-
-        value:
-          item.value_percentage === null
-            ? null
-            : Number(item.value_percentage),
-
-        explanation: item.explanation,
-      },
-
-      status: item.result_status,
-    }));
-
-    const valueBets = picks.filter(
-      (item) =>
-        item.analysis.betStatus === "VALUE_BET"
-    );
-
-    const watchlist = picks.filter(
-      (item) =>
-        item.analysis.betStatus === "À_SURVEILLER"
-    );
-
-    const noBet = picks.filter(
-      (item) =>
-        item.analysis.betStatus === "NO_BET"
-    );
-
-    return res.json({
-      ok: true,
-      date: requestedDate,
-      count: picks.length,
-
-      summary: {
-        valueBets: valueBets.length,
-        watchlist: watchlist.length,
-        noBet: noBet.length,
-      },
-
-      topPicks: valueBets.slice(0, 5),
-      watchlist,
-      noBet,
-      all: picks,
-    });
-  } catch (error) {
-    return res.status(500).json({
-      ok: false,
-      error: error.message,
-    });
-  }
-});
 app.get(
   "/internal/cron/analyze-daily",
   async (req, res) => {
@@ -8258,7 +8127,20 @@ updated_at
             "Analyse AI Lab introuvable",
         });
       }
-
+if (
+  isFriendlyLeagueName(
+    prediction.league_name
+  )
+) {
+  return res.status(404).json({
+    ok: false,
+    skipped: true,
+    reason:
+      "FRIENDLY_MATCH_EXCLUDED",
+    error:
+      "Cette analyse amicale est exclue de FootballBrain.",
+  });
+}
       return res.json({
         ok: true,
 
