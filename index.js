@@ -10279,6 +10279,112 @@ async function runHourlyOddsWatcher() {
       false;
   }
 }
+/*
+ * PLANIFICATEUR DE L’ANALYSE COMPLÈTE
+ *
+ * Cette variable mémorise la dernière date
+ * pour laquelle l’analyse quotidienne a été lancée.
+ */
+let lastDailyFullAnalysisDate = null;
+
+/*
+ * Retourne la date et l’heure actuelles
+ * dans le fuseau horaire Europe/Paris.
+ */
+function getParisTimeParts() {
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone: "Europe/Paris",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }
+    ).formatToParts(new Date());
+
+  const values = {};
+
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      values[part.type] =
+        part.value;
+    }
+  }
+
+  return {
+    date:
+      `${values.year}-` +
+      `${values.month}-` +
+      `${values.day}`,
+
+    hour:
+      Number(values.hour),
+
+    minute:
+      Number(values.minute),
+  };
+}
+
+/*
+ * Vérifie si l’analyse complète doit être lancée.
+ *
+ * Elle s’exécute une seule fois par jour,
+ * entre 03h00 et 03h09, heure de Paris.
+ */
+async function checkDailyFullAnalysisSchedule() {
+  const paris =
+    getParisTimeParts();
+
+  const isScheduledWindow =
+    paris.hour === 3 &&
+    paris.minute < 10;
+
+  const alreadyRunToday =
+    lastDailyFullAnalysisDate ===
+    paris.date;
+
+  if (
+    !isScheduledWindow ||
+    alreadyRunToday
+  ) {
+    return;
+  }
+
+  /*
+   * On mémorise immédiatement la date
+   * pour empêcher deux lancements simultanés.
+   */
+  lastDailyFullAnalysisDate =
+    paris.date;
+
+  console.log(
+    `ANALYSE COMPLÈTE PLANIFIÉE : ${paris.date}`
+  );
+
+  try {
+    await runAutomaticDailyAnalysis();
+  } catch (error) {
+    /*
+     * En cas d’échec, le prochain contrôle
+     * pourra effectuer une nouvelle tentative.
+     */
+    lastDailyFullAnalysisDate =
+      null;
+
+    console.error(
+      "ANALYSE COMPLÈTE PLANIFIÉE : erreur",
+      error.message
+    );
+  }
+}
+
+/*
+ * DÉMARRAGE DU SERVEUR
+ */
 app.listen(
   PORT,
   "0.0.0.0",
@@ -10290,12 +10396,8 @@ app.listen(
     /*
      * ANALYSE COMPLÈTE QUOTIDIENNE
      *
-     * Premier contrôle du planificateur
-     * une minute après le démarrage.
-     *
-     * Ce contrôle ne lance une analyse
-     * que si l’heure de Paris se trouve
-     * dans la fenêtre prévue autour de 03h00.
+     * Premier contrôle une minute
+     * après le démarrage du serveur.
      */
     setTimeout(() => {
       checkDailyFullAnalysisSchedule();
@@ -10304,12 +10406,12 @@ app.listen(
     /*
      * ANALYSE COMPLÈTE QUOTIDIENNE
      *
-     * Vérification de l’heure toutes
-     * les cinq minutes.
+     * Vérification de l’horaire
+     * toutes les cinq minutes.
      *
-     * Cette vérification ne consomme aucune
-     * requête API-Football tant qu’il n’est
-     * pas l’heure de lancer l’analyse complète.
+     * Aucune requête API-Football
+     * n’est consommée hors de la fenêtre
+     * prévue à 03h00.
      */
     setInterval(() => {
       checkDailyFullAnalysisSchedule();
@@ -10319,8 +10421,7 @@ app.listen(
      * ODDS WATCHER
      *
      * Premier contrôle léger des cotes
-     * cinq minutes après le démarrage
-     * du serveur.
+     * cinq minutes après le démarrage.
      */
     setTimeout(() => {
       runHourlyOddsWatcher();
@@ -10331,15 +10432,6 @@ app.listen(
      *
      * Actualisation légère des cotes
      * toutes les heures.
-     *
-     * Le watcher vérifie uniquement
-     * les prochains matchs déjà analysés.
-     *
-     * - Petit mouvement de cote :
-     *   mise à jour PostgreSQL uniquement.
-     *
-     * - Mouvement supérieur ou égal à 10 % :
-     *   réanalyse complète du match.
      */
     setInterval(() => {
       runHourlyOddsWatcher();
