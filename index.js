@@ -8439,15 +8439,7 @@ app.get(
       )
     )
   );
-        })
-        .sort((a, b) =>
-          String(
-            a?.fixture?.date || ""
-          ).localeCompare(
-            String(b?.fixture?.date || "")
-          )
-        );
-
+       
       const fixtureIds = fixtures.map(
         (item) =>
           Number(item.fixture.id)
