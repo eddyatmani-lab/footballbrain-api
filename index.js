@@ -9504,6 +9504,323 @@ app.get(
     }
   }
 );
+let lineupWatcherRunning = false;
+
+const lineupRebuiltFixtures =
+  new Set();
+
+function wait(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+async function runLineupWatcher() {
+  if (lineupWatcherRunning) {
+    console.log(
+      "LINEUP WATCHER : contrôle déjà en cours"
+    );
+
+    return;
+  }
+
+  lineupWatcherRunning = true;
+
+  try {
+    const date =
+      getParisDateString();
+
+    console.log(
+      `LINEUP WATCHER : contrôle du ${date}`
+    );
+
+    /*
+     * On récupère les matchs du jour.
+     */
+    const fixturesResponse =
+      await callApiFootball(
+        "/fixtures",
+        {
+          date,
+          timezone:
+            "Europe/Paris",
+        }
+      );
+
+    const fixtures =
+      Array.isArray(
+        fixturesResponse
+          .data?.response
+      )
+        ? fixturesResponse
+            .data.response
+        : [];
+
+    const now =
+      Date.now();
+
+    /*
+     * On surveille uniquement les matchs :
+     * - commençant dans moins de 2 heures ;
+     * - ou commencés/terminés depuis moins de 3 heures.
+     */
+    const fixturesToCheck =
+      fixtures.filter((item) => {
+        const fixtureId =
+          Number(
+            item?.fixture?.id
+          );
+
+        const kickoff =
+          new Date(
+            item?.fixture?.date
+          ).getTime();
+
+        if (
+          !Number.isInteger(
+            fixtureId
+          ) ||
+          fixtureId <= 0 ||
+          !Number.isFinite(kickoff)
+        ) {
+          return false;
+        }
+
+        const minutesUntilKickoff =
+          (kickoff - now) /
+          60000;
+
+        return (
+          minutesUntilKickoff <=
+            120 &&
+          minutesUntilKickoff >=
+            -180
+        );
+      });
+
+    const baseUrl =
+      `http://127.0.0.1:${PORT}`;
+
+    const results = [];
+
+    for (
+      const fixture
+      of fixturesToCheck
+    ) {
+      const fixtureId =
+        Number(
+          fixture.fixture.id
+        );
+
+      const homeTeam =
+        fixture.teams?.home
+          ?.name ||
+        "Domicile";
+
+      const awayTeam =
+        fixture.teams?.away
+          ?.name ||
+        "Extérieur";
+
+      /*
+       * Ce match a déjà été recalculé après
+       * réception de ses compositions.
+       */
+      if (
+        lineupRebuiltFixtures.has(
+          fixtureId
+        )
+      ) {
+        continue;
+      }
+
+      try {
+        /*
+         * Petit délai pour éviter les erreurs 429.
+         */
+        await wait(1200);
+
+        const lineupResponse =
+          await callApiFootball(
+            "/fixtures/lineups",
+            {
+              fixture:
+                fixtureId,
+            }
+          );
+
+        const lineups =
+          Array.isArray(
+            lineupResponse
+              .data?.response
+          )
+            ? lineupResponse
+                .data.response
+            : [];
+
+        const homeFormation =
+          lineups?.[0]
+            ?.formation ||
+          null;
+
+        const awayFormation =
+          lineups?.[1]
+            ?.formation ||
+          null;
+
+        const lineupsAvailable =
+          lineups.length >= 2 &&
+          Boolean(
+            homeFormation &&
+            awayFormation
+          );
+
+        if (!lineupsAvailable) {
+          results.push({
+            fixtureId,
+            homeTeam,
+            awayTeam,
+            status:
+              "WAITING_LINEUPS",
+          });
+
+          continue;
+        }
+
+        console.log(
+          "LINEUP WATCHER : compositions détectées",
+          {
+            fixtureId,
+            homeTeam,
+            awayTeam,
+            homeFormation,
+            awayFormation,
+          }
+        );
+
+        /*
+         * Recalcul complet sans utiliser le cache.
+         */
+        const analysisResponse =
+          await fetch(
+            `${baseUrl}/internal/analyze/${fixtureId}?refresh=1`,
+            {
+              method: "GET",
+              headers: {
+                Accept:
+                  "application/json",
+              },
+            }
+          );
+
+        const analysisData =
+          await analysisResponse
+            .json();
+
+        if (
+          !analysisResponse.ok ||
+          !analysisData?.ok
+        ) {
+          throw new Error(
+            analysisData?.message ||
+            analysisData?.error ||
+            "Recalcul impossible"
+          );
+        }
+
+        lineupRebuiltFixtures.add(
+          fixtureId
+        );
+
+        results.push({
+          fixtureId,
+          homeTeam,
+          awayTeam,
+          status:
+            "REBUILT_WITH_LINEUPS",
+          homeFormation,
+          awayFormation,
+        });
+      } catch (error) {
+        const status =
+          error.response?.status;
+
+        results.push({
+          fixtureId,
+          homeTeam,
+          awayTeam,
+          status: "FAILED",
+          error:
+            error.message ||
+            "Erreur inconnue",
+        });
+
+        /*
+         * Si l’API ralentit les requêtes,
+         * on attend avant le match suivant.
+         */
+        if (status === 429) {
+          console.warn(
+            "LINEUP WATCHER : limite API, pause de 60 secondes"
+          );
+
+          await wait(60000);
+        }
+      }
+    }
+
+    console.log(
+      "LINEUP WATCHER : terminé",
+      {
+        checked:
+          fixturesToCheck.length,
+
+        rebuilt:
+          results.filter(
+            (item) =>
+              item.status ===
+              "REBUILT_WITH_LINEUPS"
+          ).length,
+
+        waiting:
+          results.filter(
+            (item) =>
+              item.status ===
+              "WAITING_LINEUPS"
+          ).length,
+
+        failed:
+          results.filter(
+            (item) =>
+              item.status ===
+              "FAILED"
+          ).length,
+      }
+    );
+  } catch (error) {
+    console.error(
+      "ERREUR LINEUP WATCHER :",
+      error.message
+    );
+  } finally {
+    lineupWatcherRunning =
+      false;
+  }
+}
+/*
+ * Premier contrôle 45 secondes
+ * après le démarrage du serveur.
+ */
+setTimeout(() => {
+  runLineupWatcher();
+}, 45_000);
+
+/*
+ * Nouveau contrôle toutes les 10 minutes.
+ */
+setInterval(() => {
+  runLineupWatcher();
+}, 10 * 60 * 1000);
 app.listen(
   PORT,
   "0.0.0.0",
