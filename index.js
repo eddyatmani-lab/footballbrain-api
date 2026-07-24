@@ -581,16 +581,27 @@ app.get("/internal/analyze/:fixtureId", async (req, res) => {
 
     // ...
 
-   const cached = analysisCache.get(fixtureId);
+   const forceRefresh =
+  req.query.refresh === "1" ||
+  req.query.refresh === "true";
+
+const cached =
+  analysisCache.get(fixtureId);
 
 if (
+  !forceRefresh &&
   cached &&
-  Date.now() - cached.createdAt < ANALYSIS_CACHE_TTL
+  Date.now() - cached.createdAt <
+    ANALYSIS_CACHE_TTL
 ) {
   return res.json({
     ...cached.data,
     cached: true,
   });
+}
+
+if (forceRefresh) {
+  analysisCache.delete(fixtureId);
 }
  const fixtureResponse = await callApiFootball("/fixtures", {
       id: fixtureId,
@@ -9355,6 +9366,138 @@ app.get(
           error.message ||
           "Erreur inconnue",
       });
+    }
+  }
+);
+app.get(
+  "/internal/rebuild-daily-analyses",
+  async (req, res) => {
+    try {
+      const date =
+        req.query.date ||
+        getParisDateString();
+
+      const limit =
+        Math.max(
+          1,
+          Math.min(
+            300,
+            Number(req.query.limit) ||
+              200
+          )
+        );
+
+      const fixturesResponse =
+        await callApiFootball(
+          "/fixtures",
+          {
+            date,
+            timezone:
+              "Europe/Paris",
+          }
+        );
+
+      const fixtures =
+        Array.isArray(
+          fixturesResponse
+            .data?.response
+        )
+          ? fixturesResponse
+              .data.response
+          : [];
+
+      const selectedFixtures =
+        fixtures.slice(0, limit);
+
+      const results = [];
+
+      for (
+        const fixture
+        of selectedFixtures
+      ) {
+        const fixtureId =
+          Number(
+            fixture?.fixture?.id
+          );
+
+        if (
+          !Number.isInteger(
+            fixtureId
+          )
+        ) {
+          continue;
+        }
+
+        try {
+          analysisCache.delete(
+            fixtureId
+          );
+
+          const analysis =
+            await processFixtureAnalysis(
+              fixtureId,
+              {
+                forceRefresh:
+                  true,
+              }
+            );
+
+          results.push({
+            fixtureId,
+            ok: true,
+            hasContext:
+              Boolean(
+                analysis?.context
+              ),
+            hasMonteCarlo:
+              Number(
+                analysis
+                  ?.monteCarloModel
+                  ?.simulations
+              ) === 10000,
+          });
+        } catch (error) {
+          results.push({
+            fixtureId,
+            ok: false,
+            error:
+              error.message ||
+              "Erreur inconnue",
+          });
+        }
+      }
+
+      return res.json({
+        ok: true,
+        date,
+        summary: {
+          fixtures:
+            selectedFixtures
+              .length,
+
+          rebuilt:
+            results.filter(
+              (item) =>
+                item.ok
+            ).length,
+
+          failed:
+            results.filter(
+              (item) =>
+                !item.ok
+            ).length,
+        },
+        results,
+      });
+    } catch (error) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            error.message ||
+            "Erreur inconnue",
+        });
     }
   }
 );
