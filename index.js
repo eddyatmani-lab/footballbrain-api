@@ -9790,6 +9790,68 @@ setTimeout(() => {
 setInterval(() => {
   runLineupWatcher();
 }, 10 * 60 * 1000);
+let automaticRebuildRunning = false;
+
+async function runAutomaticRebuildQueue() {
+  if (automaticRebuildRunning) {
+    console.log(
+      "AUTO REBUILD : une reconstruction est déjà en cours"
+    );
+    return;
+  }
+
+  automaticRebuildRunning = true;
+
+  try {
+    const date = getParisDateString();
+
+    console.log(
+      `AUTO REBUILD : démarrage pour ${date}`
+    );
+
+    const baseUrl =
+      `http://127.0.0.1:${PORT}`;
+
+    const response = await fetch(
+      `${baseUrl}/internal/rebuild-daily-analysis` +
+        `?date=${date}&force=1&limit=20`,
+      {
+        headers: {
+          Accept: "application/json",
+        },
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || !data?.ok) {
+      throw new Error(
+        data?.error ||
+          data?.message ||
+          "Reconstruction automatique impossible"
+      );
+    }
+
+    console.log(
+      "AUTO REBUILD : terminé",
+      data.summary || data
+    );
+  } catch (error) {
+    console.error(
+      "AUTO REBUILD : erreur",
+      error.message
+    );
+  } finally {
+    automaticRebuildRunning = false;
+  }
+}
+setTimeout(() => {
+  runAutomaticRebuildQueue();
+}, 2 * 60 * 1000);
+
+setInterval(() => {
+  runAutomaticRebuildQueue();
+}, 15 * 60 * 1000);
 app.listen(
   PORT,
   "0.0.0.0",
