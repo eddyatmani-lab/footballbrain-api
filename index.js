@@ -69,7 +69,37 @@ async function callApiFootball(
 
   return response;
 }
+function isFriendlyFixture(
+  fixture = {}
+) {
+  const leagueName = String(
+    fixture?.league?.name ||
+    fixture?.league_name ||
+    ""
+  )
+    .toLowerCase();
 
+  return (
+    leagueName.includes(
+      "friendl"
+    ) ||
+    leagueName.includes(
+      "amical"
+    ) ||
+    leagueName.includes(
+      "u17"
+    ) ||
+    leagueName.includes(
+      "u18"
+    ) ||
+    leagueName.includes(
+      "u19"
+    ) ||
+    leagueName.includes(
+      "u20"
+    )
+  );
+}
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -616,7 +646,20 @@ if (forceRefresh) {
         error: "Match introuvable",
       });
     }
+if (
+  isFriendlyFixture(fixture)
+) {
+  analysisCache.delete(
+    fixtureId
+  );
 
+  return res.status(422).json({
+    ok: false,
+    skipped: true,
+    reason:
+      "FRIENDLY_MATCH_EXCLUDED",
+  });
+}
     const homeTeamId = fixture.teams?.home?.id;
     const awayTeamId = fixture.teams?.away?.id;
 
@@ -4477,7 +4520,37 @@ async function callApiFootball(
 
   return response;
 }
+function isFriendlyFixture(
+  fixture = {}
+) {
+  const leagueName = String(
+    fixture?.league?.name ||
+    fixture?.league_name ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
 
+  return (
+    leagueName.includes("friendl") ||
+    leagueName.includes("amical")
+  );
+}
+
+function isFriendlyLeagueName(
+  leagueName = ""
+) {
+  const normalized = String(
+    leagueName
+  )
+    .trim()
+    .toLowerCase();
+
+  return (
+    normalized.includes("friendl") ||
+    normalized.includes("amical")
+  );
+}
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -5013,7 +5086,26 @@ if (
         error: "Match introuvable",
       });
     }
+if (
+  isFriendlyFixture(fixture)
+) {
+  analysisCache.delete(
+    fixtureId
+  );
 
+  return res.status(422).json({
+    ok: false,
+    skipped: true,
+    reason:
+      "FRIENDLY_MATCH_EXCLUDED",
+    error:
+      "Les matchs amicaux sont exclus des analyses FootballBrain.",
+    fixtureId,
+    league:
+      fixture?.league?.name ||
+      null,
+  });
+}
     const homeTeamId = fixture.teams?.home?.id;
     const awayTeamId = fixture.teams?.away?.id;
 
@@ -8452,11 +8544,15 @@ app.get(
             item?.teams?.away?.name;
 
           return (
-            Number.isInteger(fixtureId) &&
-            fixtureId > 0 &&
-            homeName &&
-            awayName
-          );
+  Number.isInteger(fixtureId) &&
+  fixtureId > 0 &&
+  item?.teams?.home?.name &&
+  item?.teams?.away?.name &&
+  !excludedStatuses.includes(
+    status
+  ) &&
+  !isFriendlyFixture(item)
+);
         })
         .sort((a, b) =>
           String(
@@ -8880,26 +8976,27 @@ app.get(
       ];
 
       const fixtures = rawFixtures
-        .filter((item) => {
-          const fixtureId = Number(
-            item?.fixture?.id
-          );
+  .filter((item) => {
+    const fixtureId = Number(
+      item?.fixture?.id
+    );
 
-          const status = String(
-            item?.fixture?.status?.short ||
-              ""
-          ).toUpperCase();
+    const status = String(
+      item?.fixture?.status?.short ||
+        ""
+    ).toUpperCase();
 
-          return (
-            Number.isInteger(fixtureId) &&
-            fixtureId > 0 &&
-            item?.teams?.home?.name &&
-            item?.teams?.away?.name &&
-            !excludedStatuses.includes(
-              status
-            )
-          );
-        })
+    return (
+  Number.isInteger(fixtureId) &&
+  fixtureId > 0 &&
+  item?.teams?.home?.name &&
+  item?.teams?.away?.name &&
+  !excludedStatuses.includes(
+    status
+  ) &&
+  !isFriendlyFixture(item)
+);
+  });
         
 
       if (fixtures.length === 0) {
@@ -9565,16 +9662,22 @@ async function runLineupWatcher() {
      * - ou commencés/terminés depuis moins de 3 heures.
      */
     const fixturesToCheck =
-      fixtures.filter((item) => {
-        const fixtureId =
-          Number(
-            item?.fixture?.id
-          );
+  fixtures.filter((item) => {
+    if (
+      isFriendlyFixture(item)
+    ) {
+      return false;
+    }
 
-        const kickoff =
-          new Date(
-            item?.fixture?.date
-          ).getTime();
+    const fixtureId =
+      Number(
+        item?.fixture?.id
+      );
+
+    const kickoff =
+      new Date(
+        item?.fixture?.date
+      ).getTime();
 
         if (
           !Number.isInteger(
