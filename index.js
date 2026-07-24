@@ -77,27 +77,12 @@ function isFriendlyFixture(
     fixture?.league_name ||
     ""
   )
+    .trim()
     .toLowerCase();
 
   return (
-    leagueName.includes(
-      "friendl"
-    ) ||
-    leagueName.includes(
-      "amical"
-    ) ||
-    leagueName.includes(
-      "u17"
-    ) ||
-    leagueName.includes(
-      "u18"
-    ) ||
-    leagueName.includes(
-      "u19"
-    ) ||
-    leagueName.includes(
-      "u20"
-    )
+    leagueName.includes("friendl") ||
+    leagueName.includes("amical")
   );
 }
 app.get("/", (req, res) => {
