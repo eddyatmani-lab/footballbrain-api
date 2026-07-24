@@ -9154,14 +9154,103 @@ async function runAutomaticDailyAnalysis() {
     );
     return;
   }
+let lastDailyFullAnalysisDate = null;
 
+function getParisTimeParts() {
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone: "Europe/Paris",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }
+    ).formatToParts(new Date());
+
+  const values = {};
+
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      values[part.type] =
+        part.value;
+    }
+  }
+
+  return {
+    date:
+      `${values.year}-` +
+      `${values.month}-` +
+      `${values.day}`,
+
+    hour:
+      Number(values.hour),
+
+    minute:
+      Number(values.minute),
+  };
+}
+
+async function checkDailyFullAnalysisSchedule() {
+  const paris =
+    getParisTimeParts();
+
+  /*
+   * Exécution une seule fois entre
+   * 03h00 et 03h09, heure de Paris.
+   */
+  const isScheduledWindow =
+    paris.hour === 3 &&
+    paris.minute < 10;
+
+  const alreadyRunToday =
+    lastDailyFullAnalysisDate ===
+    paris.date;
+
+  if (
+    !isScheduledWindow ||
+    alreadyRunToday
+  ) {
+    return;
+  }
+
+  /*
+   * On mémorise immédiatement la date
+   * pour éviter deux lancements simultanés.
+   */
+  lastDailyFullAnalysisDate =
+    paris.date;
+
+  console.log(
+    `ANALYSE COMPLÈTE PLANIFIÉE : ${paris.date}`
+  );
+
+  try {
+    await runAutomaticDailyAnalysis();
+  } catch (error) {
+    /*
+     * En cas d’échec, autoriser une nouvelle
+     * tentative au prochain contrôle.
+     */
+    lastDailyFullAnalysisDate =
+      null;
+
+    console.error(
+      "ANALYSE COMPLÈTE PLANIFIÉE : erreur",
+      error.message
+    );
+  }
+}
   dailyAnalysisJobRunning = true;
 
   try {
     const url =
-      `http://127.0.0.1:${PORT}` +
-      `/internal/rebuild-daily-analysis` +
-      `?limit=20`;
+  `http://127.0.0.1:${PORT}` +
+  `/internal/rebuild-daily-analysis` +
+  `?limit=300`;
 
     console.log(
       "ANALYSE QUOTIDIENNE : démarrage"
@@ -9863,16 +9952,15 @@ app.listen(
      * Premier contrôle 30 secondes
      * après le démarrage du serveur.
      */
-    setTimeout(() => {
-      runAutomaticDailyAnalysis();
-    }, 30_000);
-
+   setTimeout(() => {
+  checkDailyFullAnalysisSchedule();
+}, 60_000);
     /*
      * Nouveau contrôle chaque heure.
      * Les matchs déjà complets sont ignorés.
      */
     setInterval(() => {
-      runAutomaticDailyAnalysis();
-    }, 10 * 60 * 1000);
+      checkDailyFullAnalysisSchedule();
+    }, 5 * 60 * 1000);
   }
 );
