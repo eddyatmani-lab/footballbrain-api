@@ -8839,14 +8839,14 @@ app.get(
       );
 
       const limit = Math.min(
-        30,
-        Math.max(
-          1,
-          Number.isInteger(requestedLimit)
-            ? requestedLimit
-            : 10
-        )
-      );
+  300,
+  Math.max(
+    1,
+    Number.isInteger(requestedLimit)
+      ? requestedLimit
+      : 200
+  )
+);
 
       const force =
         String(req.query.force || "") ===
@@ -9006,17 +9006,20 @@ const selectedFixturesToRebuild =
           fixture.teams.away.name;
 
         try {
-          const response = await fetch(
-            `${baseUrl}/internal/analyze/${fixtureId}`,
-            {
-              method: "GET",
-              headers: {
-                Accept:
-                  "application/json",
-              },
-            }
-          );
+          const analysisUrl =
+  `${baseUrl}/internal/analyze/${fixtureId}` +
+  `${force ? "?refresh=1" : ""}`;
 
+const response = await fetch(
+  analysisUrl,
+  {
+    method: "GET",
+    headers: {
+      Accept:
+        "application/json",
+    },
+  }
+);
           const data =
             await response.json();
 
