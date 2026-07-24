@@ -9939,7 +9939,346 @@ setTimeout(() => {
 setInterval(() => {
   runLineupWatcher();
 }, 10 * 60 * 1000);
+let hourlyOddsWatcherRunning = false;
 
+function normalizeSelectedOutcome(
+  selectedOutcome = ""
+) {
+  const value = String(
+    selectedOutcome
+  )
+    .trim()
+    .toUpperCase();
+
+  if (
+    value === "HOME" ||
+    value === "1" ||
+    value === "DOMICILE"
+  ) {
+    return "HOME";
+  }
+
+  if (
+    value === "DRAW" ||
+    value === "X" ||
+    value === "N" ||
+    value === "NUL"
+  ) {
+    return "DRAW";
+  }
+
+  if (
+    value === "AWAY" ||
+    value === "2" ||
+    value === "EXTÉRIEUR" ||
+    value === "EXTERIEUR"
+  ) {
+    return "AWAY";
+  }
+
+  return null;
+}
+
+function getSelectedMarketOdd(
+  market = {},
+  selectedOutcome = ""
+) {
+  const normalized =
+    normalizeSelectedOutcome(
+      selectedOutcome
+    );
+
+  if (normalized === "HOME") {
+    return Number(
+      market.homeAverageOdd
+    );
+  }
+
+  if (normalized === "DRAW") {
+    return Number(
+      market.drawAverageOdd
+    );
+  }
+
+  if (normalized === "AWAY") {
+    return Number(
+      market.awayAverageOdd
+    );
+  }
+
+  return null;
+}
+
+function getSelectedProbability(
+  prediction = {}
+) {
+  const normalized =
+    normalizeSelectedOutcome(
+      prediction.selected_outcome
+    );
+
+  if (normalized === "HOME") {
+    return Number(
+      prediction.home_probability
+    );
+  }
+
+  if (normalized === "DRAW") {
+    return Number(
+      prediction.draw_probability
+    );
+  }
+
+  if (normalized === "AWAY") {
+    return Number(
+      prediction.away_probability
+    );
+  }
+
+  return null;
+}
+
+async function runHourlyOddsWatcher() {
+  if (hourlyOddsWatcherRunning) {
+    console.log(
+      "ODDS WATCHER : contrôle déjà en cours"
+    );
+    return;
+  }
+
+  hourlyOddsWatcherRunning = true;
+
+  const summary = {
+    checked: 0,
+    updated: 0,
+    rebuilt: 0,
+    unavailable: 0,
+    failed: 0,
+  };
+
+  try {
+    const date =
+      getParisDateString();
+
+    console.log(
+      `ODDS WATCHER : contrôle du ${date}`
+    );
+
+    /*
+     * On sélectionne seulement les 20
+     * prochains matchs déjà analysés.
+     */
+    const predictionsResult =
+      await pool.query(
+        `
+          SELECT
+            fixture_id,
+            fixture_date,
+            selected_outcome,
+            home_probability,
+            draw_probability,
+            away_probability,
+            market_odd
+          FROM predictions
+          WHERE
+            fixture_date >= NOW()
+            AND fixture_date <
+              NOW() + INTERVAL '24 hours'
+            AND result_status = 'PENDING'
+          ORDER BY fixture_date ASC
+          LIMIT 20
+        `
+      );
+
+    const predictions =
+      predictionsResult.rows;
+
+    for (
+      const prediction
+      of predictions
+    ) {
+      const fixtureId =
+        Number(
+          prediction.fixture_id
+        );
+
+      try {
+        summary.checked += 1;
+
+        const oddsResponse =
+          await callApiFootball(
+            "/odds",
+            {
+              fixture: fixtureId,
+            }
+          );
+
+        const rawOdds =
+          oddsResponse.data?.response ||
+          [];
+
+        const market =
+          summarizeMatchWinnerOdds(
+            rawOdds
+          );
+
+        const newMarketOdd =
+          getSelectedMarketOdd(
+            market,
+            prediction.selected_outcome
+          );
+
+        if (
+          !Number.isFinite(
+            newMarketOdd
+          ) ||
+          newMarketOdd <= 1
+        ) {
+          summary.unavailable += 1;
+          continue;
+        }
+
+        const oldMarketOdd =
+          Number(
+            prediction.market_odd
+          );
+
+        const probability =
+          getSelectedProbability(
+            prediction
+          );
+
+        const valuePercentage =
+          Number.isFinite(
+            probability
+          )
+            ? Number(
+                (
+                  (
+                    newMarketOdd *
+                    (probability / 100)
+                  ) -
+                  1
+                ).toFixed(4)
+              ) * 100
+            : null;
+
+        /*
+         * Variation relative entre
+         * l’ancienne et la nouvelle cote.
+         */
+        const movementPercent =
+          Number.isFinite(
+            oldMarketOdd
+          ) &&
+          oldMarketOdd > 1
+            ? Math.abs(
+                (
+                  (
+                    newMarketOdd -
+                    oldMarketOdd
+                  ) /
+                  oldMarketOdd
+                ) *
+                  100
+              )
+            : 0;
+
+        /*
+         * Mouvement d’au moins 10 % :
+         * réanalyse complète du match.
+         */
+        if (
+          movementPercent >= 10
+        ) {
+          console.log(
+            "ODDS WATCHER : mouvement important",
+            {
+              fixtureId,
+              oldMarketOdd,
+              newMarketOdd,
+              movementPercent:
+                Number(
+                  movementPercent.toFixed(
+                    2
+                  )
+                ),
+            }
+          );
+
+          analysisCache.delete(
+            fixtureId
+          );
+
+          await processFixtureAnalysis(
+            fixtureId,
+            {
+              forceRefresh: true,
+            }
+          );
+
+          summary.rebuilt += 1;
+        } else {
+          /*
+           * Petit mouvement :
+           * simple actualisation SQL,
+           * sans reconstruire les moteurs.
+           */
+          await pool.query(
+            `
+              UPDATE predictions
+              SET
+                market_odd = $1,
+                value_percentage = $2,
+                updated_at = NOW()
+              WHERE fixture_id = $3
+            `,
+            [
+              newMarketOdd,
+              valuePercentage,
+              fixtureId,
+            ]
+          );
+
+          summary.updated += 1;
+        }
+
+        /*
+         * Petite pause pour éviter
+         * d’envoyer 20 appels simultanés.
+         */
+        await wait(750);
+      } catch (error) {
+        summary.failed += 1;
+
+        console.error(
+          "ODDS WATCHER : erreur",
+          {
+            fixtureId,
+            error:
+              error.message ||
+              "Erreur inconnue",
+          }
+        );
+
+        await wait(1500);
+      }
+    }
+
+    console.log(
+      "ODDS WATCHER : terminé",
+      summary
+    );
+  } catch (error) {
+    console.error(
+      "ODDS WATCHER : erreur générale",
+      error.message
+    );
+  } finally {
+    hourlyOddsWatcherRunning =
+      false;
+  }
+}
 app.listen(
   PORT,
   "0.0.0.0",
@@ -9949,18 +10288,61 @@ app.listen(
     );
 
     /*
-     * Premier contrôle 30 secondes
-     * après le démarrage du serveur.
+     * ANALYSE COMPLÈTE QUOTIDIENNE
+     *
+     * Premier contrôle du planificateur
+     * une minute après le démarrage.
+     *
+     * Ce contrôle ne lance une analyse
+     * que si l’heure de Paris se trouve
+     * dans la fenêtre prévue autour de 03h00.
      */
-   setTimeout(() => {
-  checkDailyFullAnalysisSchedule();
-}, 60_000);
+    setTimeout(() => {
+      checkDailyFullAnalysisSchedule();
+    }, 60_000);
+
     /*
-     * Nouveau contrôle chaque heure.
-     * Les matchs déjà complets sont ignorés.
+     * ANALYSE COMPLÈTE QUOTIDIENNE
+     *
+     * Vérification de l’heure toutes
+     * les cinq minutes.
+     *
+     * Cette vérification ne consomme aucune
+     * requête API-Football tant qu’il n’est
+     * pas l’heure de lancer l’analyse complète.
      */
     setInterval(() => {
       checkDailyFullAnalysisSchedule();
     }, 5 * 60 * 1000);
+
+    /*
+     * ODDS WATCHER
+     *
+     * Premier contrôle léger des cotes
+     * cinq minutes après le démarrage
+     * du serveur.
+     */
+    setTimeout(() => {
+      runHourlyOddsWatcher();
+    }, 5 * 60 * 1000);
+
+    /*
+     * ODDS WATCHER
+     *
+     * Actualisation légère des cotes
+     * toutes les heures.
+     *
+     * Le watcher vérifie uniquement
+     * les prochains matchs déjà analysés.
+     *
+     * - Petit mouvement de cote :
+     *   mise à jour PostgreSQL uniquement.
+     *
+     * - Mouvement supérieur ou égal à 10 % :
+     *   réanalyse complète du match.
+     */
+    setInterval(() => {
+      runHourlyOddsWatcher();
+    }, 60 * 60 * 1000);
   }
 );
