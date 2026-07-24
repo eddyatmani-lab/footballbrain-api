@@ -8411,30 +8411,34 @@ app.get(
           }
         );
 
-      const rawFixtures =
-        fixturesResponse.data?.response || [];
-
       const fixtures = rawFixtures
-        .filter((item) => {
-          const fixtureId =
-            Number(item?.fixture?.id);
+  .filter((item) => {
+    const fixtureId =
+      Number(item?.fixture?.id);
 
-          const homeName =
-            item?.teams?.home?.name;
+    const homeName =
+      item?.teams?.home?.name;
 
-          const awayName =
-            item?.teams?.away?.name;
+    const awayName =
+      item?.teams?.away?.name;
 
-          return (
-  Number.isInteger(fixtureId) &&
-  fixtureId > 0 &&
-  item?.teams?.home?.name &&
-  item?.teams?.away?.name &&
-  !excludedStatuses.includes(
-    status
-  ) &&
-  !isFriendlyFixture(item)
-);
+    return (
+      Number.isInteger(fixtureId) &&
+      fixtureId > 0 &&
+      Boolean(homeName) &&
+      Boolean(awayName) &&
+      !isFriendlyFixture(item)
+    );
+  })
+  .sort((a, b) =>
+    String(
+      a?.fixture?.date || ""
+    ).localeCompare(
+      String(
+        b?.fixture?.date || ""
+      )
+    )
+  );
         })
         .sort((a, b) =>
           String(
