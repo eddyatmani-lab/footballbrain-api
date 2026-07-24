@@ -3526,19 +3526,44 @@ function settlePrediction(prediction, fixture) {
     profit,
   };
 }
-async function updatePendingPredictions(limit = 20) {
-  const pendingResult = await pool.query(
-    `
-      SELECT *
-      FROM predictions
-      WHERE result_status = 'PENDING'
-        AND fixture_date <= NOW()
-      ORDER BY fixture_date ASC
-      LIMIT $1
-    `,
-    [limit]
-  );
+async function updatePendingPredictions(
+  limit = 40
+) {
+ const pendingResult = await pool.query(
+  `
+    SELECT *
+    FROM predictions
+    WHERE
+      (
+        result_status = 'PENDING'
+        OR result_status IS NULL
+      )
 
+      /*
+       * On attend au moins 90 minutes après
+       * le coup d’envoi avant de demander
+       * si le match est terminé.
+       */
+      AND fixture_date <=
+        NOW() - INTERVAL '90 minutes'
+
+      /*
+       * On ne contrôle pas indéfiniment
+       * de très vieux matchs.
+       */
+      AND fixture_date >=
+        NOW() - INTERVAL '36 hours'
+
+    /*
+     * Priorité aux matchs les plus récents,
+     * notamment ceux terminés ce soir.
+     */
+    ORDER BY fixture_date DESC
+
+    LIMIT $1
+  `,
+  [limit]
+);
   const summary = {
     checked: 0,
     completed: 0,
@@ -3608,7 +3633,10 @@ async function updatePendingPredictions(limit = 20) {
               profit = $4,
               updated_at = NOW()
             WHERE fixture_id = $5
-              AND result_status = 'PENDING'
+  AND (
+    result_status = 'PENDING'
+    OR result_status IS NULL
+  )
           `,
           [
             settlement.homeGoals,
@@ -3667,6 +3695,74 @@ async function updatePendingPredictions(limit = 20) {
   }
 
   return summary;
+}
+    /*
+ * SYNCHRONISATION AUTOMATIQUE
+ * DES RÉSULTATS
+ *
+ * Empêche deux cycles de se lancer
+ * simultanément.
+ */
+let automaticResultSyncRunning =
+  false;
+
+async function runAutomaticResultSync() {
+  if (automaticResultSyncRunning) {
+    console.log(
+      "RESULT SYNC : cycle déjà en cours"
+    );
+
+    return {
+      skipped: true,
+      reason: "ALREADY_RUNNING",
+    };
+  }
+
+  automaticResultSyncRunning = true;
+
+  try {
+    const summary =
+      await updatePendingPredictions(
+        40
+      );
+
+    console.log(
+      "RESULT SYNC :",
+      {
+        checked:
+          summary.checked,
+
+        completed:
+          summary.completed,
+
+        stillPending:
+          summary.stillPending,
+
+        errors:
+          summary.errors,
+      }
+    );
+
+    return summary;
+  } catch (error) {
+    console.error(
+      "RESULT SYNC : erreur",
+      error
+    );
+
+    return {
+      checked: 0,
+      completed: 0,
+      stillPending: 0,
+      errors: 1,
+      error:
+        error?.message ||
+        "Erreur inconnue",
+    };
+  } finally {
+    automaticResultSyncRunning =
+      false;
+  }
 }
 app.get(
   "/internal/cron/update-results",
@@ -10512,56 +10608,109 @@ app.get(
     }
   }
 );
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
+app.listen(PORT, () => {
+  console.log(
+    `🚀 FootballBrain API démarrée sur le port ${PORT}`
+  );
+
+  /*
+   * ANALYSES AUTOMATIQUES
+   *
+   * Premier lancement une minute
+   * après le démarrage du serveur.
+   */
+  setTimeout(async () => {
     console.log(
-      `FootballBrain API running on 0.0.0.0:${PORT}`
+      "AUTO ANALYSIS : lancement initial..."
     );
 
-    /*
-     * ANALYSE COMPLÈTE QUOTIDIENNE
-     *
-     * Premier contrôle une minute
-     * après le démarrage du serveur.
-     */
-    setTimeout(() => {
-      checkDailyFullAnalysisSchedule();
-    }, 60_000);
+    try {
+      await runAutomaticDailyAnalysis();
+    } catch (error) {
+      console.error(
+        "AUTO ANALYSIS :",
+        error.message
+      );
+    }
+  }, 1 * 60 * 1000);
 
-    /*
-     * ANALYSE COMPLÈTE QUOTIDIENNE
-     *
-     * Vérification de l’horaire
-     * toutes les cinq minutes.
-     *
-     * Aucune requête API-Football
-     * n’est consommée hors de la fenêtre
-     * prévue à 03h00.
-     */
-    setInterval(() => {
-      checkDailyFullAnalysisSchedule();
-    }, 5 * 60 * 1000);
+  /*
+   * SYNCHRONISATION AUTOMATIQUE
+   * DES RÉSULTATS
+   *
+   * Premier contrôle deux minutes
+   * après le démarrage.
+   */
+  setTimeout(async () => {
+    console.log(
+      "RESULT SYNC : lancement initial..."
+    );
 
-    /*
-     * ODDS WATCHER
-     *
-     * Premier contrôle léger des cotes
-     * cinq minutes après le démarrage.
-     */
-    setTimeout(() => {
-      runHourlyOddsWatcher();
-    }, 5 * 60 * 1000);
+    try {
+      await runAutomaticResultSync();
+    } catch (error) {
+      console.error(
+        "RESULT SYNC :",
+        error.message
+      );
+    }
+  }, 2 * 60 * 1000);
 
-    /*
-     * ODDS WATCHER
-     *
-     * Actualisation légère des cotes
-     * toutes les heures.
-     */
-    setInterval(() => {
-      runHourlyOddsWatcher();
-    }, 60 * 60 * 1000);
-  }
-);
+  /*
+   * ANALYSES AUTOMATIQUES
+   *
+   * Régénère les analyses
+   * toutes les 15 minutes.
+   */
+  setInterval(async () => {
+    console.log(
+      "AUTO ANALYSIS : nouveau cycle..."
+    );
+
+    try {
+      await runAutomaticDailyAnalysis();
+    } catch (error) {
+      console.error(
+        "AUTO ANALYSIS :",
+        error.message
+      );
+    }
+  }, 15 * 60 * 1000);
+
+  /*
+   * SYNCHRONISATION DES RÉSULTATS
+   *
+   * Vérifie les matchs terminés
+   * et met à jour :
+   *
+   * - home_goals
+   * - away_goals
+   * - won
+   * - profit
+   * - result_status
+   *
+   * toutes les 10 minutes.
+   */
+  setInterval(async () => {
+    console.log(
+      "RESULT SYNC : nouveau cycle..."
+    );
+
+    try {
+      await runAutomaticResultSync();
+    } catch (error) {
+      console.error(
+        "RESULT SYNC :",
+        error.message
+      );
+    }
+  }, 10 * 60 * 1000);
+
+  console.log(
+    "✅ Automatic Analysis Scheduler : ACTIF (15 min)"
+  );
+
+  console.log(
+    "✅ Result Synchronizer : ACTIF (10 min)"
+  );
+});
