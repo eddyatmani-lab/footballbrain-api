@@ -1042,10 +1042,36 @@ officialXgSource,
 },
 
       fatigue: {
-        impact:
-          phaseTwoContext?.fatigueImpact ?? 0,
-      },
+  available:
+    phaseTwoContext?.fatigue
+      ?.homeRestDays != null ||
+    phaseTwoContext?.fatigue
+      ?.awayRestDays != null,
 
+  homeRestDays:
+    phaseTwoContext?.fatigue
+      ?.homeRestDays ??
+    null,
+
+  awayRestDays:
+    phaseTwoContext?.fatigue
+      ?.awayRestDays ??
+    null,
+
+  homePenalty:
+    phaseTwoContext?.fatigue
+      ?.homePenalty ??
+    0,
+
+  awayPenalty:
+    phaseTwoContext?.fatigue
+      ?.awayPenalty ??
+    0,
+
+  impact:
+    phaseTwoContext?.fatigueImpact ??
+    0,
+},
       motivation: {
         impact:
           phaseTwoContext?.motivationImpact ?? 0,
