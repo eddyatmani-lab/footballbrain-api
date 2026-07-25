@@ -3596,63 +3596,71 @@ async function synchronizeFinishedPredictionsByDate() {
     matchedPredictions: 0,
     completed: 0,
     stillPending: 0,
+    fixtureNotFound: 0,
+    notFinished: 0,
     errors: 0,
     items: [],
   };
 
   /*
-   * Un appel API par date.
-   * Deux dates = environ deux appels.
+   * 1. Récupération groupée des fixtures
+   *
+   * Un seul appel API-Football par date.
    */
-  const fixtures = [];
+  const fixtureMap = new Map();
 
   for (const date of dates) {
     try {
-      const dateFixtures =
+      const fixtures =
         await fetchFixturesByDate(date);
 
       summary.apiCalls += 1;
       summary.fixturesReceived +=
-        dateFixtures.length;
+        fixtures.length;
 
-      fixtures.push(...dateFixtures);
+      for (const fixture of fixtures) {
+        const fixtureId = Number(
+          fixture?.fixture?.id
+        );
+
+        if (
+          !Number.isInteger(fixtureId) ||
+          fixtureId <= 0
+        ) {
+          continue;
+        }
+
+        fixtureMap.set(
+          fixtureId,
+          fixture
+        );
+      }
     } catch (error) {
+      summary.apiCalls += 1;
       summary.errors += 1;
 
       summary.items.push({
         date,
+        type: "API_DATE_ERROR",
         updated: false,
         error:
           error?.message ||
           "Erreur API-Football",
       });
-    }
-  }
 
-  /*
-   * Indexation locale des fixtures.
-   */
-  const fixtureMap = new Map();
-
-  for (const fixture of fixtures) {
-    const fixtureId =
-      Number(fixture.fixture?.id);
-
-    if (
-      Number.isInteger(fixtureId) &&
-      fixtureId > 0
-    ) {
-      fixtureMap.set(
-        fixtureId,
-        fixture
+      console.error(
+        `RESULT SYNC : erreur pour la date ${date}`,
+        error?.message || error
       );
     }
   }
 
   /*
-   * On ne récupère que les prédictions
-   * susceptibles d’appartenir aux dates
-   * demandées.
+   * 2. Sélection des prédictions anciennes
+   * d’au moins 105 minutes.
+   *
+   * Fenêtre temporaire de 7 jours pour
+   * rattraper les anciens matchs bloqués.
    */
   const pendingResult =
     await pool.query(
@@ -3665,68 +3673,117 @@ async function synchronizeFinishedPredictionsByDate() {
             OR result_status IS NULL
           )
           AND fixture_date >=
-  NOW() - INTERVAL '7 days'
+            NOW() - INTERVAL '7 days'
           AND fixture_date <=
-  NOW() - INTERVAL '105 minutes'
-        ORDER BY fixture_date DESC
+            NOW() - INTERVAL '105 minutes'
+        ORDER BY
+          fixture_date DESC,
+          created_at DESC
       `
     );
 
-  summary.pendingPredictions =
-    pendingResult.rows.length;
+  const pendingPredictions =
+    pendingResult.rows;
 
+  summary.pendingPredictions =
+    pendingPredictions.length;
+
+  /*
+   * 3. Comparaison locale entre PostgreSQL
+   * et les fixtures récupérées.
+   */
   for (
     const prediction
-    of pendingResult.rows
+    of pendingPredictions
   ) {
-    const fixtureId =
-      Number(prediction.fixture_id);
+    const fixtureId = Number(
+      prediction.fixture_id
+    );
+
+    if (
+      !Number.isInteger(fixtureId) ||
+      fixtureId <= 0
+    ) {
+      summary.errors += 1;
+
+      summary.items.push({
+        fixtureId:
+          prediction.fixture_id,
+        type: "INVALID_FIXTURE_ID",
+        updated: false,
+        error: "fixture_id invalide",
+      });
+
+      continue;
+    }
 
     const fixture =
       fixtureMap.get(fixtureId);
 
     /*
-     * La prédiction existe en base,
-     * mais la fixture n’était pas dans
-     * les réponses des deux dates.
+     * IMPORTANT :
+     * on vérifie l’existence de fixture
+     * avant de déclarer et d’utiliser status.
      */
-   if (
-  !FINISHED_FIXTURE_STATUSES.has(
-    status
-  )
-) {
-  summary.stillPending += 1;
+    if (!fixture) {
+      summary.stillPending += 1;
+      summary.fixtureNotFound += 1;
 
-  summary.items.push({
-    fixtureId,
-    fixtureDate:
-      prediction.fixture_date,
-    home:
-      prediction.home_team_name,
-    away:
-      prediction.away_team_name,
-    status,
-    reason:
-      "MATCH_NOT_FINISHED",
-    updated: false,
-  });
+      summary.items.push({
+        fixtureId,
+        fixtureDate:
+          prediction.fixture_date,
+        home:
+          prediction.home_team_name,
+        away:
+          prediction.away_team_name,
+        type:
+          "FIXTURE_NOT_FOUND_IN_DATE_BATCH",
+        updated: false,
+      });
 
-  continue;
-}
+      continue;
+    }
+
     summary.matchedPredictions += 1;
 
-    const status =
-      fixture.fixture?.status?.short;
+    const status = String(
+      fixture?.fixture?.status?.short ||
+        ""
+    ).toUpperCase();
 
+    /*
+     * Le match existe, mais API-Football
+     * ne le considère pas encore terminé.
+     */
     if (
       !FINISHED_FIXTURE_STATUSES.has(
         status
       )
     ) {
       summary.stillPending += 1;
+      summary.notFinished += 1;
+
+      summary.items.push({
+        fixtureId,
+        fixtureDate:
+          prediction.fixture_date,
+        home:
+          prediction.home_team_name,
+        away:
+          prediction.away_team_name,
+        status:
+          status || "UNKNOWN",
+        type: "MATCH_NOT_FINISHED",
+        updated: false,
+      });
+
       continue;
     }
 
+    /*
+     * 4. Règlement de la prédiction.
+     */
     try {
       const settlement =
         settlePrediction(
@@ -3750,7 +3807,13 @@ async function synchronizeFinishedPredictionsByDate() {
                 result_status = 'PENDING'
                 OR result_status IS NULL
               )
-            RETURNING fixture_id
+            RETURNING
+              fixture_id,
+              result_status,
+              home_goals,
+              away_goals,
+              won,
+              profit
           `,
           [
             settlement.homeGoals,
@@ -3761,6 +3824,10 @@ async function synchronizeFinishedPredictionsByDate() {
           ]
         );
 
+      /*
+       * Une autre synchronisation a peut-être
+       * déjà terminé le match entre-temps.
+       */
       if (
         updateResult.rows.length === 0
       ) {
@@ -3771,22 +3838,37 @@ async function synchronizeFinishedPredictionsByDate() {
 
       summary.items.push({
         fixtureId,
+        fixtureDate:
+          prediction.fixture_date,
+        home:
+          prediction.home_team_name,
+        away:
+          prediction.away_team_name,
         status,
-        score:
-          `${settlement.homeGoals}-${settlement.awayGoals}`,
+        score: {
+          home:
+            settlement.homeGoals,
+          away:
+            settlement.awayGoals,
+        },
         selectedOutcome:
           prediction.selected_outcome,
         actualOutcome:
           settlement.actualOutcome,
-        won: settlement.won,
-        profit: settlement.profit,
+        betStatus:
+          prediction.bet_status,
+        won:
+          settlement.won,
+        profit:
+          settlement.profit,
+        type: "COMPLETED",
         updated: true,
       });
 
       /*
-       * L’ELO est utile, mais une erreur
-       * ELO ne doit pas annuler la mise
-       * à jour du résultat.
+       * La mise à jour ELO est secondaire.
+       * Son éventuelle erreur ne doit jamais
+       * remettre le match en PENDING.
        */
       try {
         await updateEloFromFinishedFixture(
@@ -3794,8 +3876,9 @@ async function synchronizeFinishedPredictionsByDate() {
         );
       } catch (eloError) {
         console.warn(
-          `ELO non mis à jour pour ${fixtureId} :`,
-          eloError?.message
+          `RESULT SYNC : ELO non mis à jour pour ${fixtureId}`,
+          eloError?.message ||
+            eloError
         );
       }
     } catch (error) {
@@ -3803,11 +3886,24 @@ async function synchronizeFinishedPredictionsByDate() {
 
       summary.items.push({
         fixtureId,
+        fixtureDate:
+          prediction.fixture_date,
+        home:
+          prediction.home_team_name,
+        away:
+          prediction.away_team_name,
+        status,
+        type: "SETTLEMENT_ERROR",
         updated: false,
         error:
           error?.message ||
           "Erreur de règlement",
       });
+
+      console.error(
+        `RESULT SYNC : erreur fixture ${fixtureId}`,
+        error?.message || error
+      );
     }
   }
 
