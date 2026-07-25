@@ -3543,16 +3543,29 @@ function formatDateForApi(date) {
 
 function getResultSyncDates() {
   const now = new Date();
+  const dates = [];
 
-  const yesterday = new Date(
-    now.getTime() -
-      24 * 60 * 60 * 1000
-  );
+  /*
+   * Aujourd’hui + les 6 jours précédents.
+   * Cela permet de rattraper les anciennes
+   * prédictions restées bloquées.
+   */
+  for (let offset = 6; offset >= 0; offset -= 1) {
+    const date = new Date(
+      now.getTime() -
+        offset *
+          24 *
+          60 *
+          60 *
+          1000
+    );
 
-  return [
-    formatDateForApi(yesterday),
-    formatDateForApi(now),
-  ];
+    dates.push(
+      formatDateForApi(date)
+    );
+  }
+
+  return dates;
 }
 
 async function fetchFixturesByDate(date) {
@@ -3652,8 +3665,9 @@ async function synchronizeFinishedPredictionsByDate() {
             OR result_status IS NULL
           )
           AND fixture_date >=
-            NOW() - INTERVAL '48 hours'
-          AND fixture_date <= NOW()
+  NOW() - INTERVAL '7 days'
+          AND fixture_date <=
+  NOW() - INTERVAL '105 minutes'
         ORDER BY fixture_date DESC
       `
     );
@@ -3676,11 +3690,29 @@ async function synchronizeFinishedPredictionsByDate() {
      * mais la fixture n’était pas dans
      * les réponses des deux dates.
      */
-    if (!fixture) {
-      summary.stillPending += 1;
-      continue;
-    }
+   if (
+  !FINISHED_FIXTURE_STATUSES.has(
+    status
+  )
+) {
+  summary.stillPending += 1;
 
+  summary.items.push({
+    fixtureId,
+    fixtureDate:
+      prediction.fixture_date,
+    home:
+      prediction.home_team_name,
+    away:
+      prediction.away_team_name,
+    status,
+    reason:
+      "MATCH_NOT_FINISHED",
+    updated: false,
+  });
+
+  continue;
+}
     summary.matchedPredictions += 1;
 
     const status =
