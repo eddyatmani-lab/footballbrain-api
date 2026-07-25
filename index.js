@@ -3526,103 +3526,184 @@ function settlePrediction(prediction, fixture) {
     profit,
   };
 }
-async function updatePendingPredictions(
-  limit = 40
-) {
- const pendingResult = await pool.query(
-  `
-    SELECT *
-    FROM predictions
-    WHERE
-      (
-        result_status = 'PENDING'
-        OR result_status IS NULL
-      )
+    const FINISHED_FIXTURE_STATUSES =
+  new Set(["FT", "AET", "PEN"]);
 
-      /*
-       * On attend au moins 90 minutes après
-       * le coup d’envoi avant de demander
-       * si le match est terminé.
-       */
-      AND fixture_date <=
-        NOW() - INTERVAL '90 minutes'
+function formatDateForApi(date) {
+  return new Intl.DateTimeFormat(
+    "en-CA",
+    {
+      timeZone: "Europe/Paris",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }
+  ).format(date);
+}
 
-      /*
-       * On ne contrôle pas indéfiniment
-       * de très vieux matchs.
-       */
-      AND fixture_date >=
-        NOW() - INTERVAL '36 hours'
+function getResultSyncDates() {
+  const now = new Date();
 
-    /*
-     * Priorité aux matchs les plus récents,
-     * notamment ceux terminés ce soir.
-     */
-    ORDER BY fixture_date DESC
+  const yesterday = new Date(
+    now.getTime() -
+      24 * 60 * 60 * 1000
+  );
 
-    LIMIT $1
-  `,
-  [limit]
-);
+  return [
+    formatDateForApi(yesterday),
+    formatDateForApi(now),
+  ];
+}
+
+async function fetchFixturesByDate(date) {
+  const response =
+    await callApiFootball(
+      "/fixtures",
+      {
+        date,
+        timezone: "Europe/Paris",
+      }
+    );
+
+  return Array.isArray(
+    response.data?.response
+  )
+    ? response.data.response
+    : [];
+}
+
+async function synchronizeFinishedPredictionsByDate() {
+  const dates = getResultSyncDates();
+
   const summary = {
-    checked: 0,
+    dates,
+    apiCalls: 0,
+    fixturesReceived: 0,
+    pendingPredictions: 0,
+    matchedPredictions: 0,
     completed: 0,
     stillPending: 0,
     errors: 0,
     items: [],
   };
 
-  for (const prediction of pendingResult.rows) {
-    summary.checked += 1;
+  /*
+   * Un appel API par date.
+   * Deux dates = environ deux appels.
+   */
+  const fixtures = [];
 
+  for (const date of dates) {
     try {
-      const response = await callApiFootball(
-        "/fixtures",
-        {
-          id: prediction.fixture_id,
-          timezone: "Europe/Paris",
-        }
-      );
+      const dateFixtures =
+        await fetchFixturesByDate(date);
 
-      const fixture =
-        response.data?.response?.[0];
+      summary.apiCalls += 1;
+      summary.fixturesReceived +=
+        dateFixtures.length;
 
-      if (!fixture) {
-        throw new Error("Match introuvable");
-      }
+      fixtures.push(...dateFixtures);
+    } catch (error) {
+      summary.errors += 1;
 
-      const status =
-        fixture.fixture?.status?.short;
+      summary.items.push({
+        date,
+        updated: false,
+        error:
+          error?.message ||
+          "Erreur API-Football",
+      });
+    }
+  }
 
-      const finishedStatuses = [
-        "FT",
-        "AET",
-        "PEN",
-      ];
+  /*
+   * Indexation locale des fixtures.
+   */
+  const fixtureMap = new Map();
 
-      if (!finishedStatuses.includes(status)) {
-        summary.stillPending += 1;
+  for (const fixture of fixtures) {
+    const fixtureId =
+      Number(fixture.fixture?.id);
 
-        summary.items.push({
-          fixtureId: prediction.fixture_id,
-          status,
-          updated: false,
-        });
-
-        continue;
-      }
-
-      const settlement = settlePrediction(
-        prediction,
+    if (
+      Number.isInteger(fixtureId) &&
+      fixtureId > 0
+    ) {
+      fixtureMap.set(
+        fixtureId,
         fixture
       );
+    }
+  }
 
-      const client = await pool.connect();
+  /*
+   * On ne récupère que les prédictions
+   * susceptibles d’appartenir aux dates
+   * demandées.
+   */
+  const pendingResult =
+    await pool.query(
+      `
+        SELECT *
+        FROM predictions
+        WHERE
+          (
+            result_status = 'PENDING'
+            OR result_status IS NULL
+          )
+          AND fixture_date >=
+            NOW() - INTERVAL '48 hours'
+          AND fixture_date <= NOW()
+        ORDER BY fixture_date DESC
+      `
+    );
 
-      try {
-        await client.query("BEGIN");
+  summary.pendingPredictions =
+    pendingResult.rows.length;
 
-        await client.query(
+  for (
+    const prediction
+    of pendingResult.rows
+  ) {
+    const fixtureId =
+      Number(prediction.fixture_id);
+
+    const fixture =
+      fixtureMap.get(fixtureId);
+
+    /*
+     * La prédiction existe en base,
+     * mais la fixture n’était pas dans
+     * les réponses des deux dates.
+     */
+    if (!fixture) {
+      summary.stillPending += 1;
+      continue;
+    }
+
+    summary.matchedPredictions += 1;
+
+    const status =
+      fixture.fixture?.status?.short;
+
+    if (
+      !FINISHED_FIXTURE_STATUSES.has(
+        status
+      )
+    ) {
+      summary.stillPending += 1;
+      continue;
+    }
+
+    try {
+      const settlement =
+        settlePrediction(
+          prediction,
+          fixture
+        );
+
+      const updateResult =
+        await pool.query(
           `
             UPDATE predictions
             SET
@@ -3633,171 +3714,112 @@ async function updatePendingPredictions(
               profit = $4,
               updated_at = NOW()
             WHERE fixture_id = $5
-  AND (
-    result_status = 'PENDING'
-    OR result_status IS NULL
-  )
+              AND (
+                result_status = 'PENDING'
+                OR result_status IS NULL
+              )
+            RETURNING fixture_id
           `,
           [
             settlement.homeGoals,
             settlement.awayGoals,
             settlement.won,
             settlement.profit,
-            prediction.fixture_id,
+            fixtureId,
           ]
         );
 
-        await client.query("COMMIT");
-      } catch (error) {
-        await client.query("ROLLBACK");
-        throw error;
-      } finally {
-        client.release();
+      if (
+        updateResult.rows.length === 0
+      ) {
+        continue;
       }
-
-      // Cette fonction possède déjà une protection
-      // contre le double traitement d'un même match.
-      const elo =
-        await updateEloFromFinishedFixture(
-          fixture
-        );
 
       summary.completed += 1;
 
       summary.items.push({
-        fixtureId: prediction.fixture_id,
+        fixtureId,
         status,
-        score: {
-          home: settlement.homeGoals,
-          away: settlement.awayGoals,
-        },
+        score:
+          `${settlement.homeGoals}-${settlement.awayGoals}`,
         selectedOutcome:
           prediction.selected_outcome,
         actualOutcome:
           settlement.actualOutcome,
-        betStatus:
-          prediction.bet_status,
         won: settlement.won,
         profit: settlement.profit,
-        eloProcessed:
-          !elo.alreadyProcessed,
         updated: true,
       });
+
+      /*
+       * L’ELO est utile, mais une erreur
+       * ELO ne doit pas annuler la mise
+       * à jour du résultat.
+       */
+      try {
+        await updateEloFromFinishedFixture(
+          fixture
+        );
+      } catch (eloError) {
+        console.warn(
+          `ELO non mis à jour pour ${fixtureId} :`,
+          eloError?.message
+        );
+      }
     } catch (error) {
       summary.errors += 1;
 
       summary.items.push({
-        fixtureId: prediction.fixture_id,
+        fixtureId,
         updated: false,
-        error: error.message,
+        error:
+          error?.message ||
+          "Erreur de règlement",
       });
     }
   }
 
   return summary;
 }
-    /*
- * SYNCHRONISATION AUTOMATIQUE
- * DES RÉSULTATS
- *
- * Empêche deux cycles de se lancer
- * simultanément.
- */
-let automaticResultSyncRunning =
-  false;
 
-async function runAutomaticResultSync() {
-  if (automaticResultSyncRunning) {
-    console.log(
-      "RESULT SYNC : cycle déjà en cours"
-    );
-
-    return {
-      skipped: true,
-      reason: "ALREADY_RUNNING",
-    };
-  }
-
-  automaticResultSyncRunning = true;
-
-  try {
-    const summary =
-      await updatePendingPredictions(
-        40
-      );
-
-    console.log(
-      "RESULT SYNC :",
-      {
-        checked:
-          summary.checked,
-
-        completed:
-          summary.completed,
-
-        stillPending:
-          summary.stillPending,
-
-        errors:
-          summary.errors,
-      }
-    );
-
-    return summary;
-  } catch (error) {
-    console.error(
-      "RESULT SYNC : erreur",
-      error
-    );
-
-    return {
-      checked: 0,
-      completed: 0,
-      stillPending: 0,
-      errors: 1,
-      error:
-        error?.message ||
-        "Erreur inconnue",
-    };
-  } finally {
-    automaticResultSyncRunning =
-      false;
-  }
-}
 app.get(
   "/internal/cron/update-results",
   async (req, res) => {
-    const secret = req.query.secret;
+    const secret =
+      req.query.secret;
 
-if (
-  !process.env.INTERNAL_CRON_SECRET ||
-  secret !== process.env.INTERNAL_CRON_SECRET
-) {
-  return res.status(401).json({
-    ok: false,
-    error: "Accès refusé",
-  });
-}
-try {
-      const limit = Math.min(
-        50,
-        Math.max(
-          1,
-          Number(req.query.limit) || 20
-        )
-      );
+    if (
+      !process.env
+        .INTERNAL_CRON_SECRET ||
+      secret !==
+        process.env
+          .INTERNAL_CRON_SECRET
+    ) {
+      return res.status(401).json({
+        ok: false,
+        error: "Accès refusé",
+      });
+    }
 
+    try {
       const summary =
-        await updatePendingPredictions(limit);
+        await synchronizeFinishedPredictionsByDate();
 
       return res.json({
         ok: true,
         summary,
       });
     } catch (error) {
+      console.error(
+        "ERREUR RESULT SYNC :",
+        error
+      );
+
       return res.status(500).json({
         ok: false,
-        error: error.message,
+        error:
+          error?.message ||
+          "Erreur inconnue",
       });
     }
   }
@@ -10608,6 +10630,70 @@ app.get(
     }
   }
 );
+let automaticResultSyncRunning =
+  false;
+
+async function runAutomaticResultSync() {
+  if (automaticResultSyncRunning) {
+    console.log(
+      "RESULT SYNC : cycle déjà actif"
+    );
+
+    return {
+      skipped: true,
+      reason: "ALREADY_RUNNING",
+    };
+  }
+
+  automaticResultSyncRunning = true;
+
+  try {
+    const summary =
+      await synchronizeFinishedPredictionsByDate();
+
+    console.log(
+      "RESULT SYNC TERMINÉ :",
+      {
+        apiCalls:
+          summary.apiCalls,
+
+        fixturesReceived:
+          summary.fixturesReceived,
+
+        pendingPredictions:
+          summary.pendingPredictions,
+
+        completed:
+          summary.completed,
+
+        stillPending:
+          summary.stillPending,
+
+        errors:
+          summary.errors,
+      }
+    );
+
+    return summary;
+  } catch (error) {
+    console.error(
+      "RESULT SYNC ERREUR :",
+      error
+    );
+
+    return {
+      apiCalls: 0,
+      completed: 0,
+      errors: 1,
+      error:
+        error?.message ||
+        "Erreur inconnue",
+    };
+  } finally {
+    automaticResultSyncRunning =
+      false;
+  }
+}
 app.listen(
   PORT,
   "0.0.0.0",
@@ -10616,16 +10702,46 @@ app.listen(
       `FootballBrain API running on 0.0.0.0:${PORT}`
     );
 
+    /*
+     * Premier rafraîchissement des
+     * résultats deux minutes après
+     * le démarrage.
+     *
+     * Environ deux appels API.
+     */
+    setTimeout(() => {
+      runAutomaticResultSync();
+    }, 2 * 60 * 1000);
+
+    /*
+     * Résultats toutes les 15 minutes.
+     *
+     * Hier + aujourd’hui :
+     * environ deux appels API par cycle.
+     *
+     * 96 cycles par jour × 2 appels
+     * ≈ 192 appels par jour.
+     */
+    setInterval(() => {
+      runAutomaticResultSync();
+    }, 15 * 60 * 1000);
+
+    /*
+     * IMPORTANT :
+     * aucune analyse complète automatique
+     * toutes les 15 minutes.
+     *
+     * Les analyses quotidiennes seront
+     * remises ensuite avec un seul cycle
+     * contrôlé et des compétitions filtrées.
+     */
+
     console.log(
-      "🛡️ Mode protection API actif"
+      "✅ Synchronisation groupée : 15 min"
     );
 
     console.log(
-      "⏸️ Analyses automatiques temporairement suspendues"
-    );
-
-    console.log(
-      "⏸️ Synchronisation individuelle temporairement suspendue"
+      "⏸️ Analyse générale répétée : désactivée"
     );
   }
 );
