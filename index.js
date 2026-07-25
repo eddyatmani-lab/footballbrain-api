@@ -10677,7 +10677,15 @@ app.get(
 
               confidence,
               risk,
-
+studio_market_key,
+studio_market_label,
+studio_probability,
+studio_decision_score,
+studio_decision_type,
+studio_decision_grade,
+studio_analysis_version,
+studio_snapshot,
+studio_saved_at,
               home_probability,
               draw_probability,
               away_probability,
@@ -10822,6 +10830,355 @@ async function runAutomaticResultSync() {
       false;
   }
 }
+          async function ensureStudioPredictionColumns() {
+  await pool.query(`
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_market_key TEXT;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_market_label TEXT;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_probability NUMERIC(6,2);
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_decision_score NUMERIC(6,2);
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_decision_type TEXT;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_decision_grade TEXT;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_analysis_version TEXT;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_snapshot JSONB;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_saved_at TIMESTAMPTZ;
+  `);
+
+  console.log(
+    "✅ Colonnes Brain Studio vérifiées"
+  );
+}
+          function clampStudioNumber(
+  value,
+  min = 0,
+  max = 100
+) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return null;
+  }
+
+  return Math.max(
+    min,
+    Math.min(max, number)
+  );
+}
+
+function normalizeStudioMarketKey(
+  value
+) {
+  const normalized = String(
+    value || ""
+  )
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_")
+    .replace(/\./g, "");
+
+  const aliases = {
+    HOME: "HOME",
+    HOME_WIN: "HOME",
+    "1": "HOME",
+
+    DRAW: "DRAW",
+    X: "DRAW",
+
+    AWAY: "AWAY",
+    AWAY_WIN: "AWAY",
+    "2": "AWAY",
+
+    OVER25: "OVER25",
+    OVER_25: "OVER25",
+    OVER_2_5: "OVER25",
+
+    UNDER25: "UNDER25",
+    UNDER_25: "UNDER25",
+    UNDER_2_5: "UNDER25",
+
+    BTTS: "BTTS",
+    BTTS_YES: "BTTS",
+
+    NO_BTTS: "NO_BTTS",
+    BTTS_NO: "NO_BTTS",
+  };
+
+  return aliases[normalized] ||
+    normalized ||
+    null;
+}
+
+function normalizeStudioDecisionType(
+  value
+) {
+  const normalized = String(
+    value || "NO_BET"
+  ).toUpperCase();
+
+  if (
+    normalized === "BET" ||
+    normalized === "VALUE_BET"
+  ) {
+    return normalized;
+  }
+
+  return "NO_BET";
+}
+async function saveStudioSnapshot({
+  fixtureId,
+  marketKey,
+  marketLabel,
+  probability,
+  decisionScore,
+  decisionType,
+  decisionGrade,
+  analysisVersion,
+  snapshot,
+}) {
+  const normalizedFixtureId =
+    Number(fixtureId);
+
+  if (
+    !Number.isInteger(
+      normalizedFixtureId
+    ) ||
+    normalizedFixtureId <= 0
+  ) {
+    throw new Error(
+      "fixtureId invalide"
+    );
+  }
+
+  const normalizedMarketKey =
+    normalizeStudioMarketKey(
+      marketKey
+    );
+
+  if (!normalizedMarketKey) {
+    throw new Error(
+      "Marché Brain Studio invalide"
+    );
+  }
+
+  const normalizedProbability =
+    clampStudioNumber(
+      probability
+    );
+
+  const normalizedDecisionScore =
+    clampStudioNumber(
+      decisionScore
+    );
+
+  const normalizedDecisionType =
+    normalizeStudioDecisionType(
+      decisionType
+    );
+
+  const result = await pool.query(
+    `
+      UPDATE predictions
+      SET
+        studio_market_key = $1,
+        studio_market_label = $2,
+        studio_probability = $3,
+        studio_decision_score = $4,
+        studio_decision_type = $5,
+        studio_decision_grade = $6,
+        studio_analysis_version = $7,
+        studio_snapshot = $8::jsonb,
+        studio_saved_at = NOW(),
+        updated_at = NOW()
+      WHERE fixture_id = $9
+      RETURNING
+        fixture_id,
+        studio_market_key,
+        studio_market_label,
+        studio_probability,
+        studio_decision_score,
+        studio_decision_type,
+        studio_decision_grade,
+        studio_analysis_version,
+        studio_saved_at
+    `,
+    [
+      normalizedMarketKey,
+
+      String(
+        marketLabel ||
+          normalizedMarketKey
+      ),
+
+      normalizedProbability,
+
+      normalizedDecisionScore,
+
+      normalizedDecisionType,
+
+      decisionGrade
+        ? String(
+            decisionGrade
+          ).toUpperCase()
+        : null,
+
+      String(
+        analysisVersion ||
+          "brain-studio-v1"
+      ),
+
+      JSON.stringify(
+        snapshot || {}
+      ),
+
+      normalizedFixtureId,
+    ]
+  );
+
+  if (
+    result.rows.length === 0
+  ) {
+    throw new Error(
+      "Prédiction Railway introuvable"
+    );
+  }
+
+  return result.rows[0];
+}
+      app.post(
+  "/public/studio-snapshot/:fixtureId",
+  async (req, res) => {
+    try {
+      const fixtureId =
+        Number(
+          req.params.fixtureId
+        );
+
+      if (
+        !Number.isInteger(
+          fixtureId
+        ) ||
+        fixtureId <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "fixtureId invalide",
+          });
+      }
+
+      const body =
+        req.body || {};
+
+      const primaryMarket =
+        body.primaryMarket ||
+        body.bestDecision ||
+        null;
+
+      if (!primaryMarket) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "primaryMarket manquant",
+          });
+      }
+
+      const saved =
+        await saveStudioSnapshot({
+          fixtureId,
+
+          marketKey:
+            primaryMarket.key,
+
+          marketLabel:
+            primaryMarket.label,
+
+          probability:
+            primaryMarket
+              ?.fairOdds
+              ?.calibratedProbability ??
+            primaryMarket
+              ?.probability,
+
+          decisionScore:
+            primaryMarket
+              ?.decision
+              ?.score ??
+            primaryMarket
+              ?.score,
+
+          decisionType:
+            primaryMarket
+              ?.decision
+              ?.type,
+
+          decisionGrade:
+            primaryMarket
+              ?.decision
+              ?.grade,
+
+          analysisVersion:
+            body.analysisVersion ||
+            body.version ||
+            "brain-studio-v1",
+
+          snapshot: {
+            primaryMarket,
+            generatedAt:
+              new Date()
+                .toISOString(),
+          },
+        });
+
+      return res.json({
+        ok: true,
+        prediction: saved,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR STUDIO SNAPSHOT :",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "Erreur inconnue",
+        });
+    }
+  }
+);
 app.listen(
   PORT,
   "0.0.0.0",
@@ -10829,7 +11186,13 @@ app.listen(
     console.log(
       `FootballBrain API running on 0.0.0.0:${PORT}`
     );
-
+ensureStudioPredictionColumns()
+  .catch((error) => {
+    console.error(
+      "ERREUR COLONNES STUDIO :",
+      error
+    );
+  });
     /*
      * Premier rafraîchissement des
      * résultats deux minutes après
