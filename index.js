@@ -10608,109 +10608,24 @@ app.get(
     }
   }
 );
-app.listen(PORT, () => {
-  console.log(
-    `🚀 FootballBrain API démarrée sur le port ${PORT}`
-  );
-
-  /*
-   * ANALYSES AUTOMATIQUES
-   *
-   * Premier lancement une minute
-   * après le démarrage du serveur.
-   */
-  setTimeout(async () => {
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
     console.log(
-      "AUTO ANALYSIS : lancement initial..."
+      `FootballBrain API running on 0.0.0.0:${PORT}`
     );
 
-    try {
-      await runAutomaticDailyAnalysis();
-    } catch (error) {
-      console.error(
-        "AUTO ANALYSIS :",
-        error.message
-      );
-    }
-  }, 1 * 60 * 1000);
-
-  /*
-   * SYNCHRONISATION AUTOMATIQUE
-   * DES RÉSULTATS
-   *
-   * Premier contrôle deux minutes
-   * après le démarrage.
-   */
-  setTimeout(async () => {
     console.log(
-      "RESULT SYNC : lancement initial..."
+      "🛡️ Mode protection API actif"
     );
 
-    try {
-      await runAutomaticResultSync();
-    } catch (error) {
-      console.error(
-        "RESULT SYNC :",
-        error.message
-      );
-    }
-  }, 2 * 60 * 1000);
-
-  /*
-   * ANALYSES AUTOMATIQUES
-   *
-   * Régénère les analyses
-   * toutes les 15 minutes.
-   */
-  setInterval(async () => {
     console.log(
-      "AUTO ANALYSIS : nouveau cycle..."
+      "⏸️ Analyses automatiques temporairement suspendues"
     );
 
-    try {
-      await runAutomaticDailyAnalysis();
-    } catch (error) {
-      console.error(
-        "AUTO ANALYSIS :",
-        error.message
-      );
-    }
-  }, 15 * 60 * 1000);
-
-  /*
-   * SYNCHRONISATION DES RÉSULTATS
-   *
-   * Vérifie les matchs terminés
-   * et met à jour :
-   *
-   * - home_goals
-   * - away_goals
-   * - won
-   * - profit
-   * - result_status
-   *
-   * toutes les 10 minutes.
-   */
-  setInterval(async () => {
     console.log(
-      "RESULT SYNC : nouveau cycle..."
+      "⏸️ Synchronisation individuelle temporairement suspendue"
     );
-
-    try {
-      await runAutomaticResultSync();
-    } catch (error) {
-      console.error(
-        "RESULT SYNC :",
-        error.message
-      );
-    }
-  }, 10 * 60 * 1000);
-
-  console.log(
-    "✅ Automatic Analysis Scheduler : ACTIF (15 min)"
-  );
-
-  console.log(
-    "✅ Result Synchronizer : ACTIF (10 min)"
-  );
-});
+  }
+);
