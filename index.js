@@ -25,7 +25,11 @@ app.use(
 app.use(express.json());
 const analysisCache = new Map();
 const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
-
+const FINISHED_FIXTURE_STATUSES = new Set([
+  "FT",
+  "AET",
+  "PEN",
+]);
 const API_BASE_URL =
   "https://v3.football.api-sports.io";
 
