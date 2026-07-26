@@ -1,7 +1,6 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
-require("dotenv").config();
 
 const PORT =
   Number(process.env.PORT) || 3000;
@@ -4118,66 +4117,6 @@ app.get("/public/analysis/:fixtureId", async (req, res) => {
   }
 });
 
-app.get(
-  "/internal/cron/analyze-daily",
-  async (req, res) => {
-    const secret = req.query.secret;
-
-    if (
-      !process.env.INTERNAL_CRON_SECRET ||
-      secret !== process.env.INTERNAL_CRON_SECRET
-    ) {
-      return res.status(401).json({
-        ok: false,
-        error: "Accès refusé",
-      });
-    }
-
-    try {
-      const requestedDate =
-        req.query.date ||
-        new Date().toISOString().slice(0, 10);
-
-      const dateFormat = /^\d{4}-\d{2}-\d{2}$/;
-
-      if (!dateFormat.test(requestedDate)) {
-        return res.status(400).json({
-          ok: false,
-          error:
-            "La date doit être au format YYYY-MM-DD",
-        });
-      }
-
-      const fixturesResponse =
-        await callApiFootball("/fixtures", {
-          date: requestedDate,
-          timezone: "Europe/Paris",
-        });
-
-      const fixtures =
-        fixturesResponse.data?.response || [];
-
-      const limit = Math.min(
-        20,
-        Math.max(
-          1,
-          Number(req.query.limit) || 10
-        )
-      );
-const priorityLeagueIds = [
-  2,   // UEFA Champions League
-  3,   // UEFA Europa League
-  848, // UEFA Conference League
-  39,  // Premier League
-  140, // La Liga
-  135, // Serie A
-  78,  // Bundesliga
-  61,  // Ligue 1
-  94,  // Primeira Liga
-  88,  // Eredivisie
-  203, // Süper Lig
-  253, // MLS
-];
    
 function computeXgConfidence({
   homeRecentForm,
