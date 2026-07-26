@@ -7371,7 +7371,7 @@ const fixture =
   return summary;
 }
 app.get(
-  "/
+  "/internal/cron/update-results",
   async (req, res) => {
     const secret = req.query.secret;
 
