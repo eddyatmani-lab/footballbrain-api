@@ -9629,14 +9629,20 @@ app.get(
             fixtureId
           );
 
-          const analysis =
-            await processFixtureAnalysis(
-              fixtureId,
-              {
-                forceRefresh:
-                  true,
-              }
-            );
+          const baseUrl =
+  process.env.PUBLIC_API_URL ||
+  `http://127.0.0.1:${PORT}`;
+
+const response = await axios.get(
+  `${baseUrl}/internal/analyze/${fixtureId}?refresh=1`,
+  {
+    timeout: 120000,
+  }
+);
+
+const analysis =
+  response.data?.analysis ||
+  response.data;
 
           results.push({
             fixtureId,
