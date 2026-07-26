@@ -2698,9 +2698,12 @@ app.get("/internal/db-init", async (req, res) => {
     });
   }
 });
-async function savePredictionToDatabase(analysis) {
+async function savePredictionToDatabase(
+  analysis
+) {
   const decision =
-    analysis.footballBrainDecision || {};
+    analysis.footballBrainDecision ||
+    {};
 
   const probabilities =
     decision.probabilities || {};
@@ -2712,7 +2715,9 @@ async function savePredictionToDatabase(analysis) {
     analysis.xgConfidence || {};
 
   const decisionTrace =
-    Array.isArray(decision.decisionTrace)
+    Array.isArray(
+      decision.decisionTrace
+    )
       ? decision.decisionTrace
       : [];
 
@@ -2721,45 +2726,158 @@ async function savePredictionToDatabase(analysis) {
 
   const monteCarloModel =
     analysis.monteCarloModel || {};
-const analysisContext =
-  analysis.context || {};
+
+  const analysisContext =
+    analysis.context || {};
+
+  /*
+   * Snapshot Brain Studio.
+   *
+   * Plusieurs emplacements sont acceptés
+   * afin de rester compatible avec les
+   * différentes versions du moteur.
+   */
+  const studioSnapshot =
+    analysis.studioSnapshot ||
+    analysis.brainStudioSnapshot ||
+    analysis.studio_snapshot ||
+    analysis.studio ||
+    null;
+
+  const primaryMarket =
+    studioSnapshot?.primaryMarket ||
+    analysis.primaryMarket ||
+    decision.primaryMarket ||
+    {};
+
+  const studioDecision =
+    primaryMarket?.decision ||
+    studioSnapshot?.decision ||
+    {};
+
+  const studioMarketKey =
+    analysis.studioMarketKey ||
+    analysis.studio_market_key ||
+    primaryMarket.key ||
+    primaryMarket.marketKey ||
+    null;
+
+  const studioMarketLabel =
+    analysis.studioMarketLabel ||
+    analysis.studio_market_label ||
+    primaryMarket.label ||
+    primaryMarket.marketLabel ||
+    null;
+
+  const studioProbability =
+    analysis.studioProbability ??
+    analysis.studio_probability ??
+    primaryMarket.probability ??
+    primaryMarket?.fairOdds
+      ?.calibratedProbability ??
+    null;
+
+  const studioDecisionScore =
+    analysis.studioDecisionScore ??
+    analysis.studio_decision_score ??
+    studioDecision.score ??
+    primaryMarket.decisionScore ??
+    primaryMarket.score ??
+    null;
+
+  const studioDecisionType =
+    analysis.studioDecisionType ||
+    analysis.studio_decision_type ||
+    studioDecision.type ||
+    primaryMarket.decisionType ||
+    null;
+
+  const studioDecisionGrade =
+    analysis.studioDecisionGrade ||
+    analysis.studio_decision_grade ||
+    studioDecision.grade ||
+    primaryMarket.decisionGrade ||
+    null;
+
+  const studioAnalysisVersion =
+    analysis.studioAnalysisVersion ||
+    analysis.studio_analysis_version ||
+    studioSnapshot?.analysisVersion ||
+    studioSnapshot?.version ||
+    null;
+
+  const hasStudioData =
+    Boolean(
+      studioMarketKey ||
+      studioMarketLabel ||
+      studioDecisionType ||
+      studioSnapshot
+    );
+
+  const studioSavedAt =
+    hasStudioData
+      ? new Date().toISOString()
+      : null;
+
   const savedPrediction =
     await pool.query(
       `
         INSERT INTO predictions (
           fixture_id,
           fixture_date,
+
           league_id,
           league_name,
+
           home_team_id,
           home_team_name,
+
           away_team_id,
           away_team_name,
+
           decision,
           selected_outcome,
           bet_status,
+
           confidence,
           risk,
+
           home_probability,
           draw_probability,
           away_probability,
+
           fair_odd,
           market_odd,
           value_percentage,
+
           explanation,
+
+          studio_market_key,
+          studio_market_label,
+          studio_probability,
+          studio_decision_score,
+          studio_decision_type,
+          studio_decision_grade,
+          studio_analysis_version,
+          studio_snapshot,
+          studio_saved_at,
+
           official_xg_home,
           official_xg_away,
           xg_source,
           xg_confidence_score,
           xg_confidence_level,
+
           form_weight,
           market_weight,
           monte_carlo_weight,
+
           decision_trace,
-model_inputs,
-monte_carlo_model,
-analysis_context
+          model_inputs,
+          monte_carlo_model,
+          analysis_context
         )
+
         VALUES (
           $1, $2, $3, $4, $5,
           $6, $7, $8, $9, $10,
@@ -2767,8 +2885,9 @@ analysis_context
           $16, $17, $18, $19, $20,
           $21, $22, $23, $24, $25,
           $26, $27, $28, $29, $30,
-          $31, $32
-
+          $31, $32, $33, $34, $35,
+          $36, $37, $38, $39, $40,
+          $41
         )
 
         ON CONFLICT (fixture_id)
@@ -2830,6 +2949,65 @@ analysis_context
           explanation =
             EXCLUDED.explanation,
 
+          /*
+           * Une valeur vide ne doit jamais
+           * effacer un snapshot Brain Studio
+           * déjà enregistré.
+           */
+          studio_market_key =
+            COALESCE(
+              EXCLUDED.studio_market_key,
+              predictions.studio_market_key
+            ),
+
+          studio_market_label =
+            COALESCE(
+              EXCLUDED.studio_market_label,
+              predictions.studio_market_label
+            ),
+
+          studio_probability =
+            COALESCE(
+              EXCLUDED.studio_probability,
+              predictions.studio_probability
+            ),
+
+          studio_decision_score =
+            COALESCE(
+              EXCLUDED.studio_decision_score,
+              predictions.studio_decision_score
+            ),
+
+          studio_decision_type =
+            COALESCE(
+              EXCLUDED.studio_decision_type,
+              predictions.studio_decision_type
+            ),
+
+          studio_decision_grade =
+            COALESCE(
+              EXCLUDED.studio_decision_grade,
+              predictions.studio_decision_grade
+            ),
+
+          studio_analysis_version =
+            COALESCE(
+              EXCLUDED.studio_analysis_version,
+              predictions.studio_analysis_version
+            ),
+
+          studio_snapshot =
+            COALESCE(
+              EXCLUDED.studio_snapshot,
+              predictions.studio_snapshot
+            ),
+
+          studio_saved_at =
+            COALESCE(
+              EXCLUDED.studio_saved_at,
+              predictions.studio_saved_at
+            ),
+
           official_xg_home =
             EXCLUDED.official_xg_home,
 
@@ -2862,23 +3040,38 @@ analysis_context
 
           monte_carlo_model =
             EXCLUDED.monte_carlo_model,
-analysis_context =
-  EXCLUDED.analysis_context,
+
+          analysis_context =
+            EXCLUDED.analysis_context,
+
           updated_at = NOW()
 
         RETURNING
           fixture_id,
+
+          studio_market_key,
+          studio_market_label,
+          studio_probability,
+          studio_decision_score,
+          studio_decision_type,
+          studio_decision_grade,
+          studio_analysis_version,
+          studio_saved_at,
+
           official_xg_home,
           official_xg_away,
+
           monte_carlo_model,
-        analysis_context,
+          analysis_context,
           decision_trace,
+
           updated_at
       `,
       [
         analysis.fixtureId,
 
-        analysis.match?.date || null,
+        analysis.match?.date ||
+          null,
 
         analysis.match?.league?.id ||
           null,
@@ -2898,30 +3091,63 @@ analysis_context =
         analysis.match?.awayTeam?.name ||
           null,
 
-        decision.decision || null,
+        decision.decision ||
+          null,
 
         decision.selectedOutcome ||
           null,
 
-        decision.betStatus || null,
+        decision.betStatus ||
+          null,
 
-        decision.confidence ?? null,
+        decision.confidence ??
+          null,
 
-        decision.risk || null,
+        decision.risk ||
+          null,
 
-        probabilities.home ?? null,
+        probabilities.home ??
+          null,
 
-        probabilities.draw ?? null,
+        probabilities.draw ??
+          null,
 
-        probabilities.away ?? null,
+        probabilities.away ??
+          null,
 
-        decision.fairOdd ?? null,
+        decision.fairOdd ??
+          null,
 
-        decision.marketOdd ?? null,
+        decision.marketOdd ??
+          null,
 
-        decision.value ?? null,
+        decision.value ??
+          null,
 
-        decision.explanation || null,
+        decision.explanation ||
+          null,
+
+        studioMarketKey,
+
+        studioMarketLabel,
+
+        studioProbability,
+
+        studioDecisionScore,
+
+        studioDecisionType,
+
+        studioDecisionGrade,
+
+        studioAnalysisVersion,
+
+        studioSnapshot
+          ? JSON.stringify(
+              studioSnapshot
+            )
+          : null,
+
+        studioSavedAt,
 
         analysis.officialXgHome ??
           null,
@@ -2932,15 +3158,20 @@ analysis_context =
         analysis.officialXgSource ||
           null,
 
-        xgConfidence.score ?? null,
+        xgConfidence.score ??
+          null,
 
-        xgConfidence.level || null,
+        xgConfidence.level ||
+          null,
 
-        weights.form ?? null,
+        weights.form ??
+          null,
 
-        weights.market ?? null,
+        weights.market ??
+          null,
 
-        weights.monteCarlo ?? null,
+        weights.monteCarlo ??
+          null,
 
         JSON.stringify(
           decisionTrace
@@ -2953,15 +3184,15 @@ analysis_context =
         JSON.stringify(
           monteCarloModel
         ),
-          JSON.stringify(
-  analysisContext
-),
+
+        JSON.stringify(
+          analysisContext
+        ),
       ]
     );
 
   return savedPrediction.rows[0];
 }
-
 async function upsertTeam(
   team,
   country = null
@@ -7235,55 +7466,547 @@ app.get(
     }
   }
 );
-function settlePrediction(prediction, fixture) {
-  const homeGoals = fixture.goals?.home;
-  const awayGoals = fixture.goals?.away;
+function normalizeSettlementMarket(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[ÀÁÂÃÄÅ]/g, "A")
+    .replace(/[ÈÉÊË]/g, "E")
+    .replace(/[ÌÍÎÏ]/g, "I")
+    .replace(/[ÒÓÔÕÖ]/g, "O")
+    .replace(/[ÙÚÛÜ]/g, "U")
+    .replace(/Ç/g, "C")
+    .replace(/[\s./-]+/g, "_")
+    .replace(/__+/g, "_");
+}
+
+function resolveSettlementMarket(
+  prediction = {}
+) {
+  const rawMarket =
+    prediction.studio_market_key ||
+    prediction.selected_outcome ||
+    prediction.decision ||
+    "";
+
+  const normalized =
+    normalizeSettlementMarket(
+      rawMarket
+    );
+
+  const aliases = {
+    /*
+     * 1N2
+     */
+    "1": "HOME",
+    HOME: "HOME",
+    HOME_WIN: "HOME",
+    DOMICILE: "HOME",
+    VICTOIRE_DOMICILE: "HOME",
+
+    X: "DRAW",
+    N: "DRAW",
+    DRAW: "DRAW",
+    MATCH_NUL: "DRAW",
+
+    "2": "AWAY",
+    AWAY: "AWAY",
+    AWAY_WIN: "AWAY",
+    EXTERIEUR: "AWAY",
+    VICTOIRE_EXTERIEUR: "AWAY",
+
+    /*
+     * Over / Under
+     */
+    OVER15: "OVER15",
+    OVER_15: "OVER15",
+    OVER_1_5: "OVER15",
+    PLUS_DE_1_5_BUTS: "OVER15",
+
+    UNDER15: "UNDER15",
+    UNDER_15: "UNDER15",
+    UNDER_1_5: "UNDER15",
+    MOINS_DE_1_5_BUTS: "UNDER15",
+
+    OVER25: "OVER25",
+    OVER_25: "OVER25",
+    OVER_2_5: "OVER25",
+    PLUS_DE_2_5_BUTS: "OVER25",
+
+    UNDER25: "UNDER25",
+    UNDER_25: "UNDER25",
+    UNDER_2_5: "UNDER25",
+    MOINS_DE_2_5_BUTS: "UNDER25",
+
+    OVER35: "OVER35",
+    OVER_35: "OVER35",
+    OVER_3_5: "OVER35",
+    PLUS_DE_3_5_BUTS: "OVER35",
+
+    UNDER35: "UNDER35",
+    UNDER_35: "UNDER35",
+    UNDER_3_5: "UNDER35",
+    MOINS_DE_3_5_BUTS: "UNDER35",
+
+    OVER45: "OVER45",
+    OVER_45: "OVER45",
+    OVER_4_5: "OVER45",
+    PLUS_DE_4_5_BUTS: "OVER45",
+
+    UNDER45: "UNDER45",
+    UNDER_45: "UNDER45",
+    UNDER_4_5: "UNDER45",
+    MOINS_DE_4_5_BUTS: "UNDER45",
+
+    /*
+     * Les deux équipes marquent
+     */
+    BTTS: "BTTS_YES",
+    BTTS_YES: "BTTS_YES",
+    BOTH_TEAMS_TO_SCORE: "BTTS_YES",
+    OUI: "BTTS_YES",
+    LES_DEUX_EQUIPES_MARQUENT: "BTTS_YES",
+
+    BTTS_NO: "BTTS_NO",
+    NO_BTTS: "BTTS_NO",
+    NON: "BTTS_NO",
+    LES_DEUX_EQUIPES_NE_MARQUENT_PAS:
+      "BTTS_NO",
+
+    /*
+     * Double chance
+     */
+    "1X": "1X",
+    HOME_OR_DRAW: "1X",
+    DOMICILE_OU_NUL: "1X",
+
+    X2: "X2",
+    DRAW_OR_AWAY: "X2",
+    NUL_OU_EXTERIEUR: "X2",
+
+    "12": "12",
+    HOME_OR_AWAY: "12",
+    PAS_DE_NUL: "12",
+
+    /*
+     * Draw No Bet
+     */
+    HOME_DNB: "HOME_DNB",
+    DNB_HOME: "HOME_DNB",
+    DOMICILE_REMBOURSE_SI_NUL:
+      "HOME_DNB",
+
+    AWAY_DNB: "AWAY_DNB",
+    DNB_AWAY: "AWAY_DNB",
+    EXTERIEUR_REMBOURSE_SI_NUL:
+      "AWAY_DNB",
+  };
+
+  return aliases[normalized] ||
+    normalized;
+}
+
+function getActualMatchOutcome(
+  homeGoals,
+  awayGoals
+) {
+  if (homeGoals > awayGoals) {
+    return "HOME";
+  }
+
+  if (awayGoals > homeGoals) {
+    return "AWAY";
+  }
+
+  return "DRAW";
+}
+
+function getSettlementProfit({
+  outcome,
+  marketOdd,
+}) {
+  if (
+    outcome === "NO_BET" ||
+    outcome === "PUSH"
+  ) {
+    return 0;
+  }
+
+  if (outcome === "LOSS") {
+    return -1;
+  }
+
+  const odd =
+    Number(marketOdd);
+
+  if (
+    !Number.isFinite(odd) ||
+    odd <= 1
+  ) {
+    /*
+     * Le résultat sportif est gagné,
+     * mais le profit ne peut pas être
+     * calculé sans cote exploitable.
+     */
+    return 0;
+  }
+
+  return Number(
+    (odd - 1).toFixed(2)
+  );
+}
+function settlePrediction(
+  prediction,
+  fixture
+) {
+  const homeGoals =
+    Number(fixture.goals?.home);
+
+  const awayGoals =
+    Number(fixture.goals?.away);
 
   if (
     !Number.isFinite(homeGoals) ||
     !Number.isFinite(awayGoals)
   ) {
-    throw new Error("Score final indisponible");
+    throw new Error(
+      "Score final indisponible"
+    );
   }
 
-  let actualOutcome = "draw";
+  const totalGoals =
+    homeGoals + awayGoals;
 
-  if (homeGoals > awayGoals) {
-    actualOutcome = "home";
-  } else if (awayGoals > homeGoals) {
-    actualOutcome = "away";
-  }
+  const bothTeamsScored =
+    homeGoals > 0 &&
+    awayGoals > 0;
+
+  const actualOutcome =
+    getActualMatchOutcome(
+      homeGoals,
+      awayGoals
+    );
+
+  const market =
+    resolveSettlementMarket(
+      prediction
+    );
 
   const isNoBet =
-    prediction.bet_status === "NO_BET";
+    String(
+      prediction.bet_status || ""
+    ).toUpperCase() === "NO_BET";
 
   if (isNoBet) {
     return {
       homeGoals,
       awayGoals,
+      totalGoals,
+
+      market,
       actualOutcome,
+
+      outcome: "NO_BET",
       won: null,
       profit: 0,
+
+      explanation:
+        "Analyse classée NO_BET : aucun pari simulé.",
+
+      settledBy:
+        market || "NO_BET",
     };
   }
 
+  let outcome = null;
+  let explanation = "";
+
+  switch (market) {
+    /*
+     * 1N2
+     */
+    case "HOME":
+      outcome =
+        actualOutcome === "HOME"
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        actualOutcome === "HOME"
+          ? `Victoire à domicile confirmée (${homeGoals}-${awayGoals}).`
+          : `L'équipe à domicile n'a pas gagné (${homeGoals}-${awayGoals}).`;
+      break;
+
+    case "DRAW":
+      outcome =
+        actualOutcome === "DRAW"
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        actualOutcome === "DRAW"
+          ? `Match nul confirmé (${homeGoals}-${awayGoals}).`
+          : `Le match ne s'est pas terminé sur un nul (${homeGoals}-${awayGoals}).`;
+      break;
+
+    case "AWAY":
+      outcome =
+        actualOutcome === "AWAY"
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        actualOutcome === "AWAY"
+          ? `Victoire à l'extérieur confirmée (${homeGoals}-${awayGoals}).`
+          : `L'équipe à l'extérieur n'a pas gagné (${homeGoals}-${awayGoals}).`;
+      break;
+
+    /*
+     * Plus de buts
+     */
+    case "OVER15":
+      outcome =
+        totalGoals > 1.5
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        `${totalGoals} but(s) inscrit(s) : ` +
+        `${outcome === "WIN" ? "plus" : "pas plus"} de 1,5 but.`;
+      break;
+
+    case "OVER25":
+      outcome =
+        totalGoals > 2.5
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        `${totalGoals} but(s) inscrit(s) : ` +
+        `${outcome === "WIN" ? "plus" : "pas plus"} de 2,5 buts.`;
+      break;
+
+    case "OVER35":
+      outcome =
+        totalGoals > 3.5
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        `${totalGoals} but(s) inscrit(s) : ` +
+        `${outcome === "WIN" ? "plus" : "pas plus"} de 3,5 buts.`;
+      break;
+
+    case "OVER45":
+      outcome =
+        totalGoals > 4.5
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        `${totalGoals} but(s) inscrit(s) : ` +
+        `${outcome === "WIN" ? "plus" : "pas plus"} de 4,5 buts.`;
+      break;
+
+    /*
+     * Moins de buts
+     */
+    case "UNDER15":
+      outcome =
+        totalGoals < 1.5
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        `${totalGoals} but(s) inscrit(s) : ` +
+        `${outcome === "WIN" ? "moins" : "pas moins"} de 1,5 but.`;
+      break;
+
+    case "UNDER25":
+      outcome =
+        totalGoals < 2.5
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        `${totalGoals} but(s) inscrit(s) : ` +
+        `${outcome === "WIN" ? "moins" : "pas moins"} de 2,5 buts.`;
+      break;
+
+    case "UNDER35":
+      outcome =
+        totalGoals < 3.5
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        `${totalGoals} but(s) inscrit(s) : ` +
+        `${outcome === "WIN" ? "moins" : "pas moins"} de 3,5 buts.`;
+      break;
+
+    case "UNDER45":
+      outcome =
+        totalGoals < 4.5
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        `${totalGoals} but(s) inscrit(s) : ` +
+        `${outcome === "WIN" ? "moins" : "pas moins"} de 4,5 buts.`;
+      break;
+
+    /*
+     * BTTS
+     */
+    case "BTTS_YES":
+      outcome =
+        bothTeamsScored
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        bothTeamsScored
+          ? `Les deux équipes ont marqué (${homeGoals}-${awayGoals}).`
+          : `Au moins une équipe n'a pas marqué (${homeGoals}-${awayGoals}).`;
+      break;
+
+    case "BTTS_NO":
+      outcome =
+        !bothTeamsScored
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        !bothTeamsScored
+          ? `Au moins une équipe n'a pas marqué (${homeGoals}-${awayGoals}).`
+          : `Les deux équipes ont marqué (${homeGoals}-${awayGoals}).`;
+      break;
+
+    /*
+     * Double chance
+     */
+    case "1X":
+      outcome =
+        actualOutcome === "HOME" ||
+        actualOutcome === "DRAW"
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        outcome === "WIN"
+          ? `Domicile ou nul validé (${homeGoals}-${awayGoals}).`
+          : `Victoire extérieure : double chance 1X perdue (${homeGoals}-${awayGoals}).`;
+      break;
+
+    case "X2":
+      outcome =
+        actualOutcome === "DRAW" ||
+        actualOutcome === "AWAY"
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        outcome === "WIN"
+          ? `Nul ou extérieur validé (${homeGoals}-${awayGoals}).`
+          : `Victoire à domicile : double chance X2 perdue (${homeGoals}-${awayGoals}).`;
+      break;
+
+    case "12":
+      outcome =
+        actualOutcome !== "DRAW"
+          ? "WIN"
+          : "LOSS";
+
+      explanation =
+        outcome === "WIN"
+          ? `Le match possède un vainqueur (${homeGoals}-${awayGoals}).`
+          : `Le match s'est terminé sur un nul (${homeGoals}-${awayGoals}).`;
+      break;
+
+    /*
+     * Draw No Bet
+     */
+    case "HOME_DNB":
+      if (actualOutcome === "DRAW") {
+        outcome = "PUSH";
+        explanation =
+          `Match nul (${homeGoals}-${awayGoals}) : mise remboursée.`;
+      } else if (
+        actualOutcome === "HOME"
+      ) {
+        outcome = "WIN";
+        explanation =
+          `Victoire à domicile (${homeGoals}-${awayGoals}).`;
+      } else {
+        outcome = "LOSS";
+        explanation =
+          `Défaite à domicile (${homeGoals}-${awayGoals}).`;
+      }
+      break;
+
+    case "AWAY_DNB":
+      if (actualOutcome === "DRAW") {
+        outcome = "PUSH";
+        explanation =
+          `Match nul (${homeGoals}-${awayGoals}) : mise remboursée.`;
+      } else if (
+        actualOutcome === "AWAY"
+      ) {
+        outcome = "WIN";
+        explanation =
+          `Victoire à l'extérieur (${homeGoals}-${awayGoals}).`;
+      } else {
+        outcome = "LOSS";
+        explanation =
+          `Défaite de l'équipe extérieure (${homeGoals}-${awayGoals}).`;
+      }
+      break;
+
+    default:
+      /*
+       * Sécurité :
+       * on ne marque jamais automatiquement
+       * un marché inconnu comme perdu.
+       */
+      outcome = "UNSUPPORTED";
+
+      explanation =
+        `Marché non pris en charge : ${
+          market || "inconnu"
+        }.`;
+      break;
+  }
+
   const won =
-    prediction.selected_outcome === actualOutcome;
+    outcome === "WIN"
+      ? true
+      : outcome === "LOSS"
+      ? false
+      : null;
 
-  const marketOdd =
-    Number(prediction.market_odd);
-
-  // Mise fixe virtuelle : 1 unité
-  const profit = won
-    ? Number((marketOdd - 1).toFixed(2))
-    : -1;
+  const profit =
+    getSettlementProfit({
+      outcome,
+      marketOdd:
+        prediction.market_odd,
+    });
 
   return {
     homeGoals,
     awayGoals,
+    totalGoals,
+
+    market,
     actualOutcome,
+
+    outcome,
     won,
     profit,
+
+    explanation,
+
+    settledBy:
+      market,
   };
 }
 async function updatePendingPredictions(limit = 20) {
@@ -7351,6 +8074,27 @@ async function updatePendingPredictions(limit = 20) {
         prediction,
         fixture
       );
+        if (
+  settlement.outcome ===
+  "UNSUPPORTED"
+) {
+  summary.errors += 1;
+
+  summary.items.push({
+    fixtureId:
+      prediction.fixture_id,
+
+    market:
+      settlement.market,
+
+    updated: false,
+
+    error:
+      settlement.explanation,
+  });
+
+  continue;
+}
 
       const client = await pool.connect();
 
@@ -7396,25 +8140,52 @@ async function updatePendingPredictions(limit = 20) {
 
       summary.completed += 1;
 
-      summary.items.push({
-        fixtureId: prediction.fixture_id,
-        status,
-        score: {
-          home: settlement.homeGoals,
-          away: settlement.awayGoals,
-        },
-        selectedOutcome:
-          prediction.selected_outcome,
-        actualOutcome:
-          settlement.actualOutcome,
-        betStatus:
-          prediction.bet_status,
-        won: settlement.won,
-        profit: settlement.profit,
-        eloProcessed:
-          !elo.alreadyProcessed,
-        updated: true,
-      });
+     summary.items.push({
+  fixtureId:
+    prediction.fixture_id,
+
+  status,
+
+  score: {
+    home:
+      settlement.homeGoals,
+
+    away:
+      settlement.awayGoals,
+  },
+
+  totalGoals:
+    settlement.totalGoals,
+
+  market:
+    settlement.market,
+
+  actualOutcome:
+    settlement.actualOutcome,
+
+  settlementOutcome:
+    settlement.outcome,
+
+  betStatus:
+    prediction.bet_status,
+
+  won:
+    settlement.won,
+
+  profit:
+    settlement.profit,
+
+  explanation:
+    settlement.explanation,
+
+  settledBy:
+    settlement.settledBy,
+
+  eloProcessed:
+    !elo.alreadyProcessed,
+
+  updated: true,
+});
     } catch (error) {
       summary.errors += 1;
 
