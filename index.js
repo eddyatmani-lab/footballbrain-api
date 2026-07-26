@@ -9164,13 +9164,15 @@ const selectedFixturesToRebuild =
   `${baseUrl}/internal/analyze/${fixtureId}` +
   `${force ? "?refresh=1" : ""}`;
 
+// Attendre 2 secondes entre chaque analyse
+await wait(2000);
+
 const response = await fetch(
   analysisUrl,
   {
     method: "GET",
     headers: {
-      Accept:
-        "application/json",
+      Accept: "application/json",
     },
   }
 );
