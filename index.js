@@ -1335,32 +1335,7 @@ function summarizeMatchWinnerOdds(oddsData) {
     bookmakersUsed: homeOdds.length,
   };
 }
-app.get("/internal/injuries/:fixtureId", async (req, res) => {
-  try {
-        const [home, away] =
-  await Promise.all([
-    callApiFootball("/injuries", {
-      team: match.teams.home.id,
-      season: match.league.season,
-    }),
 
-    callApiFootball("/injuries", {
-      team: match.teams.away.id,
-      season: match.league.season,
-    }),
-  ]);
-    res.json({
-      ok: true,
-      home: home.data.response,
-      away: away.data.response,
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message,
-    });
-  }
-});
 app.get("/internal/lineups/:fixtureId", async (req, res) => {
   try {
     const fixtureId = Number(req.params.fixtureId);
@@ -1413,76 +1388,7 @@ app.get("/internal/predictions/:fixtureId", async (req, res) => {
     });
   }
 });
-function summarizeMatchWinnerOdds(oddsData) {
-  const home = [];
-  const draw = [];
-  const away = [];
 
-  oddsData.forEach((fixture) => {
-    (fixture.bookmakers || []).forEach(
-      (bookmaker) => {
-        const bet = (
-          bookmaker.bets || []
-        ).find(
-          (b) => b.name === "Match Winner"
-        );
-
-        if (!bet) return;
-
-        bet.values.forEach((value) => {
-          const odd = Number(value.odd);
-
-          if (value.value === "Home")
-            home.push(odd);
-
-          if (value.value === "Draw")
-            draw.push(odd);
-
-          if (value.value === "Away")
-            away.push(odd);
-        });
-      }
-    );
-  });
-
-  const avg = (arr) =>
-    arr.length
-      ? Number(
-          (
-            arr.reduce((a, b) => a + b, 0) /
-            arr.length
-          ).toFixed(2)
-        )
-      : null;
-
-  const result = {
-    homeAverageOdd: avg(home),
-    drawAverageOdd: avg(draw),
-    awayAverageOdd: avg(away),
-  };
-
-  const values = [
-    {
-      key: "home",
-      value: result.homeAverageOdd,
-    },
-    {
-      key: "draw",
-      value: result.drawAverageOdd,
-    },
-    {
-      key: "away",
-      value: result.awayAverageOdd,
-    },
-  ].filter((x) => x.value);
-
-  result.marketFavorite =
-    values.sort(
-      (a, b) => a.value - b.value
-    )[0]?.key;
-
-  return result;
-}
 function computeFootballBrainDecision(
   footballBrain,
   market,
@@ -3706,59 +3612,6 @@ app.get(
     }
   }
 );
-function settlePrediction(prediction, fixture) {
-  const homeGoals = fixture.goals?.home;
-  const awayGoals = fixture.goals?.away;
-
-  if (
-    !Number.isFinite(homeGoals) ||
-    !Number.isFinite(awayGoals)
-  ) {
-    throw new Error("Score final indisponible");
-  }
-
-  let actualOutcome = "draw";
-
-  if (homeGoals > awayGoals) {
-    actualOutcome = "home";
-  } else if (awayGoals > homeGoals) {
-    actualOutcome = "away";
-  }
-
-  const isNoBet =
-    prediction.bet_status === "NO_BET";
-
-  if (isNoBet) {
-    return {
-      homeGoals,
-      awayGoals,
-      actualOutcome,
-      won: null,
-      profit: 0,
-    };
-  }
-
-  const won =
-    prediction.selected_outcome === actualOutcome;
-
-  const marketOdd =
-    Number(prediction.market_odd);
-
-  // Mise fixe virtuelle : 1 unité
-  const profit = won
-    ? Number((marketOdd - 1).toFixed(2))
-    : -1;
-
-  return {
-    homeGoals,
-    awayGoals,
-    actualOutcome,
-    won,
-    profit,
-  };
-}
-    const FINISHED_FIXTURE_STATUSES =
-  new Set(["FT", "AET", "PEN"]);
 
 function formatDateForApi(date) {
   return new Intl.DateTimeFormat(
@@ -4144,8 +3997,7 @@ async function synchronizeFinishedPredictionsByDate() {
 app.get(
   "/internal/cron/update-results",
   async (req, res) => {
-    const secret =
-      req.query.secret;
+    const secret = req.query.secret;
 
     if (
       !process.env
@@ -4183,85 +4035,7 @@ app.get(
     }
   }
 );
-app.get("/public/analysis/:fixtureId", async (req, res) => {
-  try {
-    const fixtureId = Number(req.params.fixtureId);
 
-    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "fixtureId invalide",
-      });
-    }
-
-    const result = await pool.query(
-      `
-        SELECT
-          fixture_id,
-          fixture_date,
-          league_name,
-          home_team_name,
-          away_team_name,
-          decision,
-          bet_status,
-          confidence,
-          risk,
-          home_probability,
-          draw_probability,
-          away_probability,
-          value_percentage,
-          explanation,
-          result_status
-        FROM predictions
-        WHERE fixture_id = $1
-        LIMIT 1
-      `,
-      [fixtureId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: "Analyse indisponible",
-      });
-    }
-
-    const item = result.rows[0];
-
-    return res.json({
-      ok: true,
-
-      match: {
-        fixtureId: item.fixture_id,
-        date: item.fixture_date,
-        league: item.league_name,
-        homeTeam: item.home_team_name,
-        awayTeam: item.away_team_name,
-      },
-
-      analysis: {
-        decision: item.decision,
-        betStatus: item.bet_status,
-        probabilities: {
-          home: Number(item.home_probability),
-          draw: Number(item.draw_probability),
-          away: Number(item.away_probability),
-        },
-        confidence: Number(item.confidence),
-        risk: item.risk,
-        value: Number(item.value_percentage),
-        explanation: item.explanation,
-      },
-
-      status: item.result_status,
-    });
-  } catch (error) {
-    return res.status(500).json({
-      ok: false,
-      error: error.message,
-    });
-  }
-});
 app.get("/public/analysis/:fixtureId", async (req, res) => {
   try {
     const fixtureId = Number(req.params.fixtureId);
@@ -4404,239 +4178,7 @@ const priorityLeagueIds = [
   203, // Süper Lig
   253, // MLS
 ];
-     function getFixturePriorityScore(fixture) {
-  const leagueId = fixture.league?.id;
-  const round = String(
-    fixture.league?.round || ""
-  ).toLowerCase();
-
-  let score = 0;
-
-  // Priorité par compétition
-  const leaguePriority = {
-    2: 100,   // Champions League
-    3: 90,    // Europa League
-    848: 80,  // Conference League
-    39: 75,   // Premier League
-    140: 75,  // La Liga
-    135: 75,  // Serie A
-    78: 75,   // Bundesliga
-    61: 75,   // Ligue 1
-    94: 65,   // Primeira Liga
-    88: 65,   // Eredivisie
-    203: 60,  // Süper Lig
-    253: 55,  // MLS
-  };
-
-  score += leaguePriority[leagueId] || 0;
-
-  // Bonus selon le tour
-  if (round.includes("final")) {
-    score += 30;
-  } else if (round.includes("semi")) {
-    score += 25;
-  } else if (round.includes("quarter")) {
-    score += 20;
-  } else if (round.includes("play-off")) {
-    score += 15;
-  } else if (round.includes("qualifying")) {
-    score += 5;
-  }
-
-  // Bonus si les équipes sont bien identifiées
-  if (
-    fixture.teams?.home?.id &&
-    fixture.teams?.away?.id
-  ) {
-    score += 5;
-  }
-
-  // Bonus si le stade est connu
-  if (fixture.fixture?.venue?.name) {
-    score += 2;
-  }
-
-  // Bonus si l'heure du match est disponible
-  if (fixture.fixture?.date) {
-    score += 2;
-  }
-
-  return score;
-}
-
-const priorityFixtures = fixtures
-  .filter((fixture) =>
-    priorityLeagueIds.includes(
-      fixture.league?.id
-    )
-  )
-  .map((fixture) => ({
-    fixture,
-    priorityScore:
-      getFixturePriorityScore(fixture),
-  }))
-  .sort(
-    (a, b) =>
-      b.priorityScore - a.priorityScore
-  );
-
-const selectedFixtures =
-  priorityFixtures
-    .slice(0, limit)
-    .map((item) => item.fixture);
-
-      const summary = {
-        date: requestedDate,
-        fixturesFound: fixtures.length,
-        priorityFixturesFound: priorityFixtures.length,
-selected: selectedFixtures.length,
-        analyzed: 0,
-        failed: 0,
-        items: [],
-      };
-
-      const baseUrl =
-        process.env.PUBLIC_API_URL ||
-        `http://127.0.0.1:${PORT}`;
-
-      for (const fixture of selectedFixtures) {
-        const fixtureId =
-          fixture.fixture?.id;
-
-        if (!fixtureId) {
-          continue;
-        }
-
-        try {
-          const response = await axios.get(
-            `${baseUrl}/internal/analyze/${fixtureId}`,
-            {
-              timeout: 120000,
-            }
-          );
-
-          summary.analyzed += 1;
-
-         
-
-const priorityItem =
-  priorityFixtures.find(
-    (item) =>
-      item.fixture.fixture?.id === fixtureId
-  );
-
-const analysis =
-  response.data?.analysis || {};
-
-const decision =
-  analysis.footballBrainDecision || {};
-
-const market =
-  analysis.market || {};
-const pickScore =
-  analysis.footballBrainPickScore || {};
-
-summary.items.push({
-  fixtureId,
-
-  homeTeam:
-    fixture.teams?.home?.name,
-
-  awayTeam:
-    fixture.teams?.away?.name,
-
-  league:
-    fixture.league?.name,
-
-  round:
-    fixture.league?.round,
-
-  kickoff:
-    fixture.fixture?.date,
-
-  priorityScore:
-    priorityItem?.priorityScore || 0,
-
-  hasOdds:
-    market.homeAverageOdd !== null &&
-    market.homeAverageOdd !== undefined,
-
-  confidence:
-    Number(decision.confidence || 0),
-
-  value:
-    decision.value === null ||
-    decision.value === undefined
-      ? -999
-      : Number(decision.value),
-footballBrainScore:
-  Number(pickScore.score || 0),
-
-footballBrainLevel:
-  pickScore.level || null,
-  decision:
-    decision.decision || null,
-
-  success: true,
-});
-        } catch (error) {
-          summary.failed += 1;
-
-          summary.items.push({
-            fixtureId,
-            homeTeam:
-              fixture.teams?.home?.name,
-            awayTeam:
-              fixture.teams?.away?.name,
-            success: false,
-            error:
-              error.response?.data ||
-              error.message,
-          });
-        }
-      }
-summary.items.sort((a, b) => {
-  if (b.priorityScore !== a.priorityScore) {
-    return b.priorityScore - a.priorityScore;
-  }
-
-  if (b.hasOdds !== a.hasOdds) {
-    return Number(b.hasOdds) - Number(a.hasOdds);
-  }
-if (
-  b.footballBrainScore !==
-  a.footballBrainScore
-) {
-  return (
-    b.footballBrainScore -
-    a.footballBrainScore
-  );
-}
-  if (b.confidence !== a.confidence) {
-    return b.confidence - a.confidence;
-  }
-
-  if (b.value !== a.value) {
-    return b.value - a.value;
-  }
-
-  return new Date(a.kickoff) - new Date(b.kickoff);
-});
-      return res.json({
-        ok: true,
-        summary,
-      });
-    } catch (error) {
-      return res.status(500).json({
-        ok: false,
-        error:
-          error.response?.data ||
-          error.message,
-      });
-    }
-  }
-);
-
+   
 function computeXgConfidence({
   homeRecentForm,
   awayRecentForm,
@@ -5571,350 +5113,6 @@ const headToHead = h2hMatches.map((item) => ({
 
 });
 
-app.get("/internal/analyze/:fixtureId", async (req, res) => {
-  try {
-    const fixtureId = Number(req.params.fixtureId);
-
-    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "fixtureId invalide",
-      });
-    }
-
-    // ...
-
-   const cached = analysisCache.get(fixtureId);
-
-if (
-  cached &&
-  Date.now() - cached.createdAt < ANALYSIS_CACHE_TTL
-) {
-  return res.json({
-    ...cached.data,
-    cached: true,
-  });
-}
- const fixtureResponse = await callApiFootball("/fixtures", {
-      id: fixtureId,
-      timezone: "Europe/Paris",
-    });
-
-    const fixture = fixtureResponse.data?.response?.[0];
-
-    if (!fixture) {
-      return res.status(404).json({
-        ok: false,
-        error: "Match introuvable",
-      });
-    }
-if (
- isExcludedFixture(fixture)
-) {
-  analysisCache.delete(
-    fixtureId
-  );
-
-  return res.status(422).json({
-    ok: false,
-    skipped: true,
-    reason:
-      "FRIENDLY_MATCH_EXCLUDED",
-    error:
-      "Les matchs amicaux sont exclus des analyses FootballBrain.",
-    fixtureId,
-    league:
-      fixture?.league?.name ||
-      null,
-  });
-}
-    const homeTeamId = fixture.teams?.home?.id;
-    const awayTeamId = fixture.teams?.away?.id;
-
-    const [
-      homeRecentResponse,
-      awayRecentResponse,
-      h2hResponse,
-      oddsResponse,
-injuriesResponse,
-lineupsResponse,
-    ] = await Promise.all([
-      callApiFootball("/fixtures", {
-        team: homeTeamId,
-        last: 5,
-        timezone: "Europe/Paris",
-      }),
-
-      callApiFootball("/fixtures", {
-        team: awayTeamId,
-        last: 5,
-        timezone: "Europe/Paris",
-      }),
-
-      callApiFootball("/fixtures/headtohead", {
-        h2h: `${homeTeamId}-${awayTeamId}`,
-        last: 10,
-        timezone: "Europe/Paris",
-      }),
-
-      callApiFootball("/odds", {
-        fixture: fixtureId,
-      }),
-callApiFootball("/injuries", {
-  fixture: fixtureId,
-}),
-
-callApiFootball("/fixtures/lineups", {
-  fixture: fixtureId,
-}),
-    ]);
-const homeRecentForm =
-  homeRecentResponse.data?.response || [];
-
-const awayRecentForm =
-  awayRecentResponse.data?.response || [];
-const getTeamResult = (match, teamId) => {
-  const isHome =
-    match.teams?.home?.id === teamId;
-
-  const goalsFor = isHome
-    ? match.goals?.home
-    : match.goals?.away;
-
-  const goalsAgainst = isHome
-    ? match.goals?.away
-    : match.goals?.home;
-
-  if (goalsFor > goalsAgainst) return "W";
-  if (goalsFor < goalsAgainst) return "L";
-
-  return "D";
-};
-
-const homeResults = homeRecentForm.map(
-  (match) => getTeamResult(match, homeTeamId)
-);
-
-const awayResults = awayRecentForm.map(
-  (match) => getTeamResult(match, awayTeamId)
-);
-const rawOdds = oddsResponse.data?.response || [];
-
-const market = summarizeMatchWinnerOdds(rawOdds);
-
-const injuries =
-  injuriesResponse.data?.response || [];
-
-const lineups =
-  lineupsResponse.data?.response || [];
-
-const poissonModel =
-  computePoissonModel({
-    homeRecentForm,
-    awayRecentForm,
-    homeTeamId,
-    awayTeamId,
-  });
-
-console.log(
-  "FootballXGModel chargé :",
-  typeof computeAdvancedXGModel
-);
-
-const monteCarloModel =
-  FootballMonteCarlo(
-    {
-      id: fixtureId,
-      xg_home:
-        poissonModel.expectedGoals.home,
-      xg_away:
-        poissonModel.expectedGoals.away,
-    },
-    {
-      match: {
-        id: fixtureId,
-        xgHome:
-          poissonModel.expectedGoals.home,
-        xgAway:
-          poissonModel.expectedGoals.away,
-      },
-    },
-    10000,
-    {
-      seed: fixtureId,
-    }
-  );
-const monteCarloFavorite = [
-  {
-    key: "home",
-    probability: monteCarloModel.homeWin,
-  },
-  {
-    key: "draw",
-    probability: monteCarloModel.draw,
-  },
-  {
-    key: "away",
-    probability: monteCarloModel.awayWin,
-  },
-].sort(
-  (a, b) =>
-    b.probability - a.probability
-)[0];
-
-const baseFootballBrain =
-  computeFootballBrainScore(
-    homeResults.map((result) => ({ result })),
-    awayResults.map((result) => ({ result }))
-  );
-
-const phaseOneContext =
-  computePhaseOneContext({
-    match: {
-      league: fixture.league,
-    },
-    homeResults,
-    awayResults,
-    market,
-    baseScore: baseFootballBrain,
-  });
-
-const phaseTwoContext =
-  computePhaseTwoContext({
-    fixture,
-    homeRecentForm,
-    awayRecentForm,
-    injuries,
-    lineups,
-  });
-
-const footballBrain = {
-  homeScore:
-    phaseOneContext.adjustedHomeScore +
-    phaseTwoContext.scoreAdjustment.home,
-
-  awayScore:
-    phaseOneContext.adjustedAwayScore +
-    phaseTwoContext.scoreAdjustment.away,
-
-  advantage:
-    (
-      phaseOneContext.adjustedHomeScore +
-      phaseTwoContext.scoreAdjustment.home
-    ) -
-    (
-      phaseOneContext.adjustedAwayScore +
-      phaseTwoContext.scoreAdjustment.away
-    ),
-
-  baseScore: baseFootballBrain,
-
-  context: {
-    phaseOne: phaseOneContext,
-    phaseTwo: phaseTwoContext,
-  },
-};
-const footballBrainDecision =
-  computeFootballBrainDecision(
-    footballBrain,
-    market,
-    monteCarloModel
-  );
-const monteCarloAgreement = {
-  favorite:
-    monteCarloFavorite.key,
-
-  probability:
-    Number(
-      monteCarloFavorite.probability
-    ),
-
-  agreesWithDecision:
-    monteCarloFavorite.key ===
-    footballBrainDecision.selectedOutcome,
-};
-const headToHead =
-  h2hResponse.data?.response || [];
-
-const footballBrainRating =
-  computeFootballBrainRating({
-    footballBrain,
-    footballBrainDecision,
-    market,
-    headToHead,
-  });
-const footballBrainPickScore =
-  computeFootballBrainPickScore({
-    decision: footballBrainDecision,
-    market,
-    footballBrain,
-  });
-const result = {
-  ok: true,
-  analysis: {
-    fixtureId,
-    match: {
-      date: fixture.fixture?.date,
-      homeTeam: fixture.teams?.home,
-      awayTeam: fixture.teams?.away,
-      league: fixture.league,
-    },
-    homeRecentForm,
-    awayRecentForm,
-    headToHead,
-      market,
-    poissonModel,
-monteCarloModel,
-monteCarloAgreement,
-    footballBrain,
-  footballBrainDecision,
-footballBrainRating,
-footballBrainPickScore,
-},
-};
-
-await savePredictionToDatabase(result.analysis);
-
-analysisCache.set(fixtureId, {
-  createdAt: Date.now(),
-  data: result,
-});
-
-return res.json({
-  ...result,
-  cached: false,
-});
-
-
-
-  } catch (error) {
-    console.error(
-      "ERREUR /internal/analyze :",
-      error
-    );
-
-    return res
-      .status(error.response?.status || 500)
-      .json({
-        ok: false,
-        debugCatch: "ANALYZE_CATCH_ACTIF",
-        message:
-          error.message ||
-          "Erreur inconnue",
-        code:
-          error.code || null,
-        status:
-          error.response?.status || null,
-        endpoint:
-          error.config?.url || null,
-        apiData:
-          error.response?.data ?? null,
-        apiDataType:
-          typeof error.response?.data,
-      });
-  }
-});
-
 function computeFootballBrainScore(
   homeRecent,
   awayRecent
@@ -5939,67 +5137,7 @@ function computeFootballBrainScore(
     advantage: homeScore - awayScore,
   };
 }
-function summarizeMatchWinnerOdds(oddsData) {
-  const homeOdds = [];
-  const drawOdds = [];
-  const awayOdds = [];
-
-  for (const fixtureOdds of oddsData) {
-    for (const bookmaker of fixtureOdds.bookmakers || []) {
-      const matchWinner = (bookmaker.bets || []).find(
-        (bet) => bet.name === "Match Winner"
-      );
-
-      if (!matchWinner) continue;
-
-      for (const item of matchWinner.values || []) {
-        const odd = Number(item.odd);
-
-        if (!Number.isFinite(odd)) continue;
-
-        if (item.value === "Home") homeOdds.push(odd);
-        if (item.value === "Draw") drawOdds.push(odd);
-        if (item.value === "Away") awayOdds.push(odd);
-      }
-    }
-  }
-
-  const average = (values) => {
-    if (values.length === 0) return null;
-
-    return Number(
-      (
-        values.reduce((sum, value) => sum + value, 0) /
-        values.length
-      ).toFixed(2)
-    );
-  };
-
-  const home = average(homeOdds);
-  const draw = average(drawOdds);
-  const away = average(awayOdds);
-
-  const availableOdds = [
-    { key: "home", odd: home },
-    { key: "draw", odd: draw },
-    { key: "away", odd: away },
-  ].filter((item) => item.odd !== null);
-
-  const favorite =
-    availableOdds.length > 0
-      ? availableOdds.reduce((best, current) =>
-          current.odd < best.odd ? current : best
-        ).key
-      : null;
-
-  return {
-    homeAverageOdd: home,
-    drawAverageOdd: draw,
-    awayAverageOdd: away,
-    marketFavorite: favorite,
-    bookmakersUsed: homeOdds.length,
-  };
-}
+        
 app.get("/internal/injuries/:fixtureId", async (req, res) => {
   try {
     const fixtureId = Number(req.params.fixtureId);
@@ -6092,76 +5230,7 @@ app.get("/internal/predictions/:fixtureId", async (req, res) => {
     });
   }
 });
-function summarizeMatchWinnerOdds(oddsData) {
-  const home = [];
-  const draw = [];
-  const away = [];
 
-  oddsData.forEach((fixture) => {
-    (fixture.bookmakers || []).forEach(
-      (bookmaker) => {
-        const bet = (
-          bookmaker.bets || []
-        ).find(
-          (b) => b.name === "Match Winner"
-        );
-
-        if (!bet) return;
-
-        bet.values.forEach((value) => {
-          const odd = Number(value.odd);
-
-          if (value.value === "Home")
-            home.push(odd);
-
-          if (value.value === "Draw")
-            draw.push(odd);
-
-          if (value.value === "Away")
-            away.push(odd);
-        });
-      }
-    );
-  });
-
-  const avg = (arr) =>
-    arr.length
-      ? Number(
-          (
-            arr.reduce((a, b) => a + b, 0) /
-            arr.length
-          ).toFixed(2)
-        )
-      : null;
-
-  const result = {
-    homeAverageOdd: avg(home),
-    drawAverageOdd: avg(draw),
-    awayAverageOdd: avg(away),
-  };
-
-  const values = [
-    {
-      key: "home",
-      value: result.homeAverageOdd,
-    },
-    {
-      key: "draw",
-      value: result.drawAverageOdd,
-    },
-    {
-      key: "away",
-      value: result.awayAverageOdd,
-    },
-  ].filter((x) => x.value);
-
-  result.marketFavorite =
-    values.sort(
-      (a, b) => a.value - b.value
-    )[0]?.key;
-
-  return result;
-}
 function computeFootballBrainRating({
   footballBrain,
   footballBrainDecision,
@@ -6889,76 +5958,6 @@ app.get("/internal/db-test", async (req, res) => {
   }
 });
 
-
-async function initializeDatabase() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS teams (
-      id SERIAL PRIMARY KEY,
-      api_team_id INTEGER UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      country TEXT,
-      logo TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS elo_ratings (
-      id SERIAL PRIMARY KEY,
-      team_id INTEGER UNIQUE NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-      rating NUMERIC(8,2) NOT NULL DEFAULT 1500,
-      matches_played INTEGER NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS elo_history (
-      id SERIAL PRIMARY KEY,
-      team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-      fixture_id INTEGER NOT NULL,
-      rating_before NUMERIC(8,2) NOT NULL,
-      rating_after NUMERIC(8,2) NOT NULL,
-      rating_change NUMERIC(8,2) NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-CREATE UNIQUE INDEX IF NOT EXISTS elo_history_team_fixture_unique
-ON elo_history (team_id, fixture_id);
-    CREATE TABLE IF NOT EXISTS predictions (
-      id SERIAL PRIMARY KEY,
-      fixture_id INTEGER UNIQUE NOT NULL,
-      fixture_date TIMESTAMPTZ,
-      league_id INTEGER,
-      league_name TEXT,
-      home_team_id INTEGER,
-      home_team_name TEXT,
-      away_team_id INTEGER,
-      away_team_name TEXT,
-
-      decision TEXT,
-      selected_outcome TEXT,
-      bet_status TEXT,
-      confidence NUMERIC(5,2),
-      risk TEXT,
-
-      home_probability NUMERIC(5,2),
-      draw_probability NUMERIC(5,2),
-      away_probability NUMERIC(5,2),
-
-      fair_odd NUMERIC(8,2),
-      market_odd NUMERIC(8,2),
-      value_percentage NUMERIC(8,2),
-
-      explanation TEXT,
-
-      result_status TEXT DEFAULT 'PENDING',
-      home_goals INTEGER,
-      away_goals INTEGER,
-      won BOOLEAN,
-      profit NUMERIC(10,2),
-
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-}
 app.get("/internal/db-init", async (req, res) => {
   try {
     await initializeDatabase();
@@ -8009,6 +7008,93 @@ function settlePrediction(
       market,
   };
 }
+function getApiFootballErrorText(
+  value
+) {
+  if (!value) {
+    return "";
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map(getApiFootballErrorText)
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  if (typeof value === "object") {
+    return Object.values(value)
+      .map(getApiFootballErrorText)
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  return String(value);
+}
+
+function isApiFootballQuotaMessage(
+  value
+) {
+  const message =
+    getApiFootballErrorText(value)
+      .toLowerCase();
+
+  return (
+    message.includes("request limit") ||
+    message.includes("requests limit") ||
+    message.includes("rate limit") ||
+    message.includes("quota") ||
+    message.includes("too many requests") ||
+    message.includes("limit for the day") ||
+    message.includes("daily limit")
+  );
+}
+
+function isApiFootballQuotaError(
+  error
+) {
+  if (
+    error?.code ===
+    "API_FOOTBALL_QUOTA_REACHED"
+  ) {
+    return true;
+  }
+
+  const status =
+    error?.response?.status ||
+    error?.status ||
+    null;
+
+  if (status === 429) {
+    return true;
+  }
+
+  return isApiFootballQuotaMessage([
+    error?.message,
+    error?.response?.data,
+    error?.response?.data?.errors,
+  ]);
+}
+
+function createApiFootballQuotaError(
+  details
+) {
+  const error = new Error(
+    "Quota API-Football atteint"
+  );
+
+  error.code =
+    "API_FOOTBALL_QUOTA_REACHED";
+
+  error.details =
+    getApiFootballErrorText(details);
+
+  return error;
+}
 async function updatePendingPredictions(limit = 20) {
   const pendingResult = await pool.query(
     `
@@ -8023,27 +7109,62 @@ async function updatePendingPredictions(limit = 20) {
   );
 
   const summary = {
-    checked: 0,
-    completed: 0,
-    stillPending: 0,
-    errors: 0,
-    items: [],
-  };
+  checked: 0,
+  completed: 0,
+  stillPending: 0,
+  errors: 0,
+
+  quotaReached: false,
+  stoppedEarly: false,
+  stopReason: null,
+
+  items: [],
+};
 
   for (const prediction of pendingResult.rows) {
     summary.checked += 1;
 
     try {
-      const response = await callApiFootball(
-        "/fixtures",
-        {
-          id: prediction.fixture_id,
-          timezone: "Europe/Paris",
-        }
-      );
+     const response =
+  await callApiFootball(
+    "/fixtures",
+    {
+      id:
+        prediction.fixture_id,
 
-      const fixture =
-        response.data?.response?.[0];
+      timezone:
+        "Europe/Paris",
+    }
+  );
+
+const apiErrors =
+  response?.data?.errors;
+
+if (
+  apiErrors &&
+  Object.keys(apiErrors).length > 0
+) {
+  if (
+    isApiFootballQuotaMessage(
+      apiErrors
+    )
+  ) {
+    throw createApiFootballQuotaError(
+      apiErrors
+    );
+  }
+
+  throw new Error(
+    `Erreur API-Football : ${
+      getApiFootballErrorText(
+        apiErrors
+      )
+    }`
+  );
+}
+
+const fixture =
+  response?.data?.response?.[0];
 
       if (!fixture) {
         throw new Error("Match introuvable");
@@ -8186,21 +7307,71 @@ async function updatePendingPredictions(limit = 20) {
 
   updated: true,
 });
-    } catch (error) {
-      summary.errors += 1;
+   } catch (error) {
+  if (
+    isApiFootballQuotaError(
+      error
+    )
+  ) {
+    summary.quotaReached = true;
+    summary.stoppedEarly = true;
+    summary.stopReason =
+      "API_FOOTBALL_QUOTA_REACHED";
 
-      summary.items.push({
-        fixtureId: prediction.fixture_id,
-        updated: false,
-        error: error.message,
-      });
-    }
+    summary.items.push({
+      fixtureId:
+        prediction.fixture_id,
+
+      updated: false,
+
+      error:
+        "Quota API-Football atteint. Synchronisation suspendue.",
+
+      details:
+        error.details ||
+        error.message,
+    });
+
+    console.warn(
+      [
+        "⚠️ Quota API-Football atteint.",
+        "Arrêt immédiat de la synchronisation.",
+        "Les prédictions restent en PENDING.",
+        "Elles seront reprises automatiquement lors de la prochaine exécution disponible.",
+      ].join(" ")
+    );
+
+    /*
+     * Très important :
+     * on arrête la boucle pour éviter
+     * tous les appels API suivants.
+     */
+    break;
+  }
+
+  summary.errors += 1;
+
+  summary.items.push({
+    fixtureId:
+      prediction.fixture_id,
+
+    updated: false,
+
+    error:
+      error.message,
+  });
+
+  console.error(
+    `Erreur de règlement du match ${prediction.fixture_id} :`,
+    error.message
+  );
+}
   }
 
   return summary;
 }
 app.get(
-  "/internal/cron/update-results",
+  "/
   async (req, res) => {
     const secret = req.query.secret;
 
@@ -10211,56 +9382,6 @@ function getParisTimeParts() {
   };
 }
 
-async function checkDailyFullAnalysisSchedule() {
-  const paris =
-    getParisTimeParts();
-
-  /*
-   * Exécution une seule fois entre
-   * 03h00 et 03h09, heure de Paris.
-   */
-  const isScheduledWindow =
-    paris.hour === 3 &&
-    paris.minute < 10;
-
-  const alreadyRunToday =
-    lastDailyFullAnalysisDate ===
-    paris.date;
-
-  if (
-    !isScheduledWindow ||
-    alreadyRunToday
-  ) {
-    return;
-  }
-
-  /*
-   * On mémorise immédiatement la date
-   * pour éviter deux lancements simultanés.
-   */
-  lastDailyFullAnalysisDate =
-    paris.date;
-
-  console.log(
-    `ANALYSE COMPLÈTE PLANIFIÉE : ${paris.date}`
-  );
-
-  try {
-    await runAutomaticDailyAnalysis();
-  } catch (error) {
-    /*
-     * En cas d’échec, autoriser une nouvelle
-     * tentative au prochain contrôle.
-     */
-    lastDailyFullAnalysisDate =
-      null;
-
-    console.error(
-      "ANALYSE COMPLÈTE PLANIFIÉE : erreur",
-      error.message
-    );
-  }
-}
   dailyAnalysisJobRunning = true;
 
   try {
