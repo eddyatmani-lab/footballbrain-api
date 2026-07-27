@@ -43,6 +43,7 @@ const FINISHED_FIXTURE_STATUSES = new Set([
 const API_BASE_URL =
   "https://v3.football.api-sports.io";
 
+const DEFAULT_BOOKMAKER = 4; // Pinnacle
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -757,8 +758,9 @@ lineupsResponse,
       }),
 
       callApiFootball("/odds", {
-        fixture: fixtureId,
-      }),
+  fixture: fixtureId,
+  bookmaker: DEFAULT_BOOKMAKER,
+}),
 callApiFootball("/injuries", {
   fixture: fixtureId,
 }),
