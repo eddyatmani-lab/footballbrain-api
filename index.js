@@ -11174,8 +11174,8 @@ app.get(
             SELECT
               fixture_id,
               fixture_date,
-              home_team,
-              away_team,
+              home_team_name,
+              away_team_name,
               result_status,
 
               studio_market_key,
@@ -11246,11 +11246,13 @@ app.get(
 
         match: {
           homeTeam:
-            prediction.home_team ||
+            prediction
+              .home_team_name ||
             null,
 
           awayTeam:
-            prediction.away_team ||
+            prediction
+              .away_team_name ||
             null,
 
           kickoff:
