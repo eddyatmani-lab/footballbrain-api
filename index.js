@@ -8292,6 +8292,176 @@ app.get("/internal/db-migrate-xg", async (req, res) => {
     });
   }
 });
+
+function buildStoredPredictionExplainability(
+  prediction
+) {
+  const probabilities = {
+    home:
+      Number(
+        prediction.home_probability
+      ) || 0,
+
+    draw:
+      Number(
+        prediction.draw_probability
+      ) || 0,
+
+    away:
+      Number(
+        prediction.away_probability
+      ) || 0,
+  };
+
+  const selectedOutcome =
+    String(
+      prediction.selected_outcome ||
+      Object.entries(probabilities)
+        .sort(
+          (a, b) =>
+            b[1] - a[1]
+        )[0]?.[0] ||
+      "home"
+    ).toLowerCase();
+
+  const selectedProbability =
+    probabilities[selectedOutcome] || 0;
+
+  const sortedProbabilities =
+    Object.values(probabilities)
+      .map(Number)
+      .filter(Number.isFinite)
+      .sort((a, b) => b - a);
+
+  const probabilityGap =
+    sortedProbabilities.length >= 2
+      ? Number(
+          (
+            sortedProbabilities[0] -
+            sortedProbabilities[1]
+          ).toFixed(2)
+        )
+      : 0;
+
+  const modelInputs =
+    prediction.model_inputs || {};
+
+  const monteCarloInputs =
+    modelInputs.monteCarlo ||
+    modelInputs.monte_carlo ||
+    {};
+
+  const monteCarloEntries =
+    Object.entries({
+      home:
+        Number(
+          monteCarloInputs.home
+        ) || 0,
+
+      draw:
+        Number(
+          monteCarloInputs.draw
+        ) || 0,
+
+      away:
+        Number(
+          monteCarloInputs.away
+        ) || 0,
+    }).sort(
+      (a, b) =>
+        b[1] - a[1]
+    );
+
+  const monteCarloFavorite =
+    monteCarloEntries[0]?.[0] ||
+    null;
+
+  const monteCarloProbability =
+    monteCarloEntries[0]?.[1] ||
+    null;
+
+  const hasMonteCarlo =
+    monteCarloEntries.some(
+      ([, value]) =>
+        Number(value) > 0
+    );
+
+  return createDecisionExplainability({
+    selectedOutcome,
+    selectedProbability,
+    probabilities,
+
+    weights: {
+      form:
+        Number(
+          prediction.form_weight
+        ) || 0,
+
+      market:
+        Number(
+          prediction.market_weight
+        ) || 0,
+
+      monteCarlo:
+        Number(
+          prediction.monte_carlo_weight
+        ) || 0,
+    },
+
+    modelInputs,
+
+    monteCarlo: {
+      available:
+        hasMonteCarlo,
+
+      favorite:
+        monteCarloFavorite,
+
+      probability:
+        monteCarloProbability,
+
+      agrees:
+        monteCarloFavorite ===
+        selectedOutcome,
+    },
+
+    confidence:
+      Number(
+        prediction.confidence
+      ) || 0,
+
+    risk:
+      prediction.risk,
+
+    fairOdd:
+      prediction.fair_odd !== null
+        ? Number(
+            prediction.fair_odd
+          )
+        : null,
+
+    marketOdd:
+      prediction.market_odd !== null
+        ? Number(
+            prediction.market_odd
+          )
+        : null,
+
+    value:
+      prediction.value_percentage !==
+      null
+        ? Number(
+            prediction.value_percentage
+          )
+        : null,
+
+    betStatus:
+      prediction.bet_status,
+
+    probabilityGap,
+  });
+}
+
 app.get(
   "/public/ai-lab/:fixtureId",
   async (req, res) => {
@@ -8476,6 +8646,11 @@ if (
 
           explanation:
             prediction.explanation,
+
+          explainability:
+            buildStoredPredictionExplainability(
+              prediction
+            ),
         },
 
         xg: {
