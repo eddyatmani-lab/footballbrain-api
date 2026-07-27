@@ -12325,6 +12325,808 @@ app.get(
     }
   }
 );
+/*
+ * ============================================================
+ * BRAIN STUDIO — SCHEDULER INTELLIGENT
+ * ============================================================
+ *
+ * Fonctionnement :
+ *
+ * - vérification toutes les 15 minutes ;
+ * - sélection des matchs qui débutent dans moins de 3 heures ;
+ * - exclusion des matchs déjà commencés ou terminés ;
+ * - exclusion des snapshots actualisés trop récemment ;
+ * - recalcul un match après l’autre ;
+ * - pause entre les matchs pour protéger API-Football ;
+ * - verrouillage naturel au coup d’envoi.
+ */
+
+const STUDIO_SCHEDULER_INTERVAL_MS =
+  15 * 60 * 1000;
+
+const STUDIO_SCHEDULER_FIRST_RUN_DELAY_MS =
+  3 * 60 * 1000;
+
+const STUDIO_SCHEDULER_LOOKAHEAD_HOURS =
+  3;
+
+const STUDIO_SCHEDULER_REFRESH_MINUTES =
+  12;
+
+const STUDIO_SCHEDULER_MAX_MATCHES =
+  20;
+
+const STUDIO_SCHEDULER_DELAY_BETWEEN_MATCHES_MS =
+  2500;
+
+let studioSchedulerRunning =
+  false;
+
+let studioSchedulerLastStartedAt =
+  null;
+
+let studioSchedulerLastFinishedAt =
+  null;
+
+let studioSchedulerLastSummary =
+  null;
+
+function waitStudioScheduler(
+  milliseconds
+) {
+  return new Promise(
+    (resolve) =>
+      setTimeout(
+        resolve,
+        milliseconds
+      )
+  );
+}
+
+function normalizeSchedulerStatus(
+  value
+) {
+  return String(value || "")
+    .trim()
+    .toUpperCase();
+}
+
+function isFinishedSchedulerStatus(
+  status
+) {
+  const normalized =
+    normalizeSchedulerStatus(
+      status
+    );
+
+  return new Set([
+    "FT",
+    "AET",
+    "PEN",
+    "FINISHED",
+    "COMPLETED",
+    "CANCELLED",
+    "CANCELED",
+    "PST",
+    "POSTPONED",
+    "ABD",
+    "ABANDONED",
+    "AWD",
+    "WO",
+  ]).has(normalized);
+}
+
+async function getUpcomingStudioFixtures({
+  lookaheadHours =
+    STUDIO_SCHEDULER_LOOKAHEAD_HOURS,
+
+  refreshMinutes =
+    STUDIO_SCHEDULER_REFRESH_MINUTES,
+
+  limit =
+    STUDIO_SCHEDULER_MAX_MATCHES,
+} = {}) {
+  const normalizedLookahead =
+    Math.max(
+      1,
+      Math.min(
+        24,
+        Number(lookaheadHours) ||
+          STUDIO_SCHEDULER_LOOKAHEAD_HOURS
+      )
+    );
+
+  const normalizedRefreshMinutes =
+    Math.max(
+      5,
+      Math.min(
+        180,
+        Number(refreshMinutes) ||
+          STUDIO_SCHEDULER_REFRESH_MINUTES
+      )
+    );
+
+  const normalizedLimit =
+    Math.max(
+      1,
+      Math.min(
+        100,
+        Number(limit) ||
+          STUDIO_SCHEDULER_MAX_MATCHES
+      )
+    );
+
+  const result =
+    await pool.query(
+      `
+        SELECT
+          fixture_id,
+          fixture_date,
+
+          league_id,
+          league_name,
+
+          home_team_name,
+          away_team_name,
+
+          result_status,
+
+          studio_market_key,
+          studio_market_label,
+          studio_probability,
+          studio_decision_score,
+          studio_decision_type,
+          studio_decision_grade,
+          studio_analysis_version,
+          studio_saved_at,
+
+          created_at,
+          updated_at
+
+        FROM predictions
+
+        WHERE
+          fixture_date IS NOT NULL
+
+          /*
+           * Match pas encore commencé.
+           */
+          AND fixture_date > NOW()
+
+          /*
+           * Match dans les prochaines heures.
+           */
+          AND fixture_date <=
+            NOW() +
+            ($1 * INTERVAL '1 hour')
+
+          /*
+           * Ne pas recalculer les matchs
+           * explicitement terminés ou annulés.
+           */
+          AND (
+            result_status IS NULL
+            OR UPPER(
+              result_status
+            ) NOT IN (
+              'FT',
+              'AET',
+              'PEN',
+              'FINISHED',
+              'COMPLETED',
+              'CANCELLED',
+              'CANCELED',
+              'PST',
+              'POSTPONED',
+              'ABD',
+              'ABANDONED',
+              'AWD',
+              'WO'
+            )
+          )
+
+          /*
+           * Premier snapshot ou snapshot
+           * suffisamment ancien.
+           */
+          AND (
+            studio_saved_at IS NULL
+            OR studio_saved_at <=
+              NOW() -
+              ($2 * INTERVAL '1 minute')
+          )
+
+        ORDER BY
+          fixture_date ASC
+
+        LIMIT $3
+      `,
+      [
+        normalizedLookahead,
+        normalizedRefreshMinutes,
+        normalizedLimit,
+      ]
+    );
+
+  return result.rows;
+}
+
+async function runAutomaticStudioScheduler({
+  source = "scheduler",
+
+  force = false,
+
+  lookaheadHours =
+    STUDIO_SCHEDULER_LOOKAHEAD_HOURS,
+
+  refreshMinutes =
+    STUDIO_SCHEDULER_REFRESH_MINUTES,
+
+  limit =
+    STUDIO_SCHEDULER_MAX_MATCHES,
+} = {}) {
+  if (studioSchedulerRunning) {
+    console.log(
+      "BRAIN STUDIO SCHEDULER : cycle déjà actif"
+    );
+
+    return {
+      ok: true,
+      skipped: true,
+      reason:
+        "ALREADY_RUNNING",
+      source,
+    };
+  }
+
+  studioSchedulerRunning =
+    true;
+
+  studioSchedulerLastStartedAt =
+    new Date().toISOString();
+
+  const summary = {
+    ok: true,
+    source,
+
+    startedAt:
+      studioSchedulerLastStartedAt,
+
+    finishedAt: null,
+
+    lookaheadHours:
+      Number(lookaheadHours),
+
+    refreshMinutes:
+      Number(refreshMinutes),
+
+    force:
+      Boolean(force),
+
+    fixturesFound: 0,
+    attempted: 0,
+    saved: 0,
+    locked: 0,
+    skipped: 0,
+    failed: 0,
+
+    results: [],
+  };
+
+  try {
+    let fixtures = [];
+
+    if (force) {
+      /*
+       * En mode force, on ignore la date
+       * du dernier snapshot, mais jamais
+       * le coup d’envoi.
+       */
+      const forcedResult =
+        await pool.query(
+          `
+            SELECT
+              fixture_id,
+              fixture_date,
+
+              league_id,
+              league_name,
+
+              home_team_name,
+              away_team_name,
+
+              result_status,
+
+              studio_saved_at,
+
+              created_at,
+              updated_at
+
+            FROM predictions
+
+            WHERE
+              fixture_date IS NOT NULL
+
+              AND fixture_date > NOW()
+
+              AND fixture_date <=
+                NOW() +
+                ($1 * INTERVAL '1 hour')
+
+              AND (
+                result_status IS NULL
+                OR UPPER(
+                  result_status
+                ) NOT IN (
+                  'FT',
+                  'AET',
+                  'PEN',
+                  'FINISHED',
+                  'COMPLETED',
+                  'CANCELLED',
+                  'CANCELED',
+                  'PST',
+                  'POSTPONED',
+                  'ABD',
+                  'ABANDONED',
+                  'AWD',
+                  'WO'
+                )
+              )
+
+            ORDER BY
+              fixture_date ASC
+
+            LIMIT $2
+          `,
+          [
+            Math.max(
+              1,
+              Math.min(
+                24,
+                Number(
+                  lookaheadHours
+                ) ||
+                  STUDIO_SCHEDULER_LOOKAHEAD_HOURS
+              )
+            ),
+
+            Math.max(
+              1,
+              Math.min(
+                100,
+                Number(limit) ||
+                  STUDIO_SCHEDULER_MAX_MATCHES
+              )
+            ),
+          ]
+        );
+
+      fixtures =
+        forcedResult.rows;
+    } else {
+      fixtures =
+        await getUpcomingStudioFixtures({
+          lookaheadHours,
+          refreshMinutes,
+          limit,
+        });
+    }
+
+    summary.fixturesFound =
+      fixtures.length;
+
+    console.log(
+      "BRAIN STUDIO SCHEDULER : démarrage",
+      {
+        source,
+        fixturesFound:
+          fixtures.length,
+        lookaheadHours,
+        refreshMinutes,
+        force,
+      }
+    );
+
+    for (
+      let index = 0;
+      index < fixtures.length;
+      index += 1
+    ) {
+      const fixture =
+        fixtures[index];
+
+      const fixtureId =
+        Number(
+          fixture.fixture_id
+        );
+
+      const matchLabel =
+        `${fixture.home_team_name || "Domicile"}` +
+        " vs " +
+        `${fixture.away_team_name || "Extérieur"}`;
+
+      const kickoff =
+        fixture.fixture_date
+          ? new Date(
+              fixture.fixture_date
+            )
+          : null;
+
+      /*
+       * Deuxième sécurité :
+       * le match a pu commencer pendant
+       * l’exécution du scheduler.
+       */
+      if (
+        kickoff &&
+        !Number.isNaN(
+          kickoff.getTime()
+        ) &&
+        kickoff.getTime() <=
+          Date.now()
+      ) {
+        summary.locked += 1;
+
+        summary.results.push({
+          fixtureId,
+          match:
+            matchLabel,
+          ok: true,
+          saved: false,
+          locked: true,
+          reason:
+            "MATCH_STARTED",
+        });
+
+        continue;
+      }
+
+      if (
+        isFinishedSchedulerStatus(
+          fixture.result_status
+        )
+      ) {
+        summary.skipped += 1;
+
+        summary.results.push({
+          fixtureId,
+          match:
+            matchLabel,
+          ok: true,
+          saved: false,
+          skipped: true,
+          reason:
+            "FINISHED_STATUS",
+        });
+
+        continue;
+      }
+
+      summary.attempted += 1;
+
+      try {
+        console.log(
+          `BRAIN STUDIO SCHEDULER : analyse ${index + 1}/${fixtures.length}`,
+          {
+            fixtureId,
+            match:
+              matchLabel,
+            kickoff:
+              fixture.fixture_date,
+          }
+        );
+
+        const result =
+          await rebuildAutomaticStudioSnapshot(
+            fixtureId
+          );
+
+        if (result?.locked) {
+          summary.locked += 1;
+        } else if (result?.saved) {
+          summary.saved += 1;
+        } else {
+          summary.skipped += 1;
+        }
+
+        summary.results.push({
+          fixtureId,
+          match:
+            matchLabel,
+          ok: true,
+
+          saved:
+            result?.saved ===
+            true,
+
+          locked:
+            result?.locked ===
+            true,
+
+          reason:
+            result?.reason ||
+            null,
+
+          primaryMarket:
+            result?.primaryMarket
+              ? {
+                  key:
+                    result
+                      .primaryMarket
+                      .key,
+
+                  label:
+                    result
+                      .primaryMarket
+                      .label,
+
+                  probability:
+                    result
+                      .primaryMarket
+                      ?.fairOdds
+                      ?.calibratedProbability ??
+                    result
+                      .primaryMarket
+                      ?.probability ??
+                    null,
+
+                  decisionScore:
+                    result
+                      .primaryMarket
+                      ?.decision
+                      ?.score ??
+                    result
+                      .primaryMarket
+                      ?.score ??
+                    null,
+
+                  decisionType:
+                    result
+                      .primaryMarket
+                      ?.decision
+                      ?.type ??
+                    null,
+                }
+              : null,
+        });
+      } catch (error) {
+        summary.failed += 1;
+
+        summary.results.push({
+          fixtureId,
+          match:
+            matchLabel,
+          ok: false,
+
+          error:
+            error?.message ||
+            "Erreur inconnue",
+        });
+
+        console.error(
+          `BRAIN STUDIO SCHEDULER : erreur fixture ${fixtureId}`,
+          error
+        );
+      }
+
+      /*
+       * Protection contre les appels trop
+       * rapprochés à API-Football.
+       */
+      if (
+        index <
+        fixtures.length - 1
+      ) {
+        await waitStudioScheduler(
+          STUDIO_SCHEDULER_DELAY_BETWEEN_MATCHES_MS
+        );
+      }
+    }
+
+    summary.finishedAt =
+      new Date().toISOString();
+
+    studioSchedulerLastFinishedAt =
+      summary.finishedAt;
+
+    studioSchedulerLastSummary =
+      summary;
+
+    console.log(
+      "BRAIN STUDIO SCHEDULER : terminé",
+      {
+        fixturesFound:
+          summary.fixturesFound,
+        attempted:
+          summary.attempted,
+        saved:
+          summary.saved,
+        locked:
+          summary.locked,
+        skipped:
+          summary.skipped,
+        failed:
+          summary.failed,
+      }
+    );
+
+    return summary;
+  } catch (error) {
+    summary.ok = false;
+    summary.failed += 1;
+
+    summary.error =
+      error?.message ||
+      "Erreur inconnue";
+
+    summary.finishedAt =
+      new Date().toISOString();
+
+    studioSchedulerLastFinishedAt =
+      summary.finishedAt;
+
+    studioSchedulerLastSummary =
+      summary;
+
+    console.error(
+      "BRAIN STUDIO SCHEDULER : erreur générale",
+      error
+    );
+
+    return summary;
+  } finally {
+    studioSchedulerRunning =
+      false;
+  }
+}
+
+/*
+ * Route permettant de lancer manuellement
+ * un cycle complet du scheduler.
+ *
+ * Exemples :
+ *
+ * /internal/run-studio-scheduler
+ *
+ * /internal/run-studio-scheduler?force=1
+ *
+ * /internal/run-studio-scheduler?hours=6&limit=10
+ */
+app.get(
+  "/internal/run-studio-scheduler",
+  async (req, res) => {
+    const force =
+      req.query.force === "1" ||
+      req.query.force === "true";
+
+    const lookaheadHours =
+      Number(
+        req.query.hours
+      ) ||
+      STUDIO_SCHEDULER_LOOKAHEAD_HOURS;
+
+    const refreshMinutes =
+      Number(
+        req.query.refreshMinutes
+      ) ||
+      STUDIO_SCHEDULER_REFRESH_MINUTES;
+
+    const limit =
+      Number(
+        req.query.limit
+      ) ||
+      STUDIO_SCHEDULER_MAX_MATCHES;
+
+    const summary =
+      await runAutomaticStudioScheduler({
+        source:
+          "manual-route",
+
+        force,
+        lookaheadHours,
+        refreshMinutes,
+        limit,
+      });
+
+    return res
+      .status(
+        summary.ok
+          ? 200
+          : 500
+      )
+      .json(summary);
+  }
+);
+
+/*
+ * Route de surveillance du scheduler.
+ */
+app.get(
+  "/internal/studio-scheduler-status",
+  async (req, res) => {
+    try {
+      const upcomingFixtures =
+        await getUpcomingStudioFixtures({
+          limit: 10,
+        });
+
+      return res.json({
+        ok: true,
+
+        running:
+          studioSchedulerRunning,
+
+        configuration: {
+          intervalMinutes:
+            STUDIO_SCHEDULER_INTERVAL_MS /
+            60000,
+
+          firstRunDelayMinutes:
+            STUDIO_SCHEDULER_FIRST_RUN_DELAY_MS /
+            60000,
+
+          lookaheadHours:
+            STUDIO_SCHEDULER_LOOKAHEAD_HOURS,
+
+          refreshMinutes:
+            STUDIO_SCHEDULER_REFRESH_MINUTES,
+
+          maxMatches:
+            STUDIO_SCHEDULER_MAX_MATCHES,
+
+          delayBetweenMatchesMs:
+            STUDIO_SCHEDULER_DELAY_BETWEEN_MATCHES_MS,
+        },
+
+        lastStartedAt:
+          studioSchedulerLastStartedAt,
+
+        lastFinishedAt:
+          studioSchedulerLastFinishedAt,
+
+        lastSummary:
+          studioSchedulerLastSummary,
+
+        upcomingCount:
+          upcomingFixtures.length,
+
+        upcomingFixtures:
+          upcomingFixtures.map(
+            (fixture) => ({
+              fixtureId:
+                fixture.fixture_id,
+
+              kickoff:
+                fixture.fixture_date,
+
+              league:
+                fixture.league_name,
+
+              homeTeam:
+                fixture.home_team_name,
+
+              awayTeam:
+                fixture.away_team_name,
+
+              studioSavedAt:
+                fixture.studio_saved_at,
+            })
+          ),
+      });
+    } catch (error) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "Impossible de lire le statut du scheduler",
+        });
+    }
+  }
+);
 app.listen(
   PORT,
   "0.0.0.0",
@@ -12362,7 +13164,40 @@ ensureStudioPredictionColumns()
     setInterval(() => {
       runAutomaticResultSync();
     }, 15 * 60 * 1000);
+/*
+ * Premier cycle Brain Studio trois minutes
+ * après le démarrage du serveur.
+ */
+setTimeout(() => {
+  runAutomaticStudioScheduler({
+    source:
+      "startup",
+  }).catch((error) => {
+    console.error(
+      "ERREUR DÉMARRAGE BRAIN STUDIO SCHEDULER :",
+      error
+    );
+  });
+}, STUDIO_SCHEDULER_FIRST_RUN_DELAY_MS);
 
+/*
+ * Brain Studio toutes les 15 minutes.
+ */
+setInterval(() => {
+  runAutomaticStudioScheduler({
+    source:
+      "interval",
+  }).catch((error) => {
+    console.error(
+      "ERREUR INTERVAL BRAIN STUDIO SCHEDULER :",
+      error
+    );
+  });
+}, STUDIO_SCHEDULER_INTERVAL_MS);
+
+console.log(
+  "✅ Brain Studio Scheduler : toutes les 15 min"
+);
     /*
      * IMPORTANT :
      * aucune analyse complète automatique
