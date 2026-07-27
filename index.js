@@ -10912,19 +10912,16 @@ async function saveStudioSnapshot({
 
   return result.rows[0];
 }
-      app.post(
+app.post(
   "/public/studio-snapshot/:fixtureId",
   async (req, res) => {
     try {
-      const fixtureId =
-        Number(
-          req.params.fixtureId
-        );
+      const fixtureId = Number(
+        req.params.fixtureId
+      );
 
       if (
-        !Number.isInteger(
-          fixtureId
-        ) ||
+        !Number.isInteger(fixtureId) ||
         fixtureId <= 0
       ) {
         return res
@@ -10954,6 +10951,101 @@ async function saveStudioSnapshot({
           });
       }
 
+      /*
+       * Vérifier la date du match avant
+       * d'autoriser la modification du snapshot.
+       */
+      const predictionResult =
+        await pool.query(
+          `
+            SELECT
+              fixture_id,
+              fixture_date,
+              result_status,
+              studio_market_key,
+              studio_market_label,
+              studio_saved_at
+            FROM predictions
+            WHERE fixture_id = $1
+            LIMIT 1
+          `,
+          [fixtureId]
+        );
+
+      const prediction =
+        predictionResult.rows[0];
+
+      if (!prediction) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "Prédiction Railway introuvable",
+          });
+      }
+
+      const fixtureDate =
+        prediction.fixture_date
+          ? new Date(
+              prediction.fixture_date
+            )
+          : null;
+
+      if (
+        fixtureDate &&
+        Number.isNaN(
+          fixtureDate.getTime()
+        )
+      ) {
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "Date du match invalide dans la base de données",
+          });
+      }
+
+      /*
+       * Dès que le coup d'envoi est atteint,
+       * le dernier snapshot Brain Studio
+       * enregistré est définitivement verrouillé.
+       */
+      if (
+        fixtureDate &&
+        fixtureDate.getTime() <=
+          Date.now()
+      ) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            locked: true,
+            fixtureId,
+            kickoff:
+              fixtureDate.toISOString(),
+            studioMarketKey:
+              prediction
+                .studio_market_key ||
+              null,
+            studioMarketLabel:
+              prediction
+                .studio_market_label ||
+              null,
+            studioSavedAt:
+              prediction
+                .studio_saved_at ||
+              null,
+            error:
+              "Le pronostic Brain Studio est verrouillé depuis le coup d’envoi.",
+          });
+      }
+
+      /*
+       * Avant le coup d'envoi, le nouveau
+       * marché Brain Studio remplace l'ancien.
+       */
       const saved =
         await saveStudioSnapshot({
           fixtureId,
@@ -10995,15 +11087,48 @@ async function saveStudioSnapshot({
 
           snapshot: {
             primaryMarket,
+
             generatedAt:
               new Date()
                 .toISOString(),
+
+            fixtureDate:
+              fixtureDate
+                ? fixtureDate
+                    .toISOString()
+                : null,
+
+            locked:
+              false,
           },
         });
 
       return res.json({
         ok: true,
-        prediction: saved,
+        locked: false,
+        replaced:
+          Boolean(
+            prediction
+              .studio_market_key
+          ),
+        previousSnapshot: {
+          marketKey:
+            prediction
+              .studio_market_key ||
+            null,
+
+          marketLabel:
+            prediction
+              .studio_market_label ||
+            null,
+
+          savedAt:
+            prediction
+              .studio_saved_at ||
+            null,
+        },
+        prediction:
+          saved,
       });
     } catch (error) {
       console.error(
