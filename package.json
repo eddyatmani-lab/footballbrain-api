@@ -1,10 +1,11 @@
 {
   "name": "footballbrain-api",
-  "version": "1.0.0",
+  "version": "2.2.0",
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "check": "node --check index.js && node --check FootballMonteCarlo.js && node --check cron-update-results.js && node --check src/services/FootballXGModel.js && node --check core/events/eventEngine.js && node --check routes/aiEventRoutes.js"
   },
   "keywords": [],
   "author": "",

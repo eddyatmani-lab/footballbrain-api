@@ -1,0 +1,1 @@
+Tous les fichiers JavaScript ont passé node --check sans erreur.
