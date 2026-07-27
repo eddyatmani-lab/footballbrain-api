@@ -11147,6 +11147,206 @@ app.post(
     }
   }
 );
+app.get(
+  "/public/studio-snapshot/:fixtureId",
+  async (req, res) => {
+    try {
+      const fixtureId = Number(
+        req.params.fixtureId
+      );
+
+      if (
+        !Number.isInteger(fixtureId) ||
+        fixtureId <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "fixtureId invalide",
+          });
+      }
+
+      const result =
+        await pool.query(
+          `
+            SELECT
+              fixture_id,
+              fixture_date,
+              home_team,
+              away_team,
+              result_status,
+
+              studio_market_key,
+              studio_market_label,
+              studio_probability,
+              studio_decision_score,
+              studio_decision_type,
+              studio_decision_grade,
+              studio_analysis_version,
+              studio_snapshot,
+              studio_saved_at,
+
+              updated_at
+            FROM predictions
+            WHERE fixture_id = $1
+            LIMIT 1
+          `,
+          [fixtureId]
+        );
+
+      const prediction =
+        result.rows[0];
+
+      if (!prediction) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "Prédiction Railway introuvable",
+          });
+      }
+
+      const fixtureDate =
+        prediction.fixture_date
+          ? new Date(
+              prediction.fixture_date
+            )
+          : null;
+
+      const fixtureDateIsValid =
+        fixtureDate &&
+        !Number.isNaN(
+          fixtureDate.getTime()
+        );
+
+      const locked =
+        fixtureDateIsValid
+          ? fixtureDate.getTime() <=
+            Date.now()
+          : false;
+
+      const hasStudioSnapshot =
+        Boolean(
+          prediction
+            .studio_market_key ||
+          prediction
+            .studio_market_label ||
+          prediction
+            .studio_snapshot
+        );
+
+      return res.json({
+        ok: true,
+
+        fixtureId:
+          prediction.fixture_id,
+
+        match: {
+          homeTeam:
+            prediction.home_team ||
+            null,
+
+          awayTeam:
+            prediction.away_team ||
+            null,
+
+          kickoff:
+            fixtureDateIsValid
+              ? fixtureDate
+                  .toISOString()
+              : null,
+
+          resultStatus:
+            prediction
+              .result_status ||
+            null,
+        },
+
+        studio: {
+          available:
+            hasStudioSnapshot,
+
+          locked,
+
+          marketKey:
+            prediction
+              .studio_market_key ||
+            null,
+
+          marketLabel:
+            prediction
+              .studio_market_label ||
+            null,
+
+          probability:
+            prediction
+              .studio_probability != null
+              ? Number(
+                  prediction
+                    .studio_probability
+                )
+              : null,
+
+          decisionScore:
+            prediction
+              .studio_decision_score !=
+            null
+              ? Number(
+                  prediction
+                    .studio_decision_score
+                )
+              : null,
+
+          decisionType:
+            prediction
+              .studio_decision_type ||
+            null,
+
+          decisionGrade:
+            prediction
+              .studio_decision_grade ||
+            null,
+
+          analysisVersion:
+            prediction
+              .studio_analysis_version ||
+            null,
+
+          savedAt:
+            prediction
+              .studio_saved_at ||
+            null,
+
+          snapshot:
+            prediction
+              .studio_snapshot ||
+            null,
+        },
+
+        updatedAt:
+          prediction.updated_at ||
+          null,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR LECTURE STUDIO SNAPSHOT :",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "Erreur inconnue",
+        });
+    }
+  }
+);
 app.listen(
   PORT,
   "0.0.0.0",
