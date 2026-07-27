@@ -8597,11 +8597,22 @@ app.get(
             monte_carlo_weight,
 
             decision_trace,
-model_inputs,
-monte_carlo_model,
-analysis_context,
-explanation,
-updated_at
+            model_inputs,
+            monte_carlo_model,
+            analysis_context,
+            explanation,
+
+            studio_market_key,
+            studio_market_label,
+            studio_probability,
+            studio_decision_score,
+            studio_decision_type,
+            studio_decision_grade,
+            studio_analysis_version,
+            studio_snapshot,
+            studio_saved_at,
+
+            updated_at
           FROM predictions
           WHERE fixture_id = $1
           LIMIT 1
