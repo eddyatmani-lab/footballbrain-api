@@ -800,12 +800,7 @@ const awayResults = awayRecentForm.map(
   (match) => getTeamResult(match, awayTeamId)
 );
 const rawOdds = oddsResponse.data?.response || [];
-console.log(
-  rawOdds[0]?.bookmakers?.map(b => ({
-    id: b.id,
-    name: b.name,
-  }))
-);
+
 const market = summarizeMatchWinnerOdds(rawOdds);
 
 const injuries =
@@ -1219,24 +1214,7 @@ officialXgSource,
           
 
 
-console.log("CONTEXT DEBUG", {
-  keys: Object.keys(result.analysis || {}),
-  injuries:
-    result.analysis?.injuries ||
-    result.analysis?.injuriesSummary ||
-    result.analysis?.context?.injuries ||
-    null,
-  lineups:
-    result.analysis?.lineups ||
-    result.analysis?.lineupsSummary ||
-    result.analysis?.context?.lineups ||
-    null,
-  fatigue:
-    result.analysis?.fatigue ||
-    result.analysis?.fatigueSummary ||
-    result.analysis?.context?.fatigue ||
-    null,
-});
+
 await savePredictionToDatabase(
   result.analysis
 );
