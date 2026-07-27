@@ -296,6 +296,135 @@ function createDecisionExplainability({
   };
 }
 
+function createMarketExplainability({
+  marketKey,
+  marketLabel,
+  probability,
+  decisionScore,
+  decisionGrade,
+  decisionType,
+  confidence,
+  risk,
+  fairOdd,
+  marketOdd,
+  value,
+  monteCarloAvailable = false,
+} = {}) {
+  const normalizedProbability = finiteNumber(probability, null);
+  const normalizedScore = finiteNumber(decisionScore, null);
+  const normalizedConfidence = finiteNumber(confidence, 50);
+  const normalizedValue = finiteNumber(value, null);
+
+  const factors = [];
+
+  if (normalizedProbability !== null) {
+    const probabilityInfluence = round(
+      clamp((normalizedProbability - 50) / 3, -15, 15),
+      1
+    );
+
+    factors.push({
+      key: "marketProbability",
+      label: "Probabilité du marché analysé",
+      available: true,
+      direction:
+        normalizedProbability >= 60
+          ? "positive"
+          : normalizedProbability < 45
+            ? "negative"
+            : "neutral",
+      influencePoints: probabilityInfluence,
+      explanation: `${marketLabel || "Marché sélectionné"} est estimé à ${normalizedProbability} % par FootballBrain.`,
+    });
+  }
+
+  if (normalizedScore !== null) {
+    factors.push({
+      key: "decisionScore",
+      label: "Decision Score FootballBrain",
+      available: true,
+      direction:
+        normalizedScore >= 75
+          ? "positive"
+          : normalizedScore < 55
+            ? "negative"
+            : "neutral",
+      influencePoints: round(clamp((normalizedScore - 50) / 3, -15, 15), 1),
+      explanation: `Le marché obtient un Decision Score de ${normalizedScore}/100${decisionGrade ? `, grade ${decisionGrade}` : ""}.`,
+    });
+  }
+
+  factors.push({
+    key: "confidence",
+    label: "Confiance et risque",
+    available: true,
+    direction:
+      normalizedConfidence >= 70
+        ? "positive"
+        : normalizedConfidence < 55
+          ? "negative"
+          : "neutral",
+    influencePoints: round(clamp((normalizedConfidence - 50) / 4, -12, 12), 1),
+    explanation: `Confiance globale ${normalizedConfidence}/100, risque ${risk || "non défini"}.`,
+  });
+
+  if (monteCarloAvailable) {
+    factors.push({
+      key: "monteCarlo",
+      label: "Simulation Monte Carlo",
+      available: true,
+      direction: "positive",
+      influencePoints: round(clamp(((normalizedProbability || 50) - 50) / 4, 0, 12), 1),
+      explanation: `La probabilité de ce marché provient des simulations Monte Carlo du match.`,
+    });
+  }
+
+  factors.push(
+    buildMarketValueFactor({
+      value: normalizedValue,
+      fairOdd,
+      marketOdd,
+      betStatus: decisionType,
+    })
+  );
+
+  const rankedFactors = factors
+    .filter((factor) => factor.available)
+    .sort((a, b) => Math.abs(b.influencePoints) - Math.abs(a.influencePoints));
+
+  const positiveFactors = rankedFactors.filter((factor) => factor.direction === "positive");
+  const negativeFactors = rankedFactors.filter((factor) => factor.direction === "negative");
+
+  const recommendationText =
+    decisionType === "VALUE_BET"
+      ? "FootballBrain détecte également une value suffisante."
+      : decisionType === "NO_BET"
+        ? "Le marché est probable, mais FootballBrain ne le considère pas forcément rentable."
+        : "La décision combine probabilité, score, confiance, risque et value.";
+
+  return {
+    version: "footballbrain-explainability-v2",
+    methodology:
+      "Cette explication porte sur le véritable marché principal choisi par FootballBrain, et non uniquement sur le scénario 1/X/2. Les points d'influence sont des indicateurs relatifs.",
+    selectedOutcome: marketKey || null,
+    selectedLabel: marketLabel || "Marché FootballBrain",
+    selectedProbability: normalizedProbability,
+    headline: `Pourquoi ${marketLabel || "ce marché"} à ${normalizedProbability ?? "N/A"} % ?`,
+    summary: `${marketLabel || "Le marché sélectionné"} est la décision principale de FootballBrain. ${recommendationText}`,
+    factors: rankedFactors,
+    topFactors: rankedFactors.slice(0, 5),
+    supportingFactors: positiveFactors.slice(0, 3),
+    limitingFactors: negativeFactors.slice(0, 3),
+    sourceAgreement: {
+      monteCarloAgrees: monteCarloAvailable ? true : null,
+      monteCarloFavorite: marketKey || null,
+      sourcesSupportingOutcome: positiveFactors.length,
+      sourcesAvailable: rankedFactors.length,
+    },
+  };
+}
+
 module.exports = {
   createDecisionExplainability,
+  createMarketExplainability,
 };

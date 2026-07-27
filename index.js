@@ -22,6 +22,7 @@ const {
 } = require("./routes/aiEventRoutes");
 const {
   createDecisionExplainability,
+  createMarketExplainability,
 } = require("./core/explainability/decisionExplainability");
 const app = express();
 app.use(
@@ -8296,6 +8297,83 @@ app.get("/internal/db-migrate-xg", async (req, res) => {
 function buildStoredPredictionExplainability(
   prediction
 ) {
+  const studioPrimaryMarket =
+    prediction.studio_snapshot?.primaryMarket ||
+    prediction.studio_snapshot?.bestDecision ||
+    null;
+
+  const studioMarketKey =
+    prediction.studio_market_key ||
+    studioPrimaryMarket?.key ||
+    null;
+
+  const studioMarketLabel =
+    prediction.studio_market_label ||
+    studioPrimaryMarket?.label ||
+    null;
+
+  const studioProbability =
+    prediction.studio_probability ??
+    studioPrimaryMarket?.probability ??
+    studioPrimaryMarket?.fairOdds?.calibratedProbability ??
+    null;
+
+  const studioDecisionScore =
+    prediction.studio_decision_score ??
+    studioPrimaryMarket?.decision?.score ??
+    studioPrimaryMarket?.score ??
+    null;
+
+  const studioDecisionType =
+    prediction.studio_decision_type ||
+    studioPrimaryMarket?.decision?.type ||
+    null;
+
+  if (
+    studioMarketLabel &&
+    studioProbability !== null
+  ) {
+    const monteCarloMarketKeys =
+      new Set([
+        "OVER25",
+        "UNDER25",
+        "BTTS",
+      ]);
+
+    return createMarketExplainability({
+      marketKey: studioMarketKey,
+      marketLabel: studioMarketLabel,
+      probability: studioProbability,
+      decisionScore: studioDecisionScore,
+      decisionGrade:
+        prediction.studio_decision_grade ||
+        studioPrimaryMarket?.decision?.grade ||
+        null,
+      decisionType: studioDecisionType,
+      confidence: prediction.confidence,
+      risk: prediction.risk,
+      fairOdd:
+        studioPrimaryMarket?.fairOdds?.fairOdds ??
+        studioPrimaryMarket?.rawFairOdds ??
+        prediction.fair_odd,
+      marketOdd:
+        studioPrimaryMarket?.fairOdds?.bookmakerOdds ??
+        studioPrimaryMarket?.bookmakerOdds ??
+        prediction.market_odd,
+      value:
+        studioPrimaryMarket?.fairOdds?.valueEdge ??
+        studioPrimaryMarket?.valueEdge ??
+        prediction.value_percentage,
+      monteCarloAvailable:
+        monteCarloMarketKeys.has(
+          String(studioMarketKey || "").toUpperCase()
+        ) ||
+        Boolean(
+          prediction.monte_carlo_model?.simulations
+        ),
+    });
+  }
+
   const probabilities = {
     home:
       Number(
