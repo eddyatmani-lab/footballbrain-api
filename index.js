@@ -20,6 +20,9 @@ const {
 const {
   registerAIEventRoutes,
 } = require("./routes/aiEventRoutes");
+const {
+  createDecisionExplainability,
+} = require("./core/explainability/decisionExplainability");
 const app = express();
 app.use(
   cors({
@@ -1717,7 +1720,53 @@ const decisionTrace = [
   }%`,
 
   `Décision finale = ${betStatus}`,
+
 ];
+
+const explainability =
+  createDecisionExplainability({
+    selectedOutcome: bestOption.key,
+    selectedProbability:
+      bestOption.probability,
+    probabilities,
+    weights: {
+      form: formWeight,
+      market: marketWeight,
+      monteCarlo: monteCarloWeight,
+    },
+    modelInputs: {
+      form: {
+        home: homeFormProbability,
+        draw: drawFormProbability,
+        away: awayFormProbability,
+      },
+      market: {
+        home: homeMarketProbability,
+        draw: drawMarketProbability,
+        away: awayMarketProbability,
+      },
+      monteCarlo: {
+        home: monteCarloHomeProbability,
+        draw: monteCarloDrawProbability,
+        away: monteCarloAwayProbability,
+      },
+    },
+    monteCarlo: {
+      available: monteCarloAvailable,
+      favorite:
+        monteCarloFavorite?.key || null,
+      probability:
+        monteCarloFavorite?.probability || null,
+      agrees: monteCarloAgreement,
+    },
+    confidence,
+    risk,
+    fairOdd,
+    marketOdd: bestOption.odd || null,
+    value,
+    betStatus,
+    probabilityGap,
+  });
 
 return {
   probabilities,
@@ -1780,6 +1829,7 @@ modelInputs: {
 },
 
 decisionTrace,
+explainability,
 
 monteCarlo: {
   available: monteCarloAvailable,
@@ -1938,6 +1988,9 @@ function saveFootballBrainPrediction(analysis) {
 
       explanation:
         analysis.footballBrainDecision?.explanation,
+
+      explainability:
+        analysis.footballBrainDecision?.explainability,
     },
 
     result: {
