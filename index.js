@@ -11349,6 +11349,982 @@ app.get(
     }
   }
 );
+/*
+ * ============================================================
+ * BRAIN STUDIO — GÉNÉRATION AUTOMATIQUE CÔTÉ RAILWAY
+ * ============================================================
+ */
+
+let automaticStudioRebuildRunning = false;
+
+function studioNumber(
+  value,
+  fallback = 0
+) {
+  const number = Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
+}
+
+function studioClamp(
+  value,
+  minimum = 0,
+  maximum = 100
+) {
+  return Math.max(
+    minimum,
+    Math.min(
+      maximum,
+      studioNumber(value)
+    )
+  );
+}
+
+function studioProbabilityToOdd(
+  probability
+) {
+  const normalizedProbability =
+    studioNumber(probability);
+
+  if (normalizedProbability <= 0) {
+    return null;
+  }
+
+  return Number(
+    (
+      100 /
+      normalizedProbability
+    ).toFixed(2)
+  );
+}
+
+function studioRiskToScore(risk) {
+  const normalizedRisk =
+    String(risk || "")
+      .trim()
+      .toLowerCase();
+
+  if (
+    normalizedRisk.includes("faible")
+  ) {
+    return 30;
+  }
+
+  if (
+    normalizedRisk.includes("mod")
+  ) {
+    return 50;
+  }
+
+  if (
+    normalizedRisk.includes("élev") ||
+    normalizedRisk.includes("elev")
+  ) {
+    return 75;
+  }
+
+  return 60;
+}
+
+function getStudioDecisionGrade(
+  score
+) {
+  const normalizedScore =
+    studioNumber(score);
+
+  if (normalizedScore >= 75) {
+    return "A";
+  }
+
+  if (normalizedScore >= 60) {
+    return "B";
+  }
+
+  if (normalizedScore >= 45) {
+    return "C";
+  }
+
+  return "D";
+}
+
+function getStudioDecisionStars(
+  score
+) {
+  const normalizedScore =
+    studioNumber(score);
+
+  if (normalizedScore >= 75) {
+    return 4;
+  }
+
+  if (normalizedScore >= 60) {
+    return 3;
+  }
+
+  if (normalizedScore >= 45) {
+    return 2;
+  }
+
+  return 1;
+}
+
+function normalizeAutomaticStudioOutcome(
+  prediction = {}
+) {
+  const explicitOutcome =
+    prediction.selected_outcome ||
+    prediction.selectedOutcome ||
+    null;
+
+  if (explicitOutcome) {
+    return String(explicitOutcome)
+      .trim()
+      .toLowerCase();
+  }
+
+  const probabilities = {
+    home:
+      studioNumber(
+        prediction.home_probability
+      ),
+
+    draw:
+      studioNumber(
+        prediction.draw_probability
+      ),
+
+    away:
+      studioNumber(
+        prediction.away_probability
+      ),
+  };
+
+  return (
+    Object.entries(probabilities)
+      .sort(
+        (a, b) =>
+          b[1] - a[1]
+      )[0]?.[0] ||
+    null
+  );
+}
+
+function buildAutomaticStudioMarket({
+  key,
+  label,
+  family,
+  probability,
+  selectedOutcome,
+  prediction,
+  monteCarloModel,
+}) {
+  const normalizedProbability =
+    studioClamp(probability);
+
+  const confidence =
+    studioClamp(
+      prediction.confidence
+    );
+
+  const riskScore =
+    studioRiskToScore(
+      prediction.risk
+    );
+
+  const normalizedBetStatus =
+    String(
+      prediction.bet_status ||
+      prediction.betStatus ||
+      "NO_BET"
+    )
+      .trim()
+      .toUpperCase();
+
+  const normalizedKey =
+    String(key || "")
+      .trim()
+      .toLowerCase();
+
+  const isSelectedOutcome =
+    normalizedKey ===
+    String(
+      selectedOutcome || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const isRecommended =
+    isSelectedOutcome &&
+    (
+      normalizedBetStatus ===
+        "BET" ||
+      normalizedBetStatus ===
+        "VALUE_BET"
+    );
+
+  const decisionScore =
+    Math.round(
+      studioClamp(
+        normalizedProbability * 0.55 +
+        confidence * 0.35 +
+        (100 - riskScore) * 0.1
+      )
+    );
+
+  const fairOdd =
+    studioProbabilityToOdd(
+      normalizedProbability
+    );
+
+  const marketOdd =
+    isSelectedOutcome
+      ? prediction.market_odd ??
+        prediction.marketOdd ??
+        null
+      : null;
+
+  const value =
+    isSelectedOutcome
+      ? prediction.value_percentage ??
+        prediction.value ??
+        null
+      : null;
+
+  const decisionType =
+    isRecommended
+      ? normalizedBetStatus
+      : "NO_BET";
+
+  const decisionGrade =
+    getStudioDecisionGrade(
+      decisionScore
+    );
+
+  return {
+    key,
+    label,
+    family,
+
+    probability:
+      normalizedProbability,
+
+    score:
+      decisionScore,
+
+    rawProbability:
+      normalizedProbability,
+
+    calibratedProbability:
+      normalizedProbability,
+
+    rawFairOdds:
+      fairOdd,
+
+    bookmakerOdds:
+      marketOdd,
+
+    valueEdge:
+      value,
+
+    expectedValue:
+      value,
+
+    expectedValuePercent:
+      value,
+
+    isValueBet:
+      decisionType ===
+      "VALUE_BET",
+
+    oddsAvailable:
+      marketOdd != null,
+
+    fairOdds: {
+      rawProbability:
+        normalizedProbability,
+
+      calibratedProbability:
+        normalizedProbability,
+
+      rawFairOdds:
+        fairOdd,
+
+      fairOdds:
+        fairOdd,
+
+      bookmakerOdds:
+        marketOdd,
+
+      valueEdge:
+        value,
+
+      expectedValue:
+        value,
+
+      expectedValuePercent:
+        value,
+
+      isValueBet:
+        decisionType ===
+        "VALUE_BET",
+
+      oddsAvailable:
+        marketOdd != null,
+
+      quality: {
+        label:
+          normalizedProbability > 0
+            ? "Calcul Railway"
+            : "Indisponible",
+
+        grade:
+          normalizedProbability >= 60
+            ? "A"
+            : normalizedProbability >= 45
+            ? "B"
+            : normalizedProbability >= 30
+            ? "C"
+            : "D",
+
+        stars:
+          normalizedProbability >= 60
+            ? 4
+            : normalizedProbability >= 45
+            ? 3
+            : normalizedProbability >= 30
+            ? 2
+            : 1,
+      },
+    },
+
+    decision: {
+      score:
+        decisionScore,
+
+      grade:
+        decisionGrade,
+
+      stars:
+        getStudioDecisionStars(
+          decisionScore
+        ),
+
+      type:
+        decisionType,
+
+      label:
+        isRecommended
+          ? prediction.decision ||
+            label
+          : "Aucun pari recommandé",
+
+      shortLabel:
+        isRecommended
+          ? "Recommandé"
+          : "À éviter",
+
+      recommendationStrength:
+        isRecommended
+          ? "strong"
+          : "none",
+
+      eligibleForPrudentTicket:
+        isRecommended &&
+        confidence >= 70 &&
+        riskScore <= 50,
+
+      eligibleForFunTicket:
+        isRecommended,
+
+      reasons:
+        Array.isArray(
+          prediction.decision_trace
+        )
+          ? prediction.decision_trace
+          : [],
+
+      warnings:
+        decisionType === "NO_BET"
+          ? [
+              "Décision finale : NO_BET",
+            ]
+          : [],
+
+      marketConsensus: {
+        score:
+          confidence,
+
+        alignedVotes:
+          isRecommended ? 3 : 1,
+
+        totalVotes: 4,
+
+        votes: [
+          {
+            engine:
+              "Railway Probability",
+
+            aligned:
+              isSelectedOutcome,
+
+            strength:
+              normalizedProbability,
+
+            reason:
+              `Probabilité estimée : ${normalizedProbability}%`,
+          },
+
+          {
+            engine:
+              "Monte Carlo",
+
+            aligned:
+              Boolean(
+                monteCarloModel
+                  ?.simulations
+              ),
+
+            strength:
+              monteCarloModel
+                ?.simulations
+                ? 100
+                : 0,
+
+            reason:
+              monteCarloModel
+                ?.simulations
+                ? `${monteCarloModel.simulations} simulations`
+                : "Monte Carlo indisponible",
+          },
+
+          {
+            engine:
+              "Risk Engine",
+
+            aligned:
+              riskScore <= 50,
+
+            strength:
+              100 - riskScore,
+
+            reason:
+              `Risque : ${
+                prediction.risk ||
+                "inconnu"
+              }`,
+          },
+        ],
+      },
+    },
+
+    evaluation: {
+      evaluated: false,
+      result: "pending",
+      won: null,
+    },
+  };
+}
+
+function buildAutomaticStudioSnapshot(
+  prediction
+) {
+  const monteCarloModel =
+    prediction.monte_carlo_model &&
+    typeof prediction
+      .monte_carlo_model ===
+      "object"
+      ? prediction
+          .monte_carlo_model
+      : {};
+
+  const selectedOutcome =
+    normalizeAutomaticStudioOutcome(
+      prediction
+    );
+
+  const homeName =
+    prediction.home_team_name ||
+    "Domicile";
+
+  const awayName =
+    prediction.away_team_name ||
+    "Extérieur";
+
+  const markets = [
+    buildAutomaticStudioMarket({
+      key: "HOME",
+
+      label:
+        `Victoire ${homeName}`,
+
+      family: "1x2",
+
+      probability:
+        prediction.home_probability,
+
+      selectedOutcome,
+      prediction,
+      monteCarloModel,
+    }),
+
+    buildAutomaticStudioMarket({
+      key: "DRAW",
+      label: "Match nul",
+      family: "1x2",
+
+      probability:
+        prediction.draw_probability,
+
+      selectedOutcome,
+      prediction,
+      monteCarloModel,
+    }),
+
+    buildAutomaticStudioMarket({
+      key: "AWAY",
+
+      label:
+        `Victoire ${awayName}`,
+
+      family: "1x2",
+
+      probability:
+        prediction.away_probability,
+
+      selectedOutcome,
+      prediction,
+      monteCarloModel,
+    }),
+  ];
+
+  const bttsProbability =
+    Number(
+      monteCarloModel.btts
+    );
+
+  if (
+    Number.isFinite(
+      bttsProbability
+    )
+  ) {
+    markets.push(
+      buildAutomaticStudioMarket({
+        key: "BTTS",
+
+        label:
+          "Les deux équipes marquent",
+
+        family: "goals",
+
+        probability:
+          bttsProbability,
+
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      })
+    );
+  }
+
+  const over25Probability =
+    Number(
+      monteCarloModel.over25
+    );
+
+  if (
+    Number.isFinite(
+      over25Probability
+    )
+  ) {
+    markets.push(
+      buildAutomaticStudioMarket({
+        key: "OVER25",
+
+        label:
+          "Plus de 2.5 buts",
+
+        family: "goals",
+
+        probability:
+          over25Probability,
+
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      }),
+
+      buildAutomaticStudioMarket({
+        key: "UNDER25",
+
+        label:
+          "Moins de 2.5 buts",
+
+        family: "goals",
+
+        probability:
+          Math.max(
+            0,
+            100 -
+              over25Probability
+          ),
+
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      })
+    );
+  }
+
+  const sortedMarkets =
+    [...markets].sort(
+      (a, b) => {
+        const scoreDifference =
+          studioNumber(
+            b?.decision?.score
+          ) -
+          studioNumber(
+            a?.decision?.score
+          );
+
+        if (
+          scoreDifference !== 0
+        ) {
+          return scoreDifference;
+        }
+
+        return (
+          studioNumber(
+            b?.fairOdds
+              ?.calibratedProbability
+          ) -
+          studioNumber(
+            a?.fairOdds
+              ?.calibratedProbability
+          )
+        );
+      }
+    );
+
+  const primaryMarket =
+    sortedMarkets[0] ||
+    null;
+
+  return {
+    version:
+      "brain-studio-railway-v1",
+
+    generatedAt:
+      new Date().toISOString(),
+
+    fixtureId:
+      prediction.fixture_id,
+
+    match: {
+      fixtureId:
+        prediction.fixture_id,
+
+      date:
+        prediction.fixture_date,
+
+      league:
+        prediction.league_name,
+
+      homeTeam:
+        homeName,
+
+      awayTeam:
+        awayName,
+    },
+
+    selectedOutcome,
+
+    primaryMarket,
+
+    bestDecision:
+      primaryMarket,
+
+    markets:
+      sortedMarkets,
+
+    context:
+      prediction.analysis_context ||
+      null,
+
+    modelInputs:
+      prediction.model_inputs ||
+      null,
+
+    monteCarloModel,
+
+    decisionTrace:
+      Array.isArray(
+        prediction.decision_trace
+      )
+        ? prediction.decision_trace
+        : [],
+  };
+}
+
+async function rebuildAutomaticStudioSnapshot(
+  fixtureId
+) {
+  const normalizedFixtureId =
+    Number(fixtureId);
+
+  if (
+    !Number.isInteger(
+      normalizedFixtureId
+    ) ||
+    normalizedFixtureId <= 0
+  ) {
+    throw new Error(
+      "fixtureId invalide"
+    );
+  }
+
+  /*
+   * Recharge l’analyse générale avant
+   * de fabriquer Brain Studio.
+   */
+  const baseUrl =
+    `http://127.0.0.1:${PORT}`;
+
+  const analysisResponse =
+    await fetch(
+      `${baseUrl}/internal/analyze/${normalizedFixtureId}?refresh=1`,
+      {
+        method: "GET",
+
+        headers: {
+          Accept:
+            "application/json",
+        },
+      }
+    );
+
+  const analysisData =
+    await analysisResponse.json();
+
+  if (
+    !analysisResponse.ok ||
+    !analysisData?.ok
+  ) {
+    throw new Error(
+      analysisData?.error ||
+      "Impossible de rafraîchir l’analyse Railway"
+    );
+  }
+
+  const predictionResult =
+    await pool.query(
+      `
+        SELECT
+          fixture_id,
+          fixture_date,
+
+          league_id,
+          league_name,
+
+          home_team_id,
+          home_team_name,
+          away_team_id,
+          away_team_name,
+
+          decision,
+          selected_outcome,
+          bet_status,
+
+          confidence,
+          risk,
+
+          home_probability,
+          draw_probability,
+          away_probability,
+
+          fair_odd,
+          market_odd,
+          value_percentage,
+
+          decision_trace,
+          model_inputs,
+          monte_carlo_model,
+          analysis_context,
+
+          result_status,
+
+          studio_saved_at,
+          created_at,
+          updated_at
+        FROM predictions
+        WHERE fixture_id = $1
+        LIMIT 1
+      `,
+      [
+        normalizedFixtureId,
+      ]
+    );
+
+  const prediction =
+    predictionResult.rows[0];
+
+  if (!prediction) {
+    throw new Error(
+      "Prédiction Railway introuvable"
+    );
+  }
+
+  const kickoff =
+    prediction.fixture_date
+      ? new Date(
+          prediction.fixture_date
+        )
+      : null;
+
+  if (
+    kickoff &&
+    !Number.isNaN(
+      kickoff.getTime()
+    ) &&
+    kickoff.getTime() <=
+      Date.now()
+  ) {
+    return {
+      fixtureId:
+        normalizedFixtureId,
+
+      locked: true,
+      saved: false,
+
+      reason:
+        "MATCH_STARTED",
+    };
+  }
+
+  const studioSnapshot =
+    buildAutomaticStudioSnapshot(
+      prediction
+    );
+
+  const primaryMarket =
+    studioSnapshot.primaryMarket;
+
+  if (!primaryMarket) {
+    throw new Error(
+      "Aucun marché Brain Studio disponible"
+    );
+  }
+
+  const saved =
+    await saveStudioSnapshot({
+      fixtureId:
+        normalizedFixtureId,
+
+      marketKey:
+        primaryMarket.key,
+
+      marketLabel:
+        primaryMarket.label,
+
+      probability:
+        primaryMarket
+          ?.fairOdds
+          ?.calibratedProbability ??
+        primaryMarket.probability,
+
+      decisionScore:
+        primaryMarket
+          ?.decision
+          ?.score ??
+        primaryMarket.score,
+
+      decisionType:
+        primaryMarket
+          ?.decision
+          ?.type,
+
+      decisionGrade:
+        primaryMarket
+          ?.decision
+          ?.grade,
+
+      analysisVersion:
+        studioSnapshot.version,
+
+      snapshot:
+        studioSnapshot,
+    });
+
+  return {
+    fixtureId:
+      normalizedFixtureId,
+
+    locked: false,
+    saved: true,
+
+    primaryMarket,
+
+    prediction:
+      saved,
+  };
+}
+
+/*
+ * Route manuelle de test.
+ *
+ * Exemple :
+ * /internal/rebuild-studio-snapshot/123456
+ */
+app.get(
+  "/internal/rebuild-studio-snapshot/:fixtureId",
+  async (req, res) => {
+    if (
+      automaticStudioRebuildRunning
+    ) {
+      return res
+        .status(409)
+        .json({
+          ok: false,
+          error:
+            "Une reconstruction Brain Studio est déjà en cours",
+        });
+    }
+
+    automaticStudioRebuildRunning =
+      true;
+
+    try {
+      const result =
+        await rebuildAutomaticStudioSnapshot(
+          req.params.fixtureId
+        );
+
+      return res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR REBUILD BRAIN STUDIO :",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "Erreur inconnue",
+        });
+    } finally {
+      automaticStudioRebuildRunning =
+        false;
+    }
+  }
+);
 app.listen(
   PORT,
   "0.0.0.0",
