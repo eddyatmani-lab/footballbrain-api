@@ -800,7 +800,12 @@ const awayResults = awayRecentForm.map(
   (match) => getTeamResult(match, awayTeamId)
 );
 const rawOdds = oddsResponse.data?.response || [];
-
+console.log(
+  rawOdds[0]?.bookmakers?.map(b => ({
+    id: b.id,
+    name: b.name,
+  }))
+);
 const market = summarizeMatchWinnerOdds(rawOdds);
 
 const injuries =
