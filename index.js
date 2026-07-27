@@ -10802,18 +10802,22 @@ app.get(
   async (req, res) => {
     try {
       const requestedLimit =
-        Number(req.query.limit);
+  Number(req.query.limit);
 
-      const limit =
-        Number.isInteger(
-          requestedLimit
-        ) &&
-        requestedLimit > 0
-          ? Math.min(
-              requestedLimit,
-              1000
-            )
-          : 300;
+const requestedOffset =
+  Number(req.query.offset);
+
+const limit =
+  Number.isInteger(requestedLimit) &&
+  requestedLimit > 0
+    ? Math.min(requestedLimit, 300)
+    : 300;
+
+const offset =
+  Number.isInteger(requestedOffset) &&
+  requestedOffset >= 0
+    ? requestedOffset
+    : 0;
 
       const result =
         await pool.query(
@@ -10894,21 +10898,34 @@ studio_saved_at,
               AND home_goals IS NOT NULL
               AND away_goals IS NOT NULL
             ORDER BY
-              fixture_date DESC
-            LIMIT $1
+  fixture_date DESC,
+  fixture_id DESC
+LIMIT $1
+OFFSET $2
           `,
-          [limit]
+          [
+  limit,
+  offset
+]
         );
 
       return res.json({
-        ok: true,
+  ok: true,
 
-        count:
-          result.rows.length,
+  count: result.rows.length,
 
-        predictions:
-          result.rows,
-      });
+  limit,
+  offset,
+
+  hasMore:
+    result.rows.length === limit,
+
+  nextOffset:
+    offset + result.rows.length,
+
+  predictions:
+    result.rows,
+});
     } catch (error) {
       console.error(
         "ERREUR /public/learning/finished :",
