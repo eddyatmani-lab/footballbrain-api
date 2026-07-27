@@ -13127,6 +13127,952 @@ app.get(
     }
   }
 );
+    /*
+ * ============================================================
+ * FOOTBALLBRAIN — LEARNING ENGINE V1
+ * ============================================================
+ *
+ * Phase 1 :
+ * - analyse des prédictions terminées ;
+ * - statistiques par marché ;
+ * - statistiques par grade ;
+ * - statistiques par type de décision ;
+ * - calcul d'un coefficient prudent ;
+ * - aucune modification automatique des prédictions pour l'instant.
+ */
+
+let learningEngineRunning = false;
+
+const LEARNING_ENGINE_VERSION =
+  "learning-engine-v1";
+
+const LEARNING_MIN_SAMPLE_SIZE = 20;
+
+const LEARNING_TARGET_WIN_RATE = 55;
+
+/*
+ * Valeur toujours comprise entre min et max.
+ */
+function clampLearningNumber(
+  value,
+  min,
+  max
+) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return min;
+  }
+
+  return Math.max(
+    min,
+    Math.min(max, number)
+  );
+}
+
+/*
+ * Crée les tables nécessaires au Learning Engine.
+ */
+async function ensureLearningEngineTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS
+      learning_market_stats (
+        id SERIAL PRIMARY KEY,
+
+        market_key TEXT NOT NULL,
+        decision_grade TEXT NOT NULL,
+        decision_type TEXT NOT NULL,
+
+        sample_size INTEGER NOT NULL DEFAULT 0,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0,
+
+        win_rate NUMERIC(7,3) NOT NULL DEFAULT 0,
+        average_probability NUMERIC(7,3),
+        average_confidence NUMERIC(7,3),
+        average_market_odd NUMERIC(10,3),
+        average_value NUMERIC(10,3),
+
+        total_profit NUMERIC(12,3) NOT NULL DEFAULT 0,
+        roi NUMERIC(10,3) NOT NULL DEFAULT 0,
+
+        calibration_gap NUMERIC(10,3) NOT NULL DEFAULT 0,
+
+        raw_weight NUMERIC(8,5) NOT NULL DEFAULT 1,
+        applied_weight NUMERIC(8,5) NOT NULL DEFAULT 1,
+
+        reliability_level TEXT NOT NULL DEFAULT 'INSUFFICIENT_DATA',
+
+        engine_version TEXT NOT NULL,
+
+        calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        UNIQUE (
+          market_key,
+          decision_grade,
+          decision_type
+        )
+      );
+
+    CREATE TABLE IF NOT EXISTS
+      learning_runs (
+        id SERIAL PRIMARY KEY,
+
+        engine_version TEXT NOT NULL,
+
+        predictions_found INTEGER NOT NULL DEFAULT 0,
+        groups_calculated INTEGER NOT NULL DEFAULT 0,
+
+        started_at TIMESTAMPTZ NOT NULL,
+        finished_at TIMESTAMPTZ,
+
+        status TEXT NOT NULL DEFAULT 'RUNNING',
+        error_message TEXT,
+
+        summary JSONB,
+
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+    CREATE INDEX IF NOT EXISTS
+      learning_market_stats_market_idx
+    ON learning_market_stats (
+      market_key
+    );
+
+    CREATE INDEX IF NOT EXISTS
+      learning_market_stats_reliability_idx
+    ON learning_market_stats (
+      reliability_level
+    );
+
+    CREATE INDEX IF NOT EXISTS
+      learning_runs_started_idx
+    ON learning_runs (
+      started_at DESC
+    );
+  `);
+
+  console.log(
+    "✅ Tables Learning Engine vérifiées"
+  );
+}
+
+/*
+ * Détermine le niveau de confiance statistique.
+ */
+function getLearningReliabilityLevel(
+  sampleSize
+) {
+  const count = Number(sampleSize) || 0;
+
+  if (count >= 200) {
+    return "HIGH";
+  }
+
+  if (count >= 80) {
+    return "MEDIUM";
+  }
+
+  if (
+    count >=
+    LEARNING_MIN_SAMPLE_SIZE
+  ) {
+    return "LOW";
+  }
+
+  return "INSUFFICIENT_DATA";
+}
+
+/*
+ * Calcule un coefficient très prudent.
+ *
+ * Le poids reste volontairement entre
+ * 0.90 et 1.10 afin d'éviter qu'une petite
+ * série de résultats dérègle le moteur.
+ */
+function calculateLearningWeight({
+  sampleSize,
+  winRate,
+  roi,
+  calibrationGap,
+}) {
+  const count =
+    Number(sampleSize) || 0;
+
+  if (
+    count <
+    LEARNING_MIN_SAMPLE_SIZE
+  ) {
+    return {
+      rawWeight: 1,
+      appliedWeight: 1,
+      reason:
+        "Échantillon insuffisant",
+    };
+  }
+
+  const normalizedWinRate =
+    Number(winRate) || 0;
+
+  const normalizedRoi =
+    Number(roi) || 0;
+
+  const normalizedCalibrationGap =
+    Number(calibrationGap) || 0;
+
+  /*
+   * Influence principale :
+   * écart par rapport au taux cible.
+   */
+  const winRateImpact =
+    (
+      normalizedWinRate -
+      LEARNING_TARGET_WIN_RATE
+    ) / 100;
+
+  /*
+   * ROI plafonné pour ne pas sur-réagir
+   * aux cotes élevées ou petits échantillons.
+   */
+  const roiImpact =
+    clampLearningNumber(
+      normalizedRoi,
+      -25,
+      25
+    ) / 500;
+
+  /*
+   * Si les probabilités annoncées sont
+   * beaucoup plus hautes que les résultats
+   * réels, le poids doit baisser.
+   */
+  const calibrationImpact =
+    clampLearningNumber(
+      -normalizedCalibrationGap,
+      -20,
+      20
+    ) / 500;
+
+  /*
+   * Plus l'échantillon est important,
+   * plus le coefficient peut être appliqué.
+   */
+  const sampleConfidence =
+    clampLearningNumber(
+      count / 200,
+      0.1,
+      1
+    );
+
+  const rawWeight =
+    1 +
+    winRateImpact * 0.35 +
+    roiImpact * 0.25 +
+    calibrationImpact * 0.25;
+
+  const boundedRawWeight =
+    clampLearningNumber(
+      rawWeight,
+      0.85,
+      1.15
+    );
+
+  const appliedWeight =
+    1 +
+    (
+      boundedRawWeight - 1
+    ) *
+    sampleConfidence;
+
+  return {
+    rawWeight:
+      Number(
+        boundedRawWeight.toFixed(5)
+      ),
+
+    appliedWeight:
+      Number(
+        clampLearningNumber(
+          appliedWeight,
+          0.9,
+          1.1
+        ).toFixed(5)
+      ),
+
+    reason:
+      `Échantillon de ${count} prédictions`,
+  };
+}
+
+/*
+ * Reconstruit toutes les statistiques
+ * du Learning Engine.
+ */
+async function rebuildLearningEngine({
+  source = "manual",
+} = {}) {
+  if (learningEngineRunning) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "ALREADY_RUNNING",
+    };
+  }
+
+  learningEngineRunning = true;
+
+  const startedAt =
+    new Date().toISOString();
+
+  let runId = null;
+
+  try {
+    await ensureLearningEngineTables();
+
+    const runResult =
+      await pool.query(
+        `
+          INSERT INTO learning_runs (
+            engine_version,
+            started_at,
+            status,
+            summary
+          )
+          VALUES (
+            $1,
+            $2,
+            'RUNNING',
+            $3::jsonb
+          )
+          RETURNING id
+        `,
+        [
+          LEARNING_ENGINE_VERSION,
+          startedAt,
+          JSON.stringify({
+            source,
+          }),
+        ]
+      );
+
+    runId =
+      runResult.rows[0].id;
+
+    /*
+     * Nous utilisons en priorité le snapshot
+     * Brain Studio réellement sauvegardé.
+     *
+     * Pour les anciennes prédictions sans
+     * snapshot, on reprend les colonnes
+     * classiques de predictions.
+     */
+    const result =
+      await pool.query(`
+        SELECT
+          COALESCE(
+            NULLIF(
+              UPPER(
+                studio_market_key
+              ),
+              ''
+            ),
+            NULLIF(
+              UPPER(
+                selected_outcome
+              ),
+              ''
+            ),
+            'UNKNOWN'
+          ) AS market_key,
+
+          COALESCE(
+            NULLIF(
+              UPPER(
+                studio_decision_grade
+              ),
+              ''
+            ),
+            'UNRATED'
+          ) AS decision_grade,
+
+          COALESCE(
+            NULLIF(
+              UPPER(
+                studio_decision_type
+              ),
+              ''
+            ),
+            NULLIF(
+              UPPER(
+                bet_status
+              ),
+              ''
+            ),
+            'NO_BET'
+          ) AS decision_type,
+
+          COUNT(*)::INTEGER
+            AS sample_size,
+
+          COUNT(*) FILTER (
+            WHERE won = TRUE
+          )::INTEGER AS wins,
+
+          COUNT(*) FILTER (
+            WHERE won = FALSE
+          )::INTEGER AS losses,
+
+          ROUND(
+            (
+              COUNT(*) FILTER (
+                WHERE won = TRUE
+              )::NUMERIC
+              /
+              NULLIF(
+                COUNT(*) FILTER (
+                  WHERE won IS NOT NULL
+                ),
+                0
+              )
+            ) * 100,
+            3
+          ) AS win_rate,
+
+          ROUND(
+            AVG(
+              COALESCE(
+                studio_probability,
+                CASE
+                  WHEN LOWER(
+                    selected_outcome
+                  ) = 'home'
+                    THEN home_probability
+
+                  WHEN LOWER(
+                    selected_outcome
+                  ) = 'draw'
+                    THEN draw_probability
+
+                  WHEN LOWER(
+                    selected_outcome
+                  ) = 'away'
+                    THEN away_probability
+
+                  ELSE NULL
+                END
+              )
+            ),
+            3
+          ) AS average_probability,
+
+          ROUND(
+            AVG(confidence),
+            3
+          ) AS average_confidence,
+
+          ROUND(
+            AVG(market_odd),
+            3
+          ) AS average_market_odd,
+
+          ROUND(
+            AVG(value_percentage),
+            3
+          ) AS average_value,
+
+          ROUND(
+            COALESCE(
+              SUM(profit),
+              0
+            ),
+            3
+          ) AS total_profit,
+
+          ROUND(
+            (
+              COALESCE(
+                SUM(profit),
+                0
+              )
+              /
+              NULLIF(
+                COUNT(*) FILTER (
+                  WHERE won IS NOT NULL
+                    AND COALESCE(
+                      studio_decision_type,
+                      bet_status,
+                      'NO_BET'
+                    ) <> 'NO_BET'
+                ),
+                0
+              )
+            ) * 100,
+            3
+          ) AS roi
+
+        FROM predictions
+
+        WHERE
+          result_status = 'COMPLETED'
+
+          AND won IS NOT NULL
+
+          AND COALESCE(
+            studio_decision_type,
+            bet_status,
+            'NO_BET'
+          ) <> 'NO_BET'
+
+        GROUP BY
+          market_key,
+          decision_grade,
+          decision_type
+
+        ORDER BY
+          sample_size DESC
+      `);
+
+    const groups =
+      result.rows.map(
+        (row) => {
+          const sampleSize =
+            Number(row.sample_size) || 0;
+
+          const wins =
+            Number(row.wins) || 0;
+
+          const losses =
+            Number(row.losses) || 0;
+
+          const winRate =
+            Number(row.win_rate) || 0;
+
+          const averageProbability =
+            Number(
+              row.average_probability
+            ) || 0;
+
+          const roi =
+            Number(row.roi) || 0;
+
+          const calibrationGap =
+            Number(
+              (
+                averageProbability -
+                winRate
+              ).toFixed(3)
+            );
+
+          const reliabilityLevel =
+            getLearningReliabilityLevel(
+              sampleSize
+            );
+
+          const weight =
+            calculateLearningWeight({
+              sampleSize,
+              winRate,
+              roi,
+              calibrationGap,
+            });
+
+          return {
+            marketKey:
+              row.market_key,
+
+            decisionGrade:
+              row.decision_grade,
+
+            decisionType:
+              row.decision_type,
+
+            sampleSize,
+            wins,
+            losses,
+            winRate,
+
+            averageProbability,
+
+            averageConfidence:
+              Number(
+                row.average_confidence
+              ) || 0,
+
+            averageMarketOdd:
+              Number(
+                row.average_market_odd
+              ) || 0,
+
+            averageValue:
+              Number(
+                row.average_value
+              ) || 0,
+
+            totalProfit:
+              Number(
+                row.total_profit
+              ) || 0,
+
+            roi,
+            calibrationGap,
+
+            reliabilityLevel,
+
+            rawWeight:
+              weight.rawWeight,
+
+            appliedWeight:
+              weight.appliedWeight,
+          };
+        }
+      );
+
+    const client =
+      await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      for (const group of groups) {
+        await client.query(
+          `
+            INSERT INTO
+              learning_market_stats (
+                market_key,
+                decision_grade,
+                decision_type,
+
+                sample_size,
+                wins,
+                losses,
+
+                win_rate,
+                average_probability,
+                average_confidence,
+                average_market_odd,
+                average_value,
+
+                total_profit,
+                roi,
+                calibration_gap,
+
+                raw_weight,
+                applied_weight,
+
+                reliability_level,
+                engine_version,
+
+                calculated_at,
+                updated_at
+              )
+            VALUES (
+              $1, $2, $3,
+              $4, $5, $6,
+              $7, $8, $9, $10, $11,
+              $12, $13, $14,
+              $15, $16,
+              $17, $18,
+              NOW(), NOW()
+            )
+
+            ON CONFLICT (
+              market_key,
+              decision_grade,
+              decision_type
+            )
+
+            DO UPDATE SET
+              sample_size =
+                EXCLUDED.sample_size,
+
+              wins =
+                EXCLUDED.wins,
+
+              losses =
+                EXCLUDED.losses,
+
+              win_rate =
+                EXCLUDED.win_rate,
+
+              average_probability =
+                EXCLUDED.average_probability,
+
+              average_confidence =
+                EXCLUDED.average_confidence,
+
+              average_market_odd =
+                EXCLUDED.average_market_odd,
+
+              average_value =
+                EXCLUDED.average_value,
+
+              total_profit =
+                EXCLUDED.total_profit,
+
+              roi =
+                EXCLUDED.roi,
+
+              calibration_gap =
+                EXCLUDED.calibration_gap,
+
+              raw_weight =
+                EXCLUDED.raw_weight,
+
+              applied_weight =
+                EXCLUDED.applied_weight,
+
+              reliability_level =
+                EXCLUDED.reliability_level,
+
+              engine_version =
+                EXCLUDED.engine_version,
+
+              calculated_at =
+                NOW(),
+
+              updated_at =
+                NOW()
+          `,
+          [
+            group.marketKey,
+            group.decisionGrade,
+            group.decisionType,
+
+            group.sampleSize,
+            group.wins,
+            group.losses,
+
+            group.winRate,
+            group.averageProbability,
+            group.averageConfidence,
+            group.averageMarketOdd,
+            group.averageValue,
+
+            group.totalProfit,
+            group.roi,
+            group.calibrationGap,
+
+            group.rawWeight,
+            group.appliedWeight,
+
+            group.reliabilityLevel,
+            LEARNING_ENGINE_VERSION,
+          ]
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    const finishedAt =
+      new Date().toISOString();
+
+    const summary = {
+      ok: true,
+      source,
+
+      engineVersion:
+        LEARNING_ENGINE_VERSION,
+
+      predictionsFound:
+        groups.reduce(
+          (sum, group) =>
+            sum +
+            group.sampleSize,
+          0
+        ),
+
+      groupsCalculated:
+        groups.length,
+
+      reliableGroups:
+        groups.filter(
+          (group) =>
+            group.reliabilityLevel !==
+            "INSUFFICIENT_DATA"
+        ).length,
+
+      startedAt,
+      finishedAt,
+
+      groups,
+    };
+
+    await pool.query(
+      `
+        UPDATE learning_runs
+        SET
+          predictions_found = $1,
+          groups_calculated = $2,
+          finished_at = $3,
+          status = 'COMPLETED',
+          summary = $4::jsonb
+        WHERE id = $5
+      `,
+      [
+        summary.predictionsFound,
+        summary.groupsCalculated,
+        finishedAt,
+        JSON.stringify(summary),
+        runId,
+      ]
+    );
+
+    console.log(
+      "LEARNING ENGINE : terminé",
+      {
+        predictionsFound:
+          summary.predictionsFound,
+
+        groupsCalculated:
+          summary.groupsCalculated,
+
+        reliableGroups:
+          summary.reliableGroups,
+      }
+    );
+
+    return summary;
+  } catch (error) {
+    const finishedAt =
+      new Date().toISOString();
+
+    if (runId) {
+      await pool.query(
+        `
+          UPDATE learning_runs
+          SET
+            finished_at = $1,
+            status = 'FAILED',
+            error_message = $2
+          WHERE id = $3
+        `,
+        [
+          finishedAt,
+          error?.message ||
+            "Erreur inconnue",
+          runId,
+        ]
+      ).catch(() => {});
+    }
+
+    console.error(
+      "LEARNING ENGINE : erreur",
+      error
+    );
+
+    return {
+      ok: false,
+      source,
+      startedAt,
+      finishedAt,
+
+      error:
+        error?.message ||
+        "Erreur inconnue",
+    };
+  } finally {
+    learningEngineRunning = false;
+  }
+}
+
+/*
+ * Lancement manuel du Learning Engine.
+ */
+app.get(
+  "/internal/rebuild-learning-engine",
+  async (req, res) => {
+    const summary =
+      await rebuildLearningEngine({
+        source: "manual-route",
+      });
+
+    return res
+      .status(
+        summary.ok
+          ? 200
+          : 500
+      )
+      .json(summary);
+  }
+);
+
+/*
+ * Lecture des statistiques calculées.
+ */
+app.get(
+  "/public/learning/market-stats",
+  async (req, res) => {
+    try {
+      await ensureLearningEngineTables();
+
+      const result =
+        await pool.query(`
+          SELECT
+            market_key,
+            decision_grade,
+            decision_type,
+
+            sample_size,
+            wins,
+            losses,
+
+            win_rate,
+            average_probability,
+            average_confidence,
+            average_market_odd,
+            average_value,
+
+            total_profit,
+            roi,
+            calibration_gap,
+
+            raw_weight,
+            applied_weight,
+
+            reliability_level,
+            engine_version,
+            calculated_at
+
+          FROM learning_market_stats
+
+          ORDER BY
+            sample_size DESC,
+            market_key ASC,
+            decision_grade ASC
+        `);
+
+      return res.json({
+        ok: true,
+
+        count:
+          result.rows.length,
+
+        stats:
+          result.rows,
+      });
+    } catch (error) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          stats: [],
+
+          error:
+            error?.message ||
+            "Impossible de charger les statistiques du Learning Engine",
+        });
+    }
+  }
+);
 app.listen(
   PORT,
   "0.0.0.0",
@@ -13138,6 +14084,13 @@ ensureStudioPredictionColumns()
   .catch((error) => {
     console.error(
       "ERREUR COLONNES STUDIO :",
+      error
+    );
+    });
+    ensureLearningEngineTables()
+  .catch((error) => {
+    console.error(
+      "ERREUR TABLES LEARNING ENGINE :",
       error
     );
   });
