@@ -11077,5 +11077,29 @@ ensureStudioPredictionColumns()
     console.log(
       "⏸️ Analyse générale répétée : désactivée"
     );
+    /*
+ * Vérification chaque minute de l’heure
+ * prévue pour l’analyse quotidienne.
+ */
+setInterval(() => {
+  checkDailyFullAnalysisSchedule()
+    .catch((error) => {
+      console.error(
+        "ERREUR PLANIFICATEUR ANALYSE QUOTIDIENNE :",
+        error
+      );
+    });
+}, 60 * 1000);
+
+/*
+ * Première vérification au démarrage.
+ */
+checkDailyFullAnalysisSchedule()
+  .catch((error) => {
+    console.error(
+      "ERREUR PREMIÈRE VÉRIFICATION QUOTIDIENNE :",
+      error
+    );
+  });
   }
 );
