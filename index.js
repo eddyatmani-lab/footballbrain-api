@@ -32,7 +32,20 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-app.use(express.json());
+// Les snapshots Brain Studio contiennent tous les marchés et peuvent
+// dépasser la limite Express par défaut de 100 Ko.
+app.use(
+  express.json({
+    limit: "10mb",
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: "10mb",
+  })
+);
 const analysisCache = new Map();
 const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
 const FINISHED_FIXTURE_STATUSES = new Set([
