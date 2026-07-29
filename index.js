@@ -12221,6 +12221,10 @@ app.get(
           : 0
       );
 
+      const pendingOnly =
+        String(req.query?.pendingOnly ?? "false").toLowerCase() ===
+        "true";
+
       const result = await pool.query(
         `
           SELECT
@@ -12248,17 +12252,23 @@ app.get(
                 'COMPLETED'
               )
             )
+            AND (
+              $3::boolean = false
+              OR COALESCE(studio_analysis_version, '') <>
+                'brain-studio-history-v3'
+            )
           ORDER BY fixture_date ASC, fixture_id ASC
           LIMIT $1
           OFFSET $2
         `,
-        [limit, offset]
+        [limit, offset, pendingOnly]
       );
 
       return res.json({
         ok: true,
         limit,
         offset,
+        pendingOnly,
         count: result.rows.length,
         hasMore: result.rows.length === limit,
         items: result.rows.map((row) => ({
