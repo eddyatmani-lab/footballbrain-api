@@ -202,6 +202,102 @@ app.get("/health", (req, res) => {
   });
 });
 
+
+
+/**
+ * Renvoie les compétitions Railway associées à une liste de fixtures.
+ * Une seule requête SQL est utilisée, même pour plusieurs milliers d'IDs.
+ */
+app.post("/internal/fixture-competitions", async (req, res) => {
+  try {
+    const rawFixtureIds = Array.isArray(req.body?.fixtureIds)
+      ? req.body.fixtureIds
+      : [];
+
+    const fixtureIds = [
+      ...new Set(
+        rawFixtureIds
+          .map((value) => Number(value))
+          .filter(
+            (value) =>
+              Number.isInteger(value) && value > 0
+          )
+      ),
+    ];
+
+    if (fixtureIds.length === 0) {
+      return res.json({
+        ok: true,
+        requested: 0,
+        found: 0,
+        missingFixtureIds: [],
+        competitions: {},
+      });
+    }
+
+    if (fixtureIds.length > 20000) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Trop de fixtureIds envoyés en une seule requête (maximum 20 000).",
+      });
+    }
+
+    const result = await pool.query(
+      `
+        SELECT DISTINCT ON (fixture_id)
+          fixture_id,
+          league_id,
+          league_name
+        FROM predictions
+        WHERE fixture_id = ANY($1::int[])
+          AND league_name IS NOT NULL
+          AND BTRIM(league_name) <> ''
+        ORDER BY fixture_id, updated_at DESC NULLS LAST, id DESC
+      `,
+      [fixtureIds]
+    );
+
+    const competitions = {};
+
+    for (const row of result.rows) {
+      competitions[String(row.fixture_id)] = {
+        fixtureId: Number(row.fixture_id),
+        leagueId:
+          row.league_id === null || row.league_id === undefined
+            ? null
+            : Number(row.league_id),
+        leagueName: String(row.league_name).trim(),
+      };
+    }
+
+    const missingFixtureIds = fixtureIds.filter(
+      (fixtureId) =>
+        !competitions[String(fixtureId)]
+    );
+
+    return res.json({
+      ok: true,
+      requested: fixtureIds.length,
+      found: Object.keys(competitions).length,
+      missingFixtureIds,
+      competitions,
+    });
+  } catch (error) {
+    console.error(
+      "ERREUR /internal/fixture-competitions :",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error.message ||
+        "Impossible de récupérer les compétitions.",
+    });
+  }
+});
+
 app.get(
   "/timezone",
   async (req, res) => {
@@ -10861,34 +10957,41 @@ studio_decision_score,
 studio_decision_type,
 studio_decision_grade,
 studio_analysis_version,
+studio_snapshot,
 studio_saved_at,
+              home_probability,
+              draw_probability,
+              away_probability,
 
-home_probability,
-draw_probability,
-away_probability,
+              fair_odd,
+              market_odd,
+              value_percentage,
 
-fair_odd,
-market_odd,
-value_percentage,
+              explanation,
 
-result_status,
-home_goals,
-away_goals,
-won,
-profit,
+              result_status,
+              home_goals,
+              away_goals,
+              won,
+              profit,
 
-official_xg_home,
-official_xg_away,
-xg_source,
-xg_confidence_score,
-xg_confidence_level,
+              official_xg_home,
+              official_xg_away,
+              xg_source,
+              xg_confidence_score,
+              xg_confidence_level,
 
-form_weight,
-market_weight,
-monte_carlo_weight,
+              form_weight,
+              market_weight,
+              monte_carlo_weight,
 
-created_at,
-updated_at
+              decision_trace,
+              model_inputs,
+              monte_carlo_model,
+              analysis_context,
+
+              created_at,
+              updated_at
             FROM predictions
             WHERE
               result_status IS NOT NULL
@@ -15185,3 +15288,4 @@ checkDailyFullAnalysisSchedule()
   });
   }
 );
+ 
