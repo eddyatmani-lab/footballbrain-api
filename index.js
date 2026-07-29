@@ -12173,6 +12173,262 @@ function buildAutomaticStudioMarket({
   };
 }
 
+
+
+/*
+ * Reconstruction historique exacte depuis Brain Studio (frontend).
+ *
+ * Le backend fournit les fixtureId à traiter puis accepte, via une
+ * route interne dédiée, le snapshot complet calculé par
+ * getFootballBrainStudioAnalysis(). Cette route administrative peut
+ * remplacer un snapshot après le coup d'envoi ; la route publique
+ * /public/studio-snapshot/:fixtureId reste verrouillée.
+ */
+app.get(
+  "/internal/studio-history-candidates",
+  async (req, res) => {
+    try {
+      const requestedLimit = Number(req.query?.limit);
+      const requestedOffset = Number(req.query?.offset);
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          500,
+          Number.isFinite(requestedLimit)
+            ? Math.trunc(requestedLimit)
+            : 100
+        )
+      );
+
+      const offset = Math.max(
+        0,
+        Number.isFinite(requestedOffset)
+          ? Math.trunc(requestedOffset)
+          : 0
+      );
+
+      const result = await pool.query(
+        `
+          SELECT
+            fixture_id,
+            fixture_date,
+            home_team_name,
+            away_team_name,
+            result_status,
+            studio_market_key,
+            studio_market_label,
+            studio_decision_score,
+            studio_analysis_version,
+            studio_saved_at
+          FROM predictions
+          WHERE
+            fixture_date IS NOT NULL
+            AND fixture_date <= NOW()
+            AND (
+              result_status IS NULL
+              OR UPPER(result_status) IN (
+                'FT',
+                'AET',
+                'PEN',
+                'FINISHED',
+                'COMPLETED'
+              )
+            )
+          ORDER BY fixture_date ASC, fixture_id ASC
+          LIMIT $1
+          OFFSET $2
+        `,
+        [limit, offset]
+      );
+
+      return res.json({
+        ok: true,
+        limit,
+        offset,
+        count: result.rows.length,
+        hasMore: result.rows.length === limit,
+        items: result.rows.map((row) => ({
+          fixtureId: Number(row.fixture_id),
+          fixtureDate: row.fixture_date || null,
+          homeTeam: row.home_team_name || null,
+          awayTeam: row.away_team_name || null,
+          resultStatus: row.result_status || null,
+          currentSnapshot: {
+            marketKey: row.studio_market_key || null,
+            marketLabel: row.studio_market_label || null,
+            decisionScore:
+              row.studio_decision_score != null
+                ? Number(row.studio_decision_score)
+                : null,
+            analysisVersion: row.studio_analysis_version || null,
+            savedAt: row.studio_saved_at || null,
+          },
+        })),
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR LISTE RECONSTRUCTION STUDIO :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: error?.message || "Erreur inconnue",
+      });
+    }
+  }
+);
+
+app.post(
+  "/internal/force-studio-snapshot/:fixtureId",
+  async (req, res) => {
+    try {
+      const fixtureId = Number(req.params.fixtureId);
+
+      if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "fixtureId invalide",
+        });
+      }
+
+      const body = req.body || {};
+      const markets = Array.isArray(body.markets)
+        ? body.markets.filter(Boolean)
+        : [];
+
+      const marketScore = (market) => {
+        const value = Number(
+          market?.decision?.score ?? market?.score ?? 0
+        );
+        return Number.isFinite(value) ? value : 0;
+      };
+
+      const marketProbability = (market) => {
+        const value = Number(
+          market?.fairOdds?.calibratedProbability ??
+            market?.calibratedProbability ??
+            market?.probability ??
+            0
+        );
+        return Number.isFinite(value) ? value : 0;
+      };
+
+      const sortedMarkets = [...markets].sort((a, b) => {
+        const scoreDifference = marketScore(b) - marketScore(a);
+        if (scoreDifference !== 0) return scoreDifference;
+        return marketProbability(b) - marketProbability(a);
+      });
+
+      const primaryMarket =
+        sortedMarkets[0] ||
+        body.primaryMarket ||
+        body.bestDecision ||
+        null;
+
+      if (!primaryMarket) {
+        return res.status(400).json({
+          ok: false,
+          error: "Aucun marché Brain Studio fourni",
+        });
+      }
+
+      const predictionResult = await pool.query(
+        `
+          SELECT
+            fixture_id,
+            fixture_date,
+            studio_market_key,
+            studio_market_label,
+            studio_decision_score,
+            studio_saved_at
+          FROM predictions
+          WHERE fixture_id = $1
+          LIMIT 1
+        `,
+        [fixtureId]
+      );
+
+      const prediction = predictionResult.rows[0];
+
+      if (!prediction) {
+        return res.status(404).json({
+          ok: false,
+          error: "Prédiction Railway introuvable",
+        });
+      }
+
+      const fixtureDate = prediction.fixture_date
+        ? new Date(prediction.fixture_date)
+        : null;
+
+      const snapshot = {
+        primaryMarket,
+        bestDecision: primaryMarket,
+        markets: sortedMarkets.length
+          ? sortedMarkets
+          : [primaryMarket],
+        generatedAt:
+          body.generatedAt || new Date().toISOString(),
+        fixtureDate:
+          fixtureDate && !Number.isNaN(fixtureDate.getTime())
+            ? fixtureDate.toISOString()
+            : null,
+        locked: true,
+        rebuilt: true,
+        rebuiltAt: new Date().toISOString(),
+        rebuildSource: "FOOTBALL_BRAIN_STUDIO_SERVICE",
+        historicalSafeMode: false,
+        administrativeOverride: true,
+      };
+
+      const saved = await saveStudioSnapshot({
+        fixtureId,
+        marketKey: primaryMarket.key,
+        marketLabel: primaryMarket.label,
+        probability: marketProbability(primaryMarket),
+        decisionScore: marketScore(primaryMarket),
+        decisionType: primaryMarket?.decision?.type,
+        decisionGrade: primaryMarket?.decision?.grade,
+        analysisVersion:
+          body.analysisVersion ||
+          body.version ||
+          "brain-studio-history-v3",
+        snapshot,
+      });
+
+      return res.json({
+        ok: true,
+        forced: true,
+        fixtureId,
+        previousSnapshot: {
+          marketKey: prediction.studio_market_key || null,
+          marketLabel: prediction.studio_market_label || null,
+          decisionScore:
+            prediction.studio_decision_score != null
+              ? Number(prediction.studio_decision_score)
+              : null,
+          savedAt: prediction.studio_saved_at || null,
+        },
+        primaryMarket,
+        marketsCount: snapshot.markets.length,
+        prediction: saved,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR FORCE STUDIO SNAPSHOT :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: error?.message || "Erreur inconnue",
+      });
+    }
+  }
+);
+
 function buildAutomaticStudioSnapshot(
   prediction
 ) {
@@ -12671,358 +12927,6 @@ app.get(
     }
   }
 );
-
-/*
- * ============================================================
- * BRAIN STUDIO — RECONSTRUCTION HISTORIQUE SÉCURISÉE
- * ============================================================
- *
- * Cette reconstruction ne relance PAS l'analyse d'un match terminé.
- * Elle réutilise uniquement la prédiction déjà enregistrée avant match,
- * afin d'éviter toute fuite de données provenant du résultat final.
- */
-
-let studioHistoryRebuildRunning = false;
-let studioHistoryRebuildProgress = null;
-
-function waitStudioHistory(milliseconds) {
-  return new Promise((resolve) =>
-    setTimeout(resolve, milliseconds)
-  );
-}
-
-function normalizeHistoryLimit(value, fallback = 500) {
-  const parsed = Number(value);
-
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-
-  return Math.max(1, Math.min(5000, Math.trunc(parsed)));
-}
-
-async function getHistoricalStudioPredictions({
-  limit = 500,
-  onlyMissingMarkets = false,
-} = {}) {
-  const normalizedLimit = normalizeHistoryLimit(limit);
-
-  const result = await pool.query(
-    `
-      SELECT
-        fixture_id,
-        fixture_date,
-
-        league_id,
-        league_name,
-
-        home_team_id,
-        home_team_name,
-        away_team_id,
-        away_team_name,
-
-        decision,
-        selected_outcome,
-        bet_status,
-
-        confidence,
-        risk,
-
-        home_probability,
-        draw_probability,
-        away_probability,
-
-        fair_odd,
-        market_odd,
-        value_percentage,
-
-        decision_trace,
-        model_inputs,
-        monte_carlo_model,
-        analysis_context,
-
-        result_status,
-
-        studio_market_key,
-        studio_market_label,
-        studio_probability,
-        studio_decision_score,
-        studio_decision_type,
-        studio_decision_grade,
-        studio_analysis_version,
-        studio_snapshot,
-        studio_saved_at,
-
-        created_at,
-        updated_at
-
-      FROM predictions
-
-      WHERE
-        fixture_date IS NOT NULL
-        AND fixture_date <= NOW()
-
-        AND (
-          result_status IS NULL
-          OR UPPER(result_status) IN (
-            'FT',
-            'AET',
-            'PEN',
-            'FINISHED',
-            'COMPLETED'
-          )
-        )
-
-        AND (
-          $1::boolean = false
-          OR studio_snapshot IS NULL
-          OR jsonb_typeof(studio_snapshot -> 'markets') <> 'array'
-          OR jsonb_array_length(
-            COALESCE(
-              studio_snapshot -> 'markets',
-              '[]'::jsonb
-            )
-          ) = 0
-        )
-
-      ORDER BY fixture_date ASC
-      LIMIT $2
-    `,
-    [Boolean(onlyMissingMarkets), normalizedLimit]
-  );
-
-  return result.rows;
-}
-
-async function rebuildHistoricalStudioSnapshotFromStoredPrediction(
-  prediction,
-  { dryRun = false } = {}
-) {
-  const fixtureId = Number(prediction?.fixture_id);
-
-  if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
-    throw new Error('fixtureId historique invalide');
-  }
-
-  const studioSnapshot = buildAutomaticStudioSnapshot(prediction);
-  const primaryMarket = studioSnapshot.primaryMarket;
-
-  if (!primaryMarket) {
-    return {
-      fixtureId,
-      saved: false,
-      skipped: true,
-      reason: 'NO_MARKET',
-    };
-  }
-
-  const historicalSnapshot = {
-    ...studioSnapshot,
-    version: 'brain-studio-history-v2',
-    rebuilt: true,
-    rebuiltAt: new Date().toISOString(),
-    rebuildSource: 'STORED_PREMATCH_PREDICTION',
-    historicalSafeMode: true,
-  };
-
-  if (dryRun) {
-    return {
-      fixtureId,
-      saved: false,
-      dryRun: true,
-      primaryMarket,
-      marketsCount: historicalSnapshot.markets.length,
-    };
-  }
-
-  await saveStudioSnapshot({
-    fixtureId,
-
-    marketKey: primaryMarket.key,
-    marketLabel: primaryMarket.label,
-
-    probability:
-      primaryMarket?.fairOdds?.calibratedProbability ??
-      primaryMarket.probability,
-
-    decisionScore:
-      primaryMarket?.decision?.score ??
-      primaryMarket.score,
-
-    decisionType: primaryMarket?.decision?.type,
-    decisionGrade: primaryMarket?.decision?.grade,
-
-    analysisVersion: historicalSnapshot.version,
-    snapshot: historicalSnapshot,
-  });
-
-  return {
-    fixtureId,
-    saved: true,
-    primaryMarket,
-    marketsCount: historicalSnapshot.markets.length,
-  };
-}
-
-async function rebuildAllHistoricalStudioSnapshots({
-  limit = 500,
-  onlyMissingMarkets = false,
-  dryRun = false,
-  delayMs = 75,
-} = {}) {
-  const predictions = await getHistoricalStudioPredictions({
-    limit,
-    onlyMissingMarkets,
-  });
-
-  const summary = {
-    startedAt: new Date().toISOString(),
-    finishedAt: null,
-    scanned: predictions.length,
-    rebuilt: 0,
-    skipped: 0,
-    errors: 0,
-    dryRun: Boolean(dryRun),
-    onlyMissingMarkets: Boolean(onlyMissingMarkets),
-    items: [],
-  };
-
-  studioHistoryRebuildProgress = {
-    ...summary,
-    running: true,
-    processed: 0,
-  };
-
-  for (const prediction of predictions) {
-    try {
-      const result =
-        await rebuildHistoricalStudioSnapshotFromStoredPrediction(
-          prediction,
-          { dryRun }
-        );
-
-      if (result.saved || result.dryRun) {
-        summary.rebuilt += 1;
-      } else {
-        summary.skipped += 1;
-      }
-
-      summary.items.push(result);
-    } catch (error) {
-      summary.errors += 1;
-      summary.items.push({
-        fixtureId: Number(prediction?.fixture_id) || null,
-        saved: false,
-        error: error?.message || 'Erreur inconnue',
-      });
-
-      console.error(
-        `ERREUR REBUILD HISTORIQUE ${prediction?.fixture_id} :`,
-        error
-      );
-    }
-
-    studioHistoryRebuildProgress = {
-      ...summary,
-      running: true,
-      processed:
-        summary.rebuilt + summary.skipped + summary.errors,
-    };
-
-    if (delayMs > 0) {
-      await waitStudioHistory(delayMs);
-    }
-  }
-
-  summary.finishedAt = new Date().toISOString();
-
-  studioHistoryRebuildProgress = {
-    ...summary,
-    running: false,
-    processed:
-      summary.rebuilt + summary.skipped + summary.errors,
-  };
-
-  return summary;
-}
-
-app.get(
-  '/internal/rebuild-studio-history/status',
-  (req, res) => {
-    return res.json({
-      ok: true,
-      running: studioHistoryRebuildRunning,
-      progress: studioHistoryRebuildProgress,
-    });
-  }
-);
-
-app.post(
-  '/internal/rebuild-studio-history',
-  async (req, res) => {
-    if (studioHistoryRebuildRunning) {
-      return res.status(409).json({
-        ok: false,
-        error: 'Une reconstruction historique est déjà en cours',
-        progress: studioHistoryRebuildProgress,
-      });
-    }
-
-    studioHistoryRebuildRunning = true;
-
-    try {
-      const limit = normalizeHistoryLimit(
-        req.body?.limit ?? req.query?.limit,
-        500
-      );
-
-      const onlyMissingMarkets =
-        String(
-          req.body?.onlyMissingMarkets ??
-            req.query?.onlyMissingMarkets ??
-            'false'
-        ).toLowerCase() === 'true';
-
-      const dryRun =
-        String(
-          req.body?.dryRun ?? req.query?.dryRun ?? 'false'
-        ).toLowerCase() === 'true';
-
-      const delayMs = Math.max(
-        0,
-        Math.min(
-          5000,
-          Number(req.body?.delayMs ?? req.query?.delayMs ?? 75) || 0
-        )
-      );
-
-      const summary = await rebuildAllHistoricalStudioSnapshots({
-        limit,
-        onlyMissingMarkets,
-        dryRun,
-        delayMs,
-      });
-
-      return res.json({
-        ok: true,
-        message: dryRun
-          ? 'Simulation de reconstruction terminée'
-          : 'Reconstruction historique terminée',
-        summary,
-      });
-    } catch (error) {
-      console.error('ERREUR REBUILD STUDIO HISTORY :', error);
-
-      return res.status(500).json({
-        ok: false,
-        error: error?.message || 'Erreur inconnue',
-      });
-    } finally {
-      studioHistoryRebuildRunning = false;
-    }
-  }
-);
-
 /*
  * ============================================================
  * BRAIN STUDIO — SCHEDULER INTELLIGENT
