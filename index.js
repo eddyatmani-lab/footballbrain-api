@@ -10861,41 +10861,34 @@ studio_decision_score,
 studio_decision_type,
 studio_decision_grade,
 studio_analysis_version,
-studio_snapshot,
 studio_saved_at,
-              home_probability,
-              draw_probability,
-              away_probability,
 
-              fair_odd,
-              market_odd,
-              value_percentage,
+home_probability,
+draw_probability,
+away_probability,
 
-              explanation,
+fair_odd,
+market_odd,
+value_percentage,
 
-              result_status,
-              home_goals,
-              away_goals,
-              won,
-              profit,
+result_status,
+home_goals,
+away_goals,
+won,
+profit,
 
-              official_xg_home,
-              official_xg_away,
-              xg_source,
-              xg_confidence_score,
-              xg_confidence_level,
+official_xg_home,
+official_xg_away,
+xg_source,
+xg_confidence_score,
+xg_confidence_level,
 
-              form_weight,
-              market_weight,
-              monte_carlo_weight,
+form_weight,
+market_weight,
+monte_carlo_weight,
 
-              decision_trace,
-              model_inputs,
-              monte_carlo_model,
-              analysis_context,
-
-              created_at,
-              updated_at
+created_at,
+updated_at
             FROM predictions
             WHERE
               result_status IS NOT NULL
