@@ -11139,6 +11139,366 @@ function normalizeStudioDecisionType(
 
   return "NO_BET";
 }
+
+/*
+ * SNAPSHOTS BRAIN STUDIO COMPACTS
+ *
+ * PostgreSQL ne conserve désormais que les informations nécessaires
+ * au Bilan, à l'historique et à la reconstruction du marché principal.
+ * Les objets lourds (engines, weights, modelInputs, decisionTrace,
+ * Monte Carlo complet, contextes détaillés, etc.) ne sont pas stockés
+ * dans studio_snapshot.
+ */
+function finiteStudioNumberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
+
+function compactStudioMarket(
+  market = {}
+) {
+  if (
+    !market ||
+    typeof market !== "object"
+  ) {
+    return null;
+  }
+
+  const probability =
+    finiteStudioNumberOrNull(
+      market?.fairOdds
+        ?.calibratedProbability ??
+      market?.calibratedProbability ??
+      market?.probability
+    );
+
+  const decisionScore =
+    finiteStudioNumberOrNull(
+      market?.decision?.score ??
+      market?.decisionScore ??
+      market?.score
+    );
+
+  const marketOdd =
+    finiteStudioNumberOrNull(
+      market?.fairOdds?.marketOdd ??
+      market?.marketOdd ??
+      market?.odd
+    );
+
+  const fairOdd =
+    finiteStudioNumberOrNull(
+      market?.fairOdds?.fairOdd ??
+      market?.fairOdd
+    );
+
+  const value =
+    finiteStudioNumberOrNull(
+      market?.fairOdds?.value ??
+      market?.value
+    );
+
+  const compact = {
+    key:
+      market.key ||
+      market.marketKey ||
+      null,
+
+    label:
+      market.label ||
+      market.marketLabel ||
+      market.key ||
+      null,
+
+    probability,
+
+    calibratedProbability:
+      probability,
+
+    score:
+      decisionScore,
+
+    decisionScore,
+
+    decision: {
+      score:
+        decisionScore,
+
+      type:
+        normalizeStudioDecisionType(
+          market?.decision?.type ||
+          market?.decisionType
+        ),
+
+      grade:
+        market?.decision?.grade ||
+        market?.decisionGrade ||
+        null,
+    },
+
+    fairOdds: {
+      calibratedProbability:
+        probability,
+
+      fairOdd,
+      marketOdd,
+      value,
+    },
+  };
+
+  /*
+   * Supprime uniquement les valeurs nulles sans modifier
+   * la structure attendue par le frontend.
+   */
+  if (
+    compact.fairOdds.fairOdd == null
+  ) {
+    delete compact.fairOdds.fairOdd;
+  }
+
+  if (
+    compact.fairOdds.marketOdd == null
+  ) {
+    delete compact.fairOdds.marketOdd;
+  }
+
+  if (
+    compact.fairOdds.value == null
+  ) {
+    delete compact.fairOdds.value;
+  }
+
+  return compact;
+}
+
+function compactStudioSnapshot(
+  snapshot = {}
+) {
+  const rawMarkets =
+    Array.isArray(snapshot?.markets)
+      ? snapshot.markets
+      : [];
+
+  const compactMarkets =
+    rawMarkets
+      .map(compactStudioMarket)
+      .filter(
+        (market) =>
+          market &&
+          market.key
+      )
+      .sort((a, b) => {
+        const scoreDifference =
+          Number(
+            b.decisionScore || 0
+          ) -
+          Number(
+            a.decisionScore || 0
+          );
+
+        if (
+          scoreDifference !== 0
+        ) {
+          return scoreDifference;
+        }
+
+        return (
+          Number(
+            b.probability || 0
+          ) -
+          Number(
+            a.probability || 0
+          )
+        );
+      });
+
+  const rawPrimary =
+    snapshot?.primaryMarket ||
+    snapshot?.bestDecision ||
+    compactMarkets[0] ||
+    null;
+
+  const compactPrimary =
+    compactStudioMarket(
+      rawPrimary
+    ) ||
+    compactMarkets[0] ||
+    null;
+
+  const marketsByKey =
+    new Map();
+
+  for (
+    const market of [
+      compactPrimary,
+      ...compactMarkets,
+    ]
+  ) {
+    if (
+      !market ||
+      !market.key ||
+      marketsByKey.has(
+        market.key
+      )
+    ) {
+      continue;
+    }
+
+    marketsByKey.set(
+      market.key,
+      market
+    );
+  }
+
+  const markets =
+    [...marketsByKey.values()]
+      .sort((a, b) => {
+        const scoreDifference =
+          Number(
+            b.decisionScore || 0
+          ) -
+          Number(
+            a.decisionScore || 0
+          );
+
+        if (
+          scoreDifference !== 0
+        ) {
+          return scoreDifference;
+        }
+
+        return (
+          Number(
+            b.probability || 0
+          ) -
+          Number(
+            a.probability || 0
+          )
+        );
+      });
+
+  const primaryMarket =
+    markets[0] ||
+    compactPrimary ||
+    null;
+
+  return {
+    primaryMarket,
+
+    bestDecision:
+      primaryMarket,
+
+    markets,
+
+    generatedAt:
+      snapshot?.generatedAt ||
+      new Date().toISOString(),
+
+    fixtureDate:
+      snapshot?.fixtureDate ||
+      null,
+
+    locked:
+      Boolean(
+        snapshot?.locked
+      ),
+
+    rebuilt:
+      Boolean(
+        snapshot?.rebuilt
+      ),
+
+    rebuiltAt:
+      snapshot?.rebuiltAt ||
+      null,
+
+    rebuildSource:
+      snapshot?.rebuildSource ||
+      null,
+
+    administrativeOverride:
+      Boolean(
+        snapshot
+          ?.administrativeOverride
+      ),
+
+    compact: true,
+
+    snapshotVersion:
+      "compact-v1",
+  };
+}
+
+async function queryWithRetry(
+  queryText,
+  values = [],
+  {
+    attempts = 3,
+    delayMs = 750,
+  } = {}
+) {
+  let lastError;
+
+  for (
+    let attempt = 1;
+    attempt <= attempts;
+    attempt += 1
+  ) {
+    try {
+      return await pool.query(
+        queryText,
+        values
+      );
+    } catch (error) {
+      lastError = error;
+
+      const retryableCodes =
+        new Set([
+          "40001",
+          "40P01",
+          "53300",
+          "57P03",
+          "08000",
+          "08003",
+          "08006",
+          "08001",
+          "08004",
+        ]);
+
+      const retryable =
+        retryableCodes.has(
+          String(
+            error?.code || ""
+          )
+        ) ||
+        /connection|terminating|not yet accepting|timeout/i.test(
+          String(
+            error?.message || ""
+          )
+        );
+
+      if (
+        !retryable ||
+        attempt >= attempts
+      ) {
+        throw error;
+      }
+
+      await new Promise(
+        (resolve) =>
+          setTimeout(
+            resolve,
+            delayMs * attempt
+          )
+      );
+    }
+  }
+
+  throw lastError;
+}
+
 async function saveStudioSnapshot({
   fixtureId,
   marketKey,
@@ -11190,7 +11550,12 @@ async function saveStudioSnapshot({
       decisionType
     );
 
-  const result = await pool.query(
+  const compactSnapshot =
+    compactStudioSnapshot(
+      snapshot || {}
+    );
+
+  const result = await queryWithRetry(
     `
       UPDATE predictions
       SET
@@ -11242,7 +11607,7 @@ async function saveStudioSnapshot({
       ),
 
       JSON.stringify(
-        snapshot || {}
+        compactSnapshot
       ),
 
       normalizedFixtureId,
