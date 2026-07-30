@@ -15525,6 +15525,158 @@ app.get("/public/bilan/stats", async (req, res) => {
   }
 });
 
+
+/*
+ * ADMIN — VÉRIFICATION MARCHÉ BILAN
+ *
+ * Liste les matchs terminés dont le marché principal Brain Studio
+ * n'est pas suffisamment enregistré pour garantir :
+ * BILAN = AI LAB = BRAIN STUDIO.
+ */
+app.get("/internal/admin/brainstudio/rebuild-needed", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+
+  try {
+    await ensureStudioPredictionColumns();
+
+    const requestedLimit = Number(req.query.limit);
+    const requestedOffset = Number(req.query.offset);
+
+    const limit =
+      Number.isInteger(requestedLimit) && requestedLimit > 0
+        ? Math.min(requestedLimit, 200)
+        : 100;
+
+    const offset =
+      Number.isInteger(requestedOffset) && requestedOffset >= 0
+        ? requestedOffset
+        : 0;
+
+    const auditWhere = `
+      result_status = 'COMPLETED'
+      AND (
+        studio_snapshot IS NULL
+        OR jsonb_typeof(studio_snapshot) <> 'object'
+        OR studio_market_key IS NULL
+        OR BTRIM(studio_market_key) = ''
+        OR studio_market_label IS NULL
+        OR BTRIM(studio_market_label) = ''
+        OR studio_probability IS NULL
+        OR studio_decision_score IS NULL
+      )
+    `;
+
+    const [summaryResult, matchesResult] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE result_status = 'COMPLETED')::int AS total_completed,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND NOT (
+                studio_snapshot IS NULL
+                OR jsonb_typeof(studio_snapshot) <> 'object'
+                OR studio_market_key IS NULL
+                OR BTRIM(studio_market_key) = ''
+                OR studio_market_label IS NULL
+                OR BTRIM(studio_market_label) = ''
+                OR studio_probability IS NULL
+                OR studio_decision_score IS NULL
+              )
+          )::int AS brain_studio_ok,
+          COUNT(*) FILTER (WHERE ${auditWhere})::int AS needs_rebuild
+        FROM predictions
+      `),
+      pool.query(
+        `
+          SELECT
+            id,
+            fixture_id,
+            fixture_date,
+            league_id,
+            league_name,
+            home_team_name,
+            away_team_name,
+            home_goals,
+            away_goals,
+            studio_market_key,
+            studio_market_label,
+            studio_probability,
+            studio_decision_score,
+            studio_decision_type,
+            studio_decision_grade,
+            studio_analysis_version,
+            studio_saved_at,
+            updated_at,
+            ARRAY_REMOVE(ARRAY[
+              CASE WHEN studio_snapshot IS NULL THEN 'SNAPSHOT_ABSENT' END,
+              CASE
+                WHEN studio_snapshot IS NOT NULL
+                 AND jsonb_typeof(studio_snapshot) <> 'object'
+                THEN 'SNAPSHOT_INVALIDE'
+              END,
+              CASE
+                WHEN studio_market_key IS NULL OR BTRIM(studio_market_key) = ''
+                THEN 'MARCHE_CLE_ABSENT'
+              END,
+              CASE
+                WHEN studio_market_label IS NULL OR BTRIM(studio_market_label) = ''
+                THEN 'MARCHE_LIBELLE_ABSENT'
+              END,
+              CASE WHEN studio_probability IS NULL THEN 'PROBABILITE_ABSENTE' END,
+              CASE WHEN studio_decision_score IS NULL THEN 'DECISION_SCORE_ABSENT' END
+            ], NULL) AS reasons
+          FROM predictions
+          WHERE ${auditWhere}
+          ORDER BY
+            fixture_date DESC NULLS LAST,
+            updated_at DESC NULLS LAST,
+            id DESC
+          LIMIT $1 OFFSET $2
+        `,
+        [limit, offset]
+      ),
+    ]);
+
+    const summaryRow = summaryResult.rows[0] || {};
+    const needsRebuild = Number(summaryRow.needs_rebuild || 0);
+
+    return res.json({
+      ok: true,
+      name: "Vérification marché Bilan",
+      summary: {
+        totalCompleted: Number(summaryRow.total_completed || 0),
+        brainStudioOk: Number(summaryRow.brain_studio_ok || 0),
+        needsRebuild,
+      },
+      count: matchesResult.rows.length,
+      limit,
+      offset,
+      hasMore: offset + matchesResult.rows.length < needsRebuild,
+      nextOffset:
+        offset + matchesResult.rows.length < needsRebuild
+          ? offset + matchesResult.rows.length
+          : null,
+      matches: matchesResult.rows.map((row) => ({
+        ...row,
+        status: "REBUILD_REQUIRED",
+      })),
+    });
+  } catch (error) {
+    console.error(
+      "ERREUR /internal/admin/brainstudio/rebuild-needed :",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      name: "Vérification marché Bilan",
+      error:
+        error?.message ||
+        "Impossible d'effectuer la vérification des marchés du Bilan.",
+    });
+  }
+});
+
 app.get("/internal/admin/bilan/markets", async (req, res) => {
   if (!requireOptionalAdminKey(req, res)) return;
 
