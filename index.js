@@ -14391,30 +14391,35 @@ app.get(
 );
     /*
  * ============================================================
- * FOOTBALLBRAIN — LEARNING ENGINE V1
+ * FOOTBALLBRAIN — LEARNING ENGINE V2
  * ============================================================
  *
- * Phase 1 :
- * - analyse des prédictions terminées ;
- * - statistiques par marché ;
- * - statistiques par grade ;
- * - statistiques par type de décision ;
- * - calcul d'un coefficient prudent ;
- * - aucune modification automatique des prédictions pour l'instant.
+ * Principes :
+ * - détection des changements avant tout recalcul lourd ;
+ * - aucun retraitement lorsqu'aucune donnée exploitable n'a changé ;
+ * - recalcul complet et sûr dès qu'un résultat/cote/snapshot est modifié ;
+ * - watermark persistant dans PostgreSQL ;
+ * - versionnement automatique ;
+ * - possibilité de forcer un rebuild avec ?force=1 ;
+ * - aucune modification automatique des prédictions.
  */
 
 let learningEngineRunning = false;
 
 const LEARNING_ENGINE_VERSION =
-  "learning-engine-v1";
-
-const LEARNING_MIN_SAMPLE_SIZE = 20;
-
-const LEARNING_TARGET_WIN_RATE = 55;
+  "learning-engine-v2.0";
 
 /*
- * Valeur toujours comprise entre min et max.
+ * À incrémenter lorsqu'une modification du modèle exige
+ * un recalcul complet des statistiques historiques.
  */
+const LEARNING_MODEL_VERSION =
+  process.env.LEARNING_MODEL_VERSION ||
+  "footballbrain-model-v1";
+
+const LEARNING_MIN_SAMPLE_SIZE = 20;
+const LEARNING_TARGET_WIN_RATE = 55;
+
 function clampLearningNumber(
   value,
   min,
@@ -14432,11 +14437,33 @@ function clampLearningNumber(
   );
 }
 
+function parseLearningBoolean(value) {
+  const normalized = String(
+    value ?? ""
+  )
+    .trim()
+    .toLowerCase();
+
+  return [
+    "1",
+    "true",
+    "yes",
+    "oui",
+    "on",
+  ].includes(normalized);
+}
+
 /*
- * Crée les tables nécessaires au Learning Engine.
+ * Crée/migre les tables nécessaires au Learning Engine V2.
  */
 async function ensureLearningEngineTables() {
   await pool.query(`
+    ALTER TABLE predictions
+      ADD COLUMN IF NOT EXISTS manual_market_odd NUMERIC,
+      ADD COLUMN IF NOT EXISTS manual_odd_source TEXT,
+      ADD COLUMN IF NOT EXISTS manual_odd_entered_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS manual_odd_entered_by TEXT;
+
     CREATE TABLE IF NOT EXISTS
       learning_market_stats (
         id SERIAL PRIMARY KEY,
@@ -14498,6 +14525,36 @@ async function ensureLearningEngineTables() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
+    ALTER TABLE learning_runs
+      ADD COLUMN IF NOT EXISTS run_mode TEXT,
+      ADD COLUMN IF NOT EXISTS new_predictions INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS changed_predictions INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS data_watermark TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS skipped_reason TEXT;
+
+    CREATE TABLE IF NOT EXISTS
+      learning_state (
+        state_key TEXT PRIMARY KEY,
+
+        engine_version TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+
+        last_watermark TIMESTAMPTZ,
+        last_prediction_count INTEGER NOT NULL DEFAULT 0,
+        last_max_prediction_id BIGINT NOT NULL DEFAULT 0,
+        last_fixture_date TIMESTAMPTZ,
+
+        last_run_id BIGINT,
+        last_run_started_at TIMESTAMPTZ,
+        last_run_finished_at TIMESTAMPTZ,
+
+        full_rebuild_required BOOLEAN NOT NULL DEFAULT FALSE,
+        last_summary JSONB,
+
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
     CREATE INDEX IF NOT EXISTS
       learning_market_stats_market_idx
     ON learning_market_stats (
@@ -14515,16 +14572,23 @@ async function ensureLearningEngineTables() {
     ON learning_runs (
       started_at DESC
     );
+
+    CREATE INDEX IF NOT EXISTS
+      predictions_learning_eligible_idx
+    ON predictions (
+      updated_at DESC,
+      id DESC
+    )
+    WHERE
+      result_status = 'COMPLETED'
+      AND won IS NOT NULL;
   `);
 
   console.log(
-    "✅ Tables Learning Engine vérifiées"
+    "✅ Tables Learning Engine V2 vérifiées"
   );
 }
 
-/*
- * Détermine le niveau de confiance statistique.
- */
 function getLearningReliabilityLevel(
   sampleSize
 ) {
@@ -14548,13 +14612,6 @@ function getLearningReliabilityLevel(
   return "INSUFFICIENT_DATA";
 }
 
-/*
- * Calcule un coefficient très prudent.
- *
- * Le poids reste volontairement entre
- * 0.90 et 1.10 afin d'éviter qu'une petite
- * série de résultats dérègle le moteur.
- */
 function calculateLearningWeight({
   sampleSize,
   winRate,
@@ -14585,20 +14642,12 @@ function calculateLearningWeight({
   const normalizedCalibrationGap =
     Number(calibrationGap) || 0;
 
-  /*
-   * Influence principale :
-   * écart par rapport au taux cible.
-   */
   const winRateImpact =
     (
       normalizedWinRate -
       LEARNING_TARGET_WIN_RATE
     ) / 100;
 
-  /*
-   * ROI plafonné pour ne pas sur-réagir
-   * aux cotes élevées ou petits échantillons.
-   */
   const roiImpact =
     clampLearningNumber(
       normalizedRoi,
@@ -14606,11 +14655,6 @@ function calculateLearningWeight({
       25
     ) / 500;
 
-  /*
-   * Si les probabilités annoncées sont
-   * beaucoup plus hautes que les résultats
-   * réels, le poids doit baisser.
-   */
   const calibrationImpact =
     clampLearningNumber(
       -normalizedCalibrationGap,
@@ -14618,41 +14662,32 @@ function calculateLearningWeight({
       20
     ) / 500;
 
-  /*
-   * Plus l'échantillon est important,
-   * plus le coefficient peut être appliqué.
-   */
   const sampleConfidence =
     clampLearningNumber(
       count / 200,
-      0.1,
+      0,
       1
     );
 
   const rawWeight =
     1 +
-    winRateImpact * 0.35 +
-    roiImpact * 0.25 +
-    calibrationImpact * 0.25;
-
-  const boundedRawWeight =
-    clampLearningNumber(
-      rawWeight,
-      0.85,
-      1.15
-    );
+    winRateImpact * 0.2 +
+    roiImpact +
+    calibrationImpact;
 
   const appliedWeight =
     1 +
-    (
-      boundedRawWeight - 1
-    ) *
-    sampleConfidence;
+    (rawWeight - 1) *
+      sampleConfidence;
 
   return {
     rawWeight:
       Number(
-        boundedRawWeight.toFixed(5)
+        clampLearningNumber(
+          rawWeight,
+          0.85,
+          1.15
+        ).toFixed(5)
       ),
 
     appliedWeight:
@@ -14669,12 +14704,302 @@ function calculateLearningWeight({
   };
 }
 
+function learningEligibleWhereSql() {
+  return `
+    result_status = 'COMPLETED'
+    AND won IS NOT NULL
+    AND UPPER(
+      COALESCE(
+        NULLIF(studio_decision_type, ''),
+        NULLIF(bet_status, ''),
+        'NO_BET'
+      )
+    ) <> 'NO_BET'
+  `;
+}
+
+async function readLearningDataSignature() {
+  const eligibleWhere =
+    learningEligibleWhereSql();
+
+  const result = await pool.query(`
+    SELECT
+      COUNT(*)::INTEGER AS prediction_count,
+      COALESCE(MAX(id), 0)::BIGINT AS max_prediction_id,
+      MAX(updated_at) AS watermark,
+      MAX(fixture_date) AS last_fixture_date
+    FROM predictions
+    WHERE ${eligibleWhere}
+  `);
+
+  const row = result.rows[0] || {};
+
+  return {
+    predictionCount:
+      Number(row.prediction_count) || 0,
+    maxPredictionId:
+      Number(row.max_prediction_id) || 0,
+    watermark:
+      row.watermark || null,
+    lastFixtureDate:
+      row.last_fixture_date || null,
+  };
+}
+
+async function readLearningState() {
+  const result = await pool.query(
+    `
+      SELECT *
+      FROM learning_state
+      WHERE state_key = $1
+      LIMIT 1
+    `,
+    ["market-stats"]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function countLearningChangesSince(
+  watermark
+) {
+  if (!watermark) {
+    return {
+      changedPredictions: 0,
+      newPredictions: 0,
+    };
+  }
+
+  const eligibleWhere =
+    learningEligibleWhereSql();
+
+  const result = await pool.query(
+    `
+      SELECT
+        COUNT(*) FILTER (
+          WHERE updated_at > $1
+        )::INTEGER AS changed_predictions,
+
+        COUNT(*) FILTER (
+          WHERE updated_at > $1
+            AND created_at > $1
+        )::INTEGER AS new_predictions
+      FROM predictions
+      WHERE ${eligibleWhere}
+    `,
+    [watermark]
+  );
+
+  const row = result.rows[0] || {};
+
+  return {
+    changedPredictions:
+      Number(row.changed_predictions) || 0,
+    newPredictions:
+      Number(row.new_predictions) || 0,
+  };
+}
+
+function learningSignaturesMatch(
+  state,
+  signature
+) {
+  if (!state) return false;
+
+  const stateWatermark =
+    state.last_watermark
+      ? new Date(
+          state.last_watermark
+        ).getTime()
+      : null;
+
+  const currentWatermark =
+    signature.watermark
+      ? new Date(
+          signature.watermark
+        ).getTime()
+      : null;
+
+  return (
+    Number(
+      state.last_prediction_count
+    ) === signature.predictionCount &&
+    Number(
+      state.last_max_prediction_id
+    ) === signature.maxPredictionId &&
+    stateWatermark === currentWatermark
+  );
+}
+
+async function saveLearningState({
+  runId,
+  startedAt,
+  finishedAt,
+  signature,
+  summary,
+}) {
+  await pool.query(
+    `
+      INSERT INTO learning_state (
+        state_key,
+        engine_version,
+        model_version,
+        last_watermark,
+        last_prediction_count,
+        last_max_prediction_id,
+        last_fixture_date,
+        last_run_id,
+        last_run_started_at,
+        last_run_finished_at,
+        full_rebuild_required,
+        last_summary,
+        updated_at
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7,
+        $8, $9, $10, FALSE, $11::jsonb, NOW()
+      )
+      ON CONFLICT (state_key)
+      DO UPDATE SET
+        engine_version = EXCLUDED.engine_version,
+        model_version = EXCLUDED.model_version,
+        last_watermark = EXCLUDED.last_watermark,
+        last_prediction_count = EXCLUDED.last_prediction_count,
+        last_max_prediction_id = EXCLUDED.last_max_prediction_id,
+        last_fixture_date = EXCLUDED.last_fixture_date,
+        last_run_id = EXCLUDED.last_run_id,
+        last_run_started_at = EXCLUDED.last_run_started_at,
+        last_run_finished_at = EXCLUDED.last_run_finished_at,
+        full_rebuild_required = FALSE,
+        last_summary = EXCLUDED.last_summary,
+        updated_at = NOW()
+    `,
+    [
+      "market-stats",
+      LEARNING_ENGINE_VERSION,
+      LEARNING_MODEL_VERSION,
+      signature.watermark,
+      signature.predictionCount,
+      signature.maxPredictionId,
+      signature.lastFixtureDate,
+      runId,
+      startedAt,
+      finishedAt,
+      JSON.stringify(summary),
+    ]
+  );
+}
+
+async function createLearningRun({
+  startedAt,
+  source,
+  mode,
+  signature,
+}) {
+  const result = await pool.query(
+    `
+      INSERT INTO learning_runs (
+        engine_version,
+        started_at,
+        status,
+        run_mode,
+        data_watermark,
+        summary
+      )
+      VALUES (
+        $1, $2, 'RUNNING', $3, $4, $5::jsonb
+      )
+      RETURNING id
+    `,
+    [
+      LEARNING_ENGINE_VERSION,
+      startedAt,
+      mode,
+      signature?.watermark || null,
+      JSON.stringify({
+        source,
+        mode,
+        modelVersion:
+          LEARNING_MODEL_VERSION,
+      }),
+    ]
+  );
+
+  return result.rows[0].id;
+}
+
+async function completeSkippedLearningRun({
+  runId,
+  startedAt,
+  source,
+  signature,
+  reason,
+}) {
+  const finishedAt =
+    new Date().toISOString();
+
+  const summary = {
+    ok: true,
+    skipped: true,
+    reason,
+    source,
+    mode: "SKIPPED",
+    engineVersion:
+      LEARNING_ENGINE_VERSION,
+    modelVersion:
+      LEARNING_MODEL_VERSION,
+    predictionsFound:
+      signature.predictionCount,
+    newPredictions: 0,
+    changedPredictions: 0,
+    groupsCalculated: 0,
+    startedAt,
+    finishedAt,
+    watermark:
+      signature.watermark,
+  };
+
+  await pool.query(
+    `
+      UPDATE learning_runs
+      SET
+        predictions_found = $1,
+        groups_calculated = 0,
+        new_predictions = 0,
+        changed_predictions = 0,
+        finished_at = $2,
+        status = 'SKIPPED',
+        run_mode = 'SKIPPED',
+        data_watermark = $3,
+        skipped_reason = $4,
+        summary = $5::jsonb
+      WHERE id = $6
+    `,
+    [
+      signature.predictionCount,
+      finishedAt,
+      signature.watermark,
+      reason,
+      JSON.stringify(summary),
+      runId,
+    ]
+  );
+
+  return summary;
+}
+
 /*
- * Reconstruit toutes les statistiques
- * du Learning Engine.
+ * Change-aware rebuild :
+ * - signature rapide au début ;
+ * - arrêt immédiat si rien n'a changé ;
+ * - recalcul SQL complet uniquement lorsqu'il est nécessaire.
+ *
+ * Cette stratégie évite les doubles comptages et reste correcte
+ * lorsqu'un ancien match, un snapshot ou une cote est corrigé.
  */
 async function rebuildLearningEngine({
   source = "manual",
+  force = false,
 } = {}) {
   if (learningEngineRunning) {
     return {
@@ -14694,57 +15019,92 @@ async function rebuildLearningEngine({
   try {
     await ensureLearningEngineTables();
 
-    const runResult =
-      await pool.query(
-        `
-          INSERT INTO learning_runs (
-            engine_version,
-            started_at,
-            status,
-            summary
-          )
-          VALUES (
-            $1,
-            $2,
-            'RUNNING',
-            $3::jsonb
-          )
-          RETURNING id
-        `,
-        [
-          LEARNING_ENGINE_VERSION,
-          startedAt,
-          JSON.stringify({
-            source,
-          }),
-        ]
+    const [
+      state,
+      signatureBefore,
+    ] = await Promise.all([
+      readLearningState(),
+      readLearningDataSignature(),
+    ]);
+
+    const versionChanged =
+      !state ||
+      state.engine_version !==
+        LEARNING_ENGINE_VERSION ||
+      state.model_version !==
+        LEARNING_MODEL_VERSION;
+
+    const rebuildRequired =
+      Boolean(
+        state?.full_rebuild_required
       );
 
-    runId =
-      runResult.rows[0].id;
+    const unchanged =
+      learningSignaturesMatch(
+        state,
+        signatureBefore
+      );
 
-    /*
-     * Nous utilisons en priorité le snapshot
-     * Brain Studio réellement sauvegardé.
-     *
-     * Pour les anciennes prédictions sans
-     * snapshot, on reprend les colonnes
-     * classiques de predictions.
-     */
+    const mode =
+      force
+        ? "FORCED_FULL_REBUILD"
+        : versionChanged
+          ? "VERSION_FULL_REBUILD"
+          : rebuildRequired
+            ? "REQUIRED_FULL_REBUILD"
+            : "CHANGE_AWARE_REBUILD";
+
+    runId =
+      await createLearningRun({
+        startedAt,
+        source,
+        mode,
+        signature:
+          signatureBefore,
+      });
+
+    if (
+      !force &&
+      !versionChanged &&
+      !rebuildRequired &&
+      unchanged
+    ) {
+      const summary =
+        await completeSkippedLearningRun({
+          runId,
+          startedAt,
+          source,
+          signature:
+            signatureBefore,
+          reason:
+            "NO_NEW_LEARNING_DATA",
+        });
+
+      console.log(
+        "LEARNING ENGINE V2 : aucun changement"
+      );
+
+      return summary;
+    }
+
+    const changes =
+      await countLearningChangesSince(
+        state?.last_watermark || null
+      );
+
+    const eligibleWhere =
+      learningEligibleWhereSql();
+
     const result =
       await pool.query(`
         SELECT
           COALESCE(
             NULLIF(
-              UPPER(
-                studio_market_key
-              ),
+              UPPER(studio_market_key),
               ''
             ),
             NULLIF(
-              UPPER(
-                selected_outcome
-              ),
+              UPPER(selected_outcome),
               ''
             ),
             'UNKNOWN'
@@ -14752,9 +15112,7 @@ async function rebuildLearningEngine({
 
           COALESCE(
             NULLIF(
-              UPPER(
-                studio_decision_grade
-              ),
+              UPPER(studio_decision_grade),
               ''
             ),
             'UNRATED'
@@ -14762,15 +15120,11 @@ async function rebuildLearningEngine({
 
           COALESCE(
             NULLIF(
-              UPPER(
-                studio_decision_type
-              ),
+              UPPER(studio_decision_type),
               ''
             ),
             NULLIF(
-              UPPER(
-                bet_status
-              ),
+              UPPER(bet_status),
               ''
             ),
             'NO_BET'
@@ -14836,7 +15190,12 @@ async function rebuildLearningEngine({
           ) AS average_confidence,
 
           ROUND(
-            AVG(market_odd),
+            AVG(
+              COALESCE(
+                manual_market_odd,
+                market_odd
+              )
+            ),
             3
           ) AS average_market_odd,
 
@@ -14847,7 +15206,26 @@ async function rebuildLearningEngine({
 
           ROUND(
             COALESCE(
-              SUM(profit),
+              SUM(
+                CASE
+                  WHEN COALESCE(
+                    manual_market_odd,
+                    market_odd
+                  ) IS NOT NULL
+                  THEN
+                    CASE
+                      WHEN won = TRUE
+                        THEN COALESCE(
+                          manual_market_odd,
+                          market_odd
+                        ) - 1
+                      WHEN won = FALSE
+                        THEN -1
+                      ELSE 0
+                    END
+                  ELSE COALESCE(profit, 0)
+                END
+              ),
               0
             ),
             3
@@ -14856,37 +15234,36 @@ async function rebuildLearningEngine({
           ROUND(
             (
               COALESCE(
-                SUM(profit),
-                0
-              )
-              /
-              NULLIF(
-                COUNT(*) FILTER (
-                  WHERE won IS NOT NULL
-                    AND COALESCE(
-                      studio_decision_type,
-                      bet_status,
-                      'NO_BET'
-                    ) <> 'NO_BET'
+                SUM(
+                  CASE
+                    WHEN COALESCE(
+                      manual_market_odd,
+                      market_odd
+                    ) IS NOT NULL
+                    THEN
+                      CASE
+                        WHEN won = TRUE
+                          THEN COALESCE(
+                            manual_market_odd,
+                            market_odd
+                          ) - 1
+                        WHEN won = FALSE
+                          THEN -1
+                        ELSE 0
+                      END
+                    ELSE COALESCE(profit, 0)
+                  END
                 ),
                 0
               )
+              /
+              NULLIF(COUNT(*), 0)
             ) * 100,
             3
           ) AS roi
 
         FROM predictions
-
-        WHERE
-          result_status = 'COMPLETED'
-
-          AND won IS NOT NULL
-
-          AND COALESCE(
-            studio_decision_type,
-            bet_status,
-            'NO_BET'
-          ) <> 'NO_BET'
+        WHERE ${eligibleWhere}
 
         GROUP BY
           market_key,
@@ -14980,7 +15357,6 @@ async function rebuildLearningEngine({
 
             roi,
             calibrationGap,
-
             reliabilityLevel,
 
             rawWeight:
@@ -14997,6 +15373,15 @@ async function rebuildLearningEngine({
 
     try {
       await client.query("BEGIN");
+
+      /*
+       * Supprime les anciens groupes qui n'existent plus.
+       * Sans cela, une correction NO_BET pourrait laisser
+       * une statistique obsolète dans la table.
+       */
+      await client.query(`
+        DELETE FROM learning_market_stats
+      `);
 
       for (const group of groups) {
         await client.query(
@@ -15039,87 +15424,24 @@ async function rebuildLearningEngine({
               $17, $18,
               NOW(), NOW()
             )
-
-            ON CONFLICT (
-              market_key,
-              decision_grade,
-              decision_type
-            )
-
-            DO UPDATE SET
-              sample_size =
-                EXCLUDED.sample_size,
-
-              wins =
-                EXCLUDED.wins,
-
-              losses =
-                EXCLUDED.losses,
-
-              win_rate =
-                EXCLUDED.win_rate,
-
-              average_probability =
-                EXCLUDED.average_probability,
-
-              average_confidence =
-                EXCLUDED.average_confidence,
-
-              average_market_odd =
-                EXCLUDED.average_market_odd,
-
-              average_value =
-                EXCLUDED.average_value,
-
-              total_profit =
-                EXCLUDED.total_profit,
-
-              roi =
-                EXCLUDED.roi,
-
-              calibration_gap =
-                EXCLUDED.calibration_gap,
-
-              raw_weight =
-                EXCLUDED.raw_weight,
-
-              applied_weight =
-                EXCLUDED.applied_weight,
-
-              reliability_level =
-                EXCLUDED.reliability_level,
-
-              engine_version =
-                EXCLUDED.engine_version,
-
-              calculated_at =
-                NOW(),
-
-              updated_at =
-                NOW()
           `,
           [
             group.marketKey,
             group.decisionGrade,
             group.decisionType,
-
             group.sampleSize,
             group.wins,
             group.losses,
-
             group.winRate,
             group.averageProbability,
             group.averageConfidence,
             group.averageMarketOdd,
             group.averageValue,
-
             group.totalProfit,
             group.roi,
             group.calibrationGap,
-
             group.rawWeight,
             group.appliedWeight,
-
             group.reliabilityLevel,
             LEARNING_ENGINE_VERSION,
           ]
@@ -15134,23 +15456,35 @@ async function rebuildLearningEngine({
       client.release();
     }
 
+    const signatureAfter =
+      await readLearningDataSignature();
+
     const finishedAt =
       new Date().toISOString();
 
     const summary = {
       ok: true,
+      skipped: false,
       source,
+      mode,
 
       engineVersion:
         LEARNING_ENGINE_VERSION,
+      modelVersion:
+        LEARNING_MODEL_VERSION,
 
       predictionsFound:
-        groups.reduce(
-          (sum, group) =>
-            sum +
-            group.sampleSize,
-          0
-        ),
+        signatureAfter.predictionCount,
+
+      newPredictions:
+        state
+          ? changes.newPredictions
+          : signatureAfter.predictionCount,
+
+      changedPredictions:
+        state
+          ? changes.changedPredictions
+          : signatureAfter.predictionCount,
 
       groupsCalculated:
         groups.length,
@@ -15162,9 +15496,16 @@ async function rebuildLearningEngine({
             "INSUFFICIENT_DATA"
         ).length,
 
+      versionChanged,
+      force,
+
+      previousWatermark:
+        state?.last_watermark || null,
+      watermark:
+        signatureAfter.watermark,
+
       startedAt,
       finishedAt,
-
       groups,
     };
 
@@ -15174,29 +15515,50 @@ async function rebuildLearningEngine({
         SET
           predictions_found = $1,
           groups_calculated = $2,
-          finished_at = $3,
+          new_predictions = $3,
+          changed_predictions = $4,
+          finished_at = $5,
           status = 'COMPLETED',
-          summary = $4::jsonb
-        WHERE id = $5
+          run_mode = $6,
+          data_watermark = $7,
+          skipped_reason = NULL,
+          summary = $8::jsonb
+        WHERE id = $9
       `,
       [
         summary.predictionsFound,
         summary.groupsCalculated,
+        summary.newPredictions,
+        summary.changedPredictions,
         finishedAt,
+        mode,
+        signatureAfter.watermark,
         JSON.stringify(summary),
         runId,
       ]
     );
 
+    await saveLearningState({
+      runId,
+      startedAt,
+      finishedAt,
+      signature:
+        signatureAfter,
+      summary,
+    });
+
     console.log(
-      "LEARNING ENGINE : terminé",
+      "LEARNING ENGINE V2 : terminé",
       {
+        mode,
         predictionsFound:
           summary.predictionsFound,
-
+        newPredictions:
+          summary.newPredictions,
+        changedPredictions:
+          summary.changedPredictions,
         groupsCalculated:
           summary.groupsCalculated,
-
         reliableGroups:
           summary.reliableGroups,
       }
@@ -15227,7 +15589,7 @@ async function rebuildLearningEngine({
     }
 
     console.error(
-      "LEARNING ENGINE : erreur",
+      "LEARNING ENGINE V2 : erreur",
       error
     );
 
@@ -15236,7 +15598,6 @@ async function rebuildLearningEngine({
       source,
       startedAt,
       finishedAt,
-
       error:
         error?.message ||
         "Erreur inconnue",
@@ -15248,13 +15609,25 @@ async function rebuildLearningEngine({
 
 /*
  * Lancement manuel du Learning Engine.
+ *
+ * Normal :
+ *   GET /internal/rebuild-learning-engine
+ *
+ * Rebuild complet forcé :
+ *   GET /internal/rebuild-learning-engine?force=1
  */
 app.get(
   "/internal/rebuild-learning-engine",
   async (req, res) => {
+    const force =
+      parseLearningBoolean(
+        req.query.force
+      );
+
     const summary =
       await rebuildLearningEngine({
         source: "manual-route",
+        force,
       });
 
     return res
@@ -15264,6 +15637,85 @@ app.get(
           : 500
       )
       .json(summary);
+  }
+);
+
+/*
+ * État synthétique du Learning V2.
+ */
+app.get(
+  "/internal/learning/status",
+  async (req, res) => {
+    try {
+      await ensureLearningEngineTables();
+
+      const [
+        state,
+        signature,
+        latestRunResult,
+      ] = await Promise.all([
+        readLearningState(),
+        readLearningDataSignature(),
+        pool.query(`
+          SELECT
+            id,
+            engine_version,
+            run_mode,
+            predictions_found,
+            groups_calculated,
+            new_predictions,
+            changed_predictions,
+            started_at,
+            finished_at,
+            status,
+            skipped_reason,
+            error_message,
+            data_watermark
+          FROM learning_runs
+          ORDER BY started_at DESC, id DESC
+          LIMIT 1
+        `),
+      ]);
+
+      const versionChanged =
+        !state ||
+        state.engine_version !==
+          LEARNING_ENGINE_VERSION ||
+        state.model_version !==
+          LEARNING_MODEL_VERSION;
+
+      return res.json({
+        ok: true,
+        running:
+          learningEngineRunning,
+        engineVersion:
+          LEARNING_ENGINE_VERSION,
+        modelVersion:
+          LEARNING_MODEL_VERSION,
+        needsRebuild:
+          versionChanged ||
+          Boolean(
+            state?.full_rebuild_required
+          ) ||
+          !learningSignaturesMatch(
+            state,
+            signature
+          ),
+        versionChanged,
+        signature,
+        state,
+        latestRun:
+          latestRunResult.rows[0] ||
+          null,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de lire le statut du Learning Engine",
+      });
+    }
   }
 );
 
@@ -15314,10 +15766,12 @@ app.get(
 
       return res.json({
         ok: true,
-
         count:
           result.rows.length,
-
+        engineVersion:
+          LEARNING_ENGINE_VERSION,
+        modelVersion:
+          LEARNING_MODEL_VERSION,
         stats:
           result.rows,
       });
@@ -15327,7 +15781,6 @@ app.get(
         .json({
           ok: false,
           stats: [],
-
           error:
             error?.message ||
             "Impossible de charger les statistiques du Learning Engine",
