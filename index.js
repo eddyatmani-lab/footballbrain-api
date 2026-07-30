@@ -14629,7 +14629,7 @@ async function ensureLearningEngineTables() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS learning_runs (
+    CREATE TABLE IF NOT EXISTS calibration_runs (
       id BIGSERIAL PRIMARY KEY,
       engine_version TEXT NOT NULL,
       predictions_found INTEGER NOT NULL DEFAULT 0,
@@ -14642,14 +14642,14 @@ async function ensureLearningEngineTables() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    ALTER TABLE learning_runs
+    ALTER TABLE calibration_runs
       ADD COLUMN IF NOT EXISTS run_mode TEXT,
       ADD COLUMN IF NOT EXISTS new_predictions INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS changed_predictions INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS data_watermark TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS skipped_reason TEXT;
 
-    CREATE TABLE IF NOT EXISTS learning_state (
+    CREATE TABLE IF NOT EXISTS calibration_state (
       state_key TEXT PRIMARY KEY,
       engine_version TEXT NOT NULL,
       model_version TEXT NOT NULL,
@@ -14675,8 +14675,8 @@ async function ensureLearningEngineTables() {
     CREATE INDEX IF NOT EXISTS learning_history_group_idx
       ON learning_history (market_key, probability_bucket, created_at DESC);
 
-    CREATE INDEX IF NOT EXISTS learning_runs_started_idx
-      ON learning_runs (started_at DESC);
+    CREATE INDEX IF NOT EXISTS calibration_runs_started_idx
+      ON calibration_runs (started_at DESC);
 
     CREATE INDEX IF NOT EXISTS predictions_calibration_eligible_idx
       ON predictions (updated_at DESC, id DESC)
@@ -14753,7 +14753,7 @@ async function readLearningDataSignature() {
 
 async function readLearningState() {
   const result = await pool.query(`
-    SELECT * FROM learning_state
+    SELECT * FROM calibration_state
     WHERE state_key = 'calibration-engine'
     LIMIT 1
   `);
@@ -14901,7 +14901,7 @@ async function rebuildLearningEngine({
 
     const runResult = await pool.query(
       `
-        INSERT INTO learning_runs (
+        INSERT INTO calibration_runs (
           engine_version, run_mode, predictions_found,
           started_at, status, data_watermark
         )
@@ -14935,7 +14935,7 @@ async function rebuildLearningEngine({
 
       await pool.query(
         `
-          UPDATE learning_runs
+          UPDATE calibration_runs
           SET finished_at = $1, status = 'SKIPPED',
               skipped_reason = $2, summary = $3::jsonb
           WHERE id = $4
@@ -15132,7 +15132,7 @@ async function rebuildLearningEngine({
 
       await client.query(
         `
-          INSERT INTO learning_state (
+          INSERT INTO calibration_state (
             state_key, engine_version, model_version,
             last_watermark, last_prediction_count, last_max_prediction_id,
             last_fixture_date, last_run_id, last_run_started_at,
@@ -15171,7 +15171,7 @@ async function rebuildLearningEngine({
 
       await client.query(
         `
-          UPDATE learning_runs
+          UPDATE calibration_runs
           SET finished_at = $1, status = 'COMPLETED',
               groups_calculated = $2, summary = $3::jsonb
           WHERE id = $4
@@ -15192,7 +15192,7 @@ async function rebuildLearningEngine({
     if (runId) {
       await pool.query(
         `
-          UPDATE learning_runs
+          UPDATE calibration_runs
           SET finished_at = $1, status = 'FAILED', error_message = $2
           WHERE id = $3
         `,
@@ -15238,19 +15238,21 @@ app.get(
   }
 );
 
-app.get(
-  "/internal/learning/status",
-  async (req, res) => {
+async function calibrationStatusHandler(req, res) {
     try {
       await ensureLearningEngineTables();
       const [state, signature, latestRunResult, groupCountResult] =
         await Promise.all([
           readLearningState(),
           readLearningDataSignature(),
-          pool.query(`
-            SELECT * FROM learning_runs
-            ORDER BY started_at DESC, id DESC LIMIT 1
-          `),
+          pool.query(
+            `
+              SELECT * FROM calibration_runs
+              WHERE engine_version = $1
+              ORDER BY started_at DESC, id DESC LIMIT 1
+            `,
+            [LEARNING_ENGINE_VERSION]
+          ),
           pool.query(`SELECT COUNT(*)::INTEGER AS count FROM learning_calibration`),
         ]);
 
@@ -15288,8 +15290,13 @@ app.get(
           "Impossible de lire le statut du Calibration Engine",
       });
     }
-  }
-);
+}
+
+app.get("/internal/calibration/status", calibrationStatusHandler);
+
+/* Compatibilité avec l'ancienne URL utilisée par le frontend. */
+app.get("/internal/learning/status", calibrationStatusHandler);
+
 
 app.get(
   "/public/learning/adaptive-adjustment",
@@ -15366,6 +15373,38 @@ app.get(
     }
   }
 );
+
+app.get("/public/calibration/stats", async (req, res) => {
+  try {
+    await ensureLearningEngineTables();
+    const result = await pool.query(`
+      SELECT
+        market_key, probability_bucket, bucket_lower, bucket_upper,
+        sample_size, wins, losses, predicted_mean, actual_mean,
+        calibration_gap, brier_score, log_loss, accuracy,
+        proposed_adjustment, applied_adjustment, confidence,
+        engine_version, model_version, calculated_at
+      FROM learning_calibration
+      ORDER BY sample_size DESC, market_key ASC, bucket_lower ASC
+    `);
+
+    return res.json({
+      ok: true,
+      count: result.rows.length,
+      engineVersion: LEARNING_ENGINE_VERSION,
+      modelVersion: LEARNING_MODEL_VERSION,
+      applyEnabled: CALIBRATION_APPLY_ENABLED,
+      stats: result.rows,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      stats: [],
+      error: error?.message || "Impossible de charger les statistiques de calibration",
+    });
+  }
+});
+
 
 app.get(
   "/public/calibration/history",
