@@ -15293,6 +15293,293 @@ app.get(
     }
   }
 );
+
+
+// === STATISTIQUES GLOBALES DU BILAN ===
+/*
+ * À ajouter dans le fichier principal Express de footballbrain-api,
+ * après la création de `app` et de `pool`.
+ *
+ * Cette route complète /internal/stats avec :
+ * - decisionLevels globaux ;
+ * - comparisons globales ;
+ * sans calculer les chiffres depuis les rapports paginés du navigateur.
+ */
+
+app.get("/public/bilan/stats", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT to_jsonb(p) AS prediction
+      FROM predictions p
+      ORDER BY COALESCE(
+        NULLIF(to_jsonb(p)->>'fixture_date', '')::timestamptz,
+        NULLIF(to_jsonb(p)->>'created_at', '')::timestamptz,
+        NOW()
+      ) DESC
+    `);
+
+    const numberOr = (value, fallback = 0) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+
+    const firstDefined = (...values) =>
+      values.find(
+        (value) =>
+          value !== undefined &&
+          value !== null &&
+          value !== ""
+      );
+
+    const parseSnapshot = (value) => {
+      if (value && typeof value === "object") return value;
+      if (typeof value === "string") {
+        try {
+          return JSON.parse(value);
+        } catch {
+          return {};
+        }
+      }
+      return {};
+    };
+
+    const getDecisionScore = (market = {}) =>
+      numberOr(
+        market?.decision?.score ??
+          market?.marketDecision?.score ??
+          market?.decisionScore ??
+          market?.score,
+        Number.NEGATIVE_INFINITY
+      );
+
+    const getPrimaryMarket = (prediction = {}) => {
+      const snapshot = parseSnapshot(prediction.studio_snapshot);
+      const markets = Array.isArray(snapshot?.markets)
+        ? snapshot.markets
+        : Array.isArray(snapshot?.studio?.markets)
+          ? snapshot.studio.markets
+          : [];
+
+      if (markets.length === 0) {
+        return snapshot?.primaryMarket || {};
+      }
+
+      return markets.reduce((best, current) => {
+        if (!current) return best;
+        if (!best) return current;
+        return getDecisionScore(current) > getDecisionScore(best)
+          ? current
+          : best;
+      }, null) || {};
+    };
+
+    const normalizeDecisionType = (prediction = {}, market = {}) =>
+      String(
+        firstDefined(
+          market?.decision?.type,
+          market?.marketDecision?.type,
+          prediction.studio_decision_type,
+          prediction.bet_status,
+          "NO_BET"
+        )
+      )
+        .trim()
+        .toUpperCase()
+        .replace(/[\s-]+/g, "_");
+
+    const getCategory = (prediction = {}, market = {}) => {
+      const type = normalizeDecisionType(prediction, market);
+
+      if (["VALUE_BET", "STRONG_OPPORTUNITY"].includes(type)) {
+        return "strong";
+      }
+
+      if (["BET", "RECOMMENDED_BET", "OPPORTUNITY"].includes(type)) {
+        return "opportunity";
+      }
+
+      if (["WATCH", "PRUDENCE", "TO_WATCH", "MOST_PROBABLE_MARKET"].includes(type)) {
+        return "watch";
+      }
+
+      if (["AVOID", "BALANCED_MARKET"].includes(type)) {
+        return "avoid";
+      }
+
+      const probability = numberOr(
+        firstDefined(
+          prediction.studio_probability,
+          prediction.prediction_probability,
+          prediction.probability,
+          market?.fairOdds?.calibratedProbability,
+          market?.calibratedProbability,
+          market?.probability
+        )
+      );
+
+      const confidence = numberOr(
+        firstDefined(
+          prediction.studio_decision_score,
+          prediction.decision_score,
+          prediction.confidence,
+          market?.decision?.score,
+          market?.marketDecision?.score,
+          market?.decisionScore,
+          market?.score
+        ),
+        50
+      );
+
+      const risk = numberOr(
+        firstDefined(prediction.risk_score, prediction.risk),
+        50
+      );
+
+      const valueEdge = numberOr(
+        firstDefined(prediction.value_percentage, prediction.value_edge)
+      );
+
+      if (
+        probability >= 60 &&
+        confidence >= 65 &&
+        risk <= 55 &&
+        valueEdge >= 3
+      ) {
+        return "strong";
+      }
+
+      if (
+        probability >= 54 &&
+        confidence >= 58 &&
+        risk <= 65
+      ) {
+        return "opportunity";
+      }
+
+      if (probability >= 47 || confidence >= 50) {
+        return "watch";
+      }
+
+      return "avoid";
+    };
+
+    const getResultStatus = (prediction = {}) => {
+      if (prediction.won === true) return "win";
+      if (prediction.won === false) return "loss";
+
+      const status = String(prediction.result_status || "")
+        .trim()
+        .toLowerCase();
+
+      if (["win", "won"].includes(status)) return "win";
+      if (["loss", "lost"].includes(status)) return "loss";
+      return null;
+    };
+
+    const getRealOdd = (prediction = {}, market = {}) => {
+      const odd = Number(
+        firstDefined(
+          market?.odds?.marketOdd,
+          prediction.market_odd,
+          prediction.bookmaker_odd,
+          prediction.odds
+        )
+      );
+      return Number.isFinite(odd) && odd > 1 ? odd : null;
+    };
+
+    const getProbability = (prediction = {}, market = {}) => {
+      const probability = Number(
+        firstDefined(
+          prediction.studio_probability,
+          prediction.prediction_probability,
+          prediction.probability,
+          market?.fairOdds?.calibratedProbability,
+          market?.calibratedProbability,
+          market?.probability
+        )
+      );
+
+      return Number.isFinite(probability) &&
+        probability > 0 &&
+        probability < 100
+        ? probability
+        : null;
+    };
+
+    const emptySimulation = () => ({ stakes: 0, profit: 0, roi: 0 });
+    const comparisons = {
+      notPlayed: emptySimulation(),
+      allRealMarkets: emptySimulation(),
+      theoreticalOdds: emptySimulation(),
+    };
+
+    const decisionLevels = {
+      strong: 0,
+      opportunity: 0,
+      watch: 0,
+      avoid: 0,
+    };
+
+    for (const row of rows) {
+      const prediction = row.prediction || {};
+      const resultStatus = getResultStatus(prediction);
+      if (!resultStatus) continue;
+
+      const market = getPrimaryMarket(prediction);
+      const category = getCategory(prediction, market);
+      decisionLevels[category] += 1;
+
+      const realOdd = getRealOdd(prediction, market);
+      const probability = getProbability(prediction, market);
+
+      if (realOdd !== null) {
+        const profit = resultStatus === "win" ? realOdd - 1 : -1;
+
+        comparisons.allRealMarkets.stakes += 1;
+        comparisons.allRealMarkets.profit += profit;
+
+        if (category === "watch" || category === "avoid") {
+          comparisons.notPlayed.stakes += 1;
+          comparisons.notPlayed.profit += profit;
+        }
+      } else if (probability !== null) {
+        const theoreticalOdd = Math.max(
+          1.01,
+          Math.min(100, 100 / probability)
+        );
+        const profit = resultStatus === "win"
+          ? theoreticalOdd - 1
+          : -1;
+
+        comparisons.theoreticalOdds.stakes += 1;
+        comparisons.theoreticalOdds.profit += profit;
+      }
+    }
+
+    for (const simulation of Object.values(comparisons)) {
+      simulation.profit = Number(simulation.profit.toFixed(2));
+      simulation.roi = simulation.stakes > 0
+        ? Number(((simulation.profit / simulation.stakes) * 100).toFixed(1))
+        : 0;
+    }
+
+    res.json({
+      ok: true,
+      stats: {
+        decisionLevels,
+        comparisons,
+      },
+    });
+  } catch (error) {
+    console.error("Erreur /public/bilan/stats :", error);
+    res.status(500).json({
+      ok: false,
+      error: error?.message || "Erreur statistiques globales du Bilan",
+    });
+  }
+});
+
 app.listen(
   PORT,
   "0.0.0.0",
