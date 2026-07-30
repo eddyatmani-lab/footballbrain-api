@@ -14421,144 +14421,226 @@ app.get(
 );
     /*
  * ============================================================
- * FOOTBALLBRAIN — ADAPTIVE LEARNING ENGINE V3
+ * FOOTBALLBRAIN — CALIBRATION ENGINE V1
  * ============================================================
  *
- * Principes :
- * - détection des changements avant tout recalcul lourd ;
- * - aucun retraitement lorsqu'aucune donnée exploitable n'a changé ;
- * - recalcul complet et sûr dès qu'un résultat/cote/snapshot est modifié ;
- * - watermark persistant dans PostgreSQL ;
- * - versionnement automatique ;
- * - possibilité de forcer un rebuild avec ?force=1 ;
- * - aucune modification automatique des prédictions.
+ * Le moteur apprend uniquement à partir de :
+ * - la probabilité annoncée ;
+ * - le résultat réel ;
+ * - le marché ;
+ * - la tranche de probabilité.
+ *
+ * Le ROI, les cotes, les grades et le type de décision ne participent
+ * jamais au calcul de calibration. Ils restent disponibles ailleurs
+ * pour l'affichage et pour le futur Value Engine.
  */
 
 let learningEngineRunning = false;
 
 const LEARNING_ENGINE_VERSION =
-  "learning-engine-v3.0";
+  "calibration-engine-v1.0";
 
-/*
- * À incrémenter lorsqu'une modification du modèle exige
- * un recalcul complet des statistiques historiques.
- */
 const LEARNING_MODEL_VERSION =
   process.env.LEARNING_MODEL_VERSION ||
-  "footballbrain-model-v2-adaptive";
+  "footballbrain-calibration-v1-buckets-5";
 
-const LEARNING_MIN_SAMPLE_SIZE = 20;
-const LEARNING_TARGET_WIN_RATE = 55;
+const CALIBRATION_BUCKET_SIZE = 5;
+const CALIBRATION_MIN_PROBABILITY = 50;
+const CALIBRATION_MAX_PROBABILITY = 100;
+const CALIBRATION_MIN_SAMPLE_SIZE = 20;
+const CALIBRATION_MAX_ADJUSTMENT = 3;
 
-function clampLearningNumber(
-  value,
-  min,
-  max
-) {
+/*
+ * Par sécurité, la V1 observe et calcule par défaut sans modifier les
+ * probabilités de production. Pour l'activer plus tard sur Railway :
+ * CALIBRATION_APPLY_ENABLED=true
+ */
+const CALIBRATION_APPLY_ENABLED = [
+  "1",
+  "true",
+  "yes",
+  "oui",
+  "on",
+].includes(
+  String(process.env.CALIBRATION_APPLY_ENABLED || "false")
+    .trim()
+    .toLowerCase()
+);
+
+function clampLearningNumber(value, min, max) {
   const number = Number(value);
-
-  if (!Number.isFinite(number)) {
-    return min;
-  }
-
-  return Math.max(
-    min,
-    Math.min(max, number)
-  );
+  if (!Number.isFinite(number)) return min;
+  return Math.max(min, Math.min(max, number));
 }
 
 function parseLearningBoolean(value) {
-  const normalized = String(
-    value ?? ""
-  )
-    .trim()
-    .toLowerCase();
-
-  return [
-    "1",
-    "true",
-    "yes",
-    "oui",
-    "on",
-  ].includes(normalized);
+  return ["1", "true", "yes", "oui", "on"].includes(
+    String(value ?? "").trim().toLowerCase()
+  );
 }
 
-/*
- * Crée/migre les tables nécessaires au Adaptive Learning Engine V3.
- */
+function normalizeAdaptiveLearningKey(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function getCalibrationBucket(probability) {
+  const normalized = clampLearningNumber(
+    probability,
+    CALIBRATION_MIN_PROBABILITY,
+    CALIBRATION_MAX_PROBABILITY
+  );
+
+  const lower = Math.min(
+    95,
+    Math.floor(normalized / CALIBRATION_BUCKET_SIZE) *
+      CALIBRATION_BUCKET_SIZE
+  );
+  const upper = Math.min(100, lower + CALIBRATION_BUCKET_SIZE);
+
+  return {
+    key: `${lower}-${upper}`,
+    lower,
+    upper,
+  };
+}
+
+function getLearningReliabilityLevel(sampleSize) {
+  const count = Number(sampleSize) || 0;
+  if (count >= 1000) return "VERY_HIGH";
+  if (count >= 300) return "HIGH";
+  if (count >= 100) return "MEDIUM";
+  if (count >= 30) return "LOW";
+  return "VERY_LOW";
+}
+
+function getCalibrationConfidenceFactor(sampleSize) {
+  const count = Number(sampleSize) || 0;
+  if (count < CALIBRATION_MIN_SAMPLE_SIZE) return 0;
+  if (count < 30) return 0.1;
+  if (count < 100) return 0.25;
+  if (count < 300) return 0.5;
+  if (count < 1000) return 0.75;
+  return 1;
+}
+
+function calculateCalibrationAdjustment(stat = {}) {
+  const sampleSize = Number(stat.sample_size ?? stat.sampleSize) || 0;
+  const predictedMean =
+    Number(stat.predicted_mean ?? stat.predictedMean) || 0;
+  const actualMean = Number(stat.actual_mean ?? stat.actualMean) || 0;
+  const calibrationGap = Number(
+    stat.calibration_gap ??
+      stat.calibrationGap ??
+      actualMean - predictedMean
+  );
+
+  const confidenceFactor = getCalibrationConfidenceFactor(sampleSize);
+
+  if (confidenceFactor <= 0) {
+    return {
+      adjustment: 0,
+      proposedAdjustment: 0,
+      appliedWeight: 1,
+      reason: "INSUFFICIENT_SAMPLE",
+    };
+  }
+
+  /*
+   * Le gap donne la direction de la correction. Brier et Log Loss sont
+   * des mesures de qualité : ils sont enregistrés et surveillés, mais ne
+   * doivent pas inventer une direction artificielle à la correction.
+   */
+  const proposedAdjustment = clampLearningNumber(
+    calibrationGap * confidenceFactor,
+    -CALIBRATION_MAX_ADJUSTMENT,
+    CALIBRATION_MAX_ADJUSTMENT
+  );
+
+  const adjustment = CALIBRATION_APPLY_ENABLED
+    ? proposedAdjustment
+    : 0;
+
+  return {
+    adjustment: Number(adjustment.toFixed(3)),
+    proposedAdjustment: Number(proposedAdjustment.toFixed(3)),
+    appliedWeight: Number(
+      clampLearningNumber(1 + adjustment / 100, 0.97, 1.03).toFixed(5)
+    ),
+    reason: CALIBRATION_APPLY_ENABLED
+      ? "CALIBRATION_APPLIED"
+      : "CALIBRATION_OBSERVATION_ONLY",
+  };
+}
+
 async function ensureLearningEngineTables() {
   await pool.query(`
     ALTER TABLE predictions
-      ADD COLUMN IF NOT EXISTS manual_market_odd NUMERIC,
-      ADD COLUMN IF NOT EXISTS manual_odd_source TEXT,
-      ADD COLUMN IF NOT EXISTS manual_odd_entered_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS manual_odd_entered_by TEXT,
       ADD COLUMN IF NOT EXISTS studio_base_probability NUMERIC(7,3),
       ADD COLUMN IF NOT EXISTS learning_probability_adjustment NUMERIC(7,3),
       ADD COLUMN IF NOT EXISTS learning_applied_weight NUMERIC(8,5),
       ADD COLUMN IF NOT EXISTS learning_engine_version TEXT,
-      ADD COLUMN IF NOT EXISTS learning_applied_at TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS learning_applied_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS calibration_bucket TEXT,
+      ADD COLUMN IF NOT EXISTS calibration_confidence TEXT;
 
-    CREATE TABLE IF NOT EXISTS
-      learning_market_stats (
-        id SERIAL PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS learning_calibration (
+      id BIGSERIAL PRIMARY KEY,
+      market_key TEXT NOT NULL,
+      probability_bucket TEXT NOT NULL,
+      bucket_lower NUMERIC(7,3) NOT NULL,
+      bucket_upper NUMERIC(7,3) NOT NULL,
+      sample_size INTEGER NOT NULL DEFAULT 0,
+      wins INTEGER NOT NULL DEFAULT 0,
+      losses INTEGER NOT NULL DEFAULT 0,
+      predicted_mean NUMERIC(9,5) NOT NULL DEFAULT 0,
+      actual_mean NUMERIC(9,5) NOT NULL DEFAULT 0,
+      calibration_gap NUMERIC(9,5) NOT NULL DEFAULT 0,
+      brier_score NUMERIC(12,8) NOT NULL DEFAULT 0,
+      log_loss NUMERIC(12,8) NOT NULL DEFAULT 0,
+      accuracy NUMERIC(9,5) NOT NULL DEFAULT 0,
+      proposed_adjustment NUMERIC(9,5) NOT NULL DEFAULT 0,
+      applied_adjustment NUMERIC(9,5) NOT NULL DEFAULT 0,
+      confidence TEXT NOT NULL DEFAULT 'VERY_LOW',
+      engine_version TEXT NOT NULL,
+      model_version TEXT NOT NULL,
+      calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (market_key, probability_bucket)
+    );
 
-        market_key TEXT NOT NULL,
-        decision_grade TEXT NOT NULL,
-        decision_type TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS learning_history (
+      id BIGSERIAL PRIMARY KEY,
+      market_key TEXT NOT NULL,
+      probability_bucket TEXT NOT NULL,
+      previous_adjustment NUMERIC(9,5),
+      new_adjustment NUMERIC(9,5) NOT NULL,
+      previous_sample_size INTEGER,
+      sample_size INTEGER NOT NULL DEFAULT 0,
+      predicted_mean NUMERIC(9,5),
+      actual_mean NUMERIC(9,5),
+      calibration_gap NUMERIC(9,5),
+      brier_score NUMERIC(12,8),
+      log_loss NUMERIC(12,8),
+      confidence TEXT,
+      engine_version TEXT NOT NULL,
+      model_version TEXT NOT NULL,
+      run_id BIGINT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
 
-        sample_size INTEGER NOT NULL DEFAULT 0,
-        wins INTEGER NOT NULL DEFAULT 0,
-        losses INTEGER NOT NULL DEFAULT 0,
-
-        win_rate NUMERIC(7,3) NOT NULL DEFAULT 0,
-        average_probability NUMERIC(7,3),
-        average_confidence NUMERIC(7,3),
-        average_market_odd NUMERIC(10,3),
-        average_value NUMERIC(10,3),
-
-        total_profit NUMERIC(12,3) NOT NULL DEFAULT 0,
-        roi NUMERIC(10,3) NOT NULL DEFAULT 0,
-
-        calibration_gap NUMERIC(10,3) NOT NULL DEFAULT 0,
-
-        raw_weight NUMERIC(8,5) NOT NULL DEFAULT 1,
-        applied_weight NUMERIC(8,5) NOT NULL DEFAULT 1,
-
-        reliability_level TEXT NOT NULL DEFAULT 'INSUFFICIENT_DATA',
-
-        engine_version TEXT NOT NULL,
-
-        calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        UNIQUE (
-          market_key,
-          decision_grade,
-          decision_type
-        )
-      );
-
-    CREATE TABLE IF NOT EXISTS
-      learning_runs (
-        id SERIAL PRIMARY KEY,
-
-        engine_version TEXT NOT NULL,
-
-        predictions_found INTEGER NOT NULL DEFAULT 0,
-        groups_calculated INTEGER NOT NULL DEFAULT 0,
-
-        started_at TIMESTAMPTZ NOT NULL,
-        finished_at TIMESTAMPTZ,
-
-        status TEXT NOT NULL DEFAULT 'RUNNING',
-        error_message TEXT,
-
-        summary JSONB,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
+    CREATE TABLE IF NOT EXISTS learning_runs (
+      id BIGSERIAL PRIMARY KEY,
+      engine_version TEXT NOT NULL,
+      predictions_found INTEGER NOT NULL DEFAULT 0,
+      groups_calculated INTEGER NOT NULL DEFAULT 0,
+      started_at TIMESTAMPTZ NOT NULL,
+      finished_at TIMESTAMPTZ,
+      status TEXT NOT NULL DEFAULT 'RUNNING',
+      error_message TEXT,
+      summary JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
 
     ALTER TABLE learning_runs
       ADD COLUMN IF NOT EXISTS run_mode TEXT,
@@ -14567,391 +14649,89 @@ async function ensureLearningEngineTables() {
       ADD COLUMN IF NOT EXISTS data_watermark TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS skipped_reason TEXT;
 
-    CREATE TABLE IF NOT EXISTS
-      learning_state (
-        state_key TEXT PRIMARY KEY,
-
-        engine_version TEXT NOT NULL,
-        model_version TEXT NOT NULL,
-
-        last_watermark TIMESTAMPTZ,
-        last_prediction_count INTEGER NOT NULL DEFAULT 0,
-        last_max_prediction_id BIGINT NOT NULL DEFAULT 0,
-        last_fixture_date TIMESTAMPTZ,
-
-        last_run_id BIGINT,
-        last_run_started_at TIMESTAMPTZ,
-        last_run_finished_at TIMESTAMPTZ,
-
-        full_rebuild_required BOOLEAN NOT NULL DEFAULT FALSE,
-        last_summary JSONB,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-    CREATE INDEX IF NOT EXISTS
-      learning_market_stats_market_idx
-    ON learning_market_stats (
-      market_key
+    CREATE TABLE IF NOT EXISTS learning_state (
+      state_key TEXT PRIMARY KEY,
+      engine_version TEXT NOT NULL,
+      model_version TEXT NOT NULL,
+      last_watermark TIMESTAMPTZ,
+      last_prediction_count INTEGER NOT NULL DEFAULT 0,
+      last_max_prediction_id BIGINT NOT NULL DEFAULT 0,
+      last_fixture_date TIMESTAMPTZ,
+      last_run_id BIGINT,
+      last_run_started_at TIMESTAMPTZ,
+      last_run_finished_at TIMESTAMPTZ,
+      full_rebuild_required BOOLEAN NOT NULL DEFAULT FALSE,
+      last_summary JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE INDEX IF NOT EXISTS
-      learning_market_stats_reliability_idx
-    ON learning_market_stats (
-      reliability_level
-    );
+    CREATE INDEX IF NOT EXISTS learning_calibration_market_bucket_idx
+      ON learning_calibration (market_key, bucket_lower, bucket_upper);
 
-    CREATE INDEX IF NOT EXISTS
-      learning_runs_started_idx
-    ON learning_runs (
-      started_at DESC
-    );
+    CREATE INDEX IF NOT EXISTS learning_calibration_confidence_idx
+      ON learning_calibration (confidence, sample_size DESC);
 
-    CREATE INDEX IF NOT EXISTS
-      predictions_learning_eligible_idx
-    ON predictions (
-      updated_at DESC,
-      id DESC
-    )
-    WHERE
-      result_status = 'COMPLETED'
-      AND won IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS learning_history_group_idx
+      ON learning_history (market_key, probability_bucket, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS learning_runs_started_idx
+      ON learning_runs (started_at DESC);
+
+    CREATE INDEX IF NOT EXISTS predictions_calibration_eligible_idx
+      ON predictions (updated_at DESC, id DESC)
+      WHERE result_status = 'COMPLETED' AND won IS NOT NULL;
   `);
 
-  console.log(
-    "✅ Tables Adaptive Learning Engine V3 vérifiées"
-  );
+  console.log("✅ Tables Calibration Engine V1 vérifiées");
 }
 
-function getLearningReliabilityLevel(
-  sampleSize
-) {
-  const count = Number(sampleSize) || 0;
-
-  if (count >= 200) {
-    return "HIGH";
-  }
-
-  if (count >= 80) {
-    return "MEDIUM";
-  }
-
-  if (
-    count >=
-    LEARNING_MIN_SAMPLE_SIZE
-  ) {
-    return "LOW";
-  }
-
-  return "INSUFFICIENT_DATA";
+function learningProbabilitySql() {
+  return `
+    COALESCE(
+      studio_base_probability,
+      studio_probability,
+      CASE
+        WHEN LOWER(COALESCE(selected_outcome, '')) = 'home'
+          THEN home_probability
+        WHEN LOWER(COALESCE(selected_outcome, '')) = 'draw'
+          THEN draw_probability
+        WHEN LOWER(COALESCE(selected_outcome, '')) = 'away'
+          THEN away_probability
+        ELSE NULL
+      END
+    )
+  `;
 }
 
-function calculateLearningWeight({
-  sampleSize,
-  winRate,
-  roi,
-  calibrationGap,
-}) {
-  const count =
-    Number(sampleSize) || 0;
-
-  if (
-    count <
-    LEARNING_MIN_SAMPLE_SIZE
-  ) {
-    return {
-      rawWeight: 1,
-      appliedWeight: 1,
-      reason:
-        "Échantillon insuffisant",
-    };
-  }
-
-  const normalizedWinRate =
-    Number(winRate) || 0;
-
-  const normalizedRoi =
-    Number(roi) || 0;
-
-  const normalizedCalibrationGap =
-    Number(calibrationGap) || 0;
-
-  const winRateImpact =
-    (
-      normalizedWinRate -
-      LEARNING_TARGET_WIN_RATE
-    ) / 100;
-
-  const roiImpact =
-    clampLearningNumber(
-      normalizedRoi,
-      -25,
-      25
-    ) / 500;
-
-  const calibrationImpact =
-    clampLearningNumber(
-      -normalizedCalibrationGap,
-      -20,
-      20
-    ) / 500;
-
-  const sampleConfidence =
-    clampLearningNumber(
-      count / 200,
-      0,
-      1
-    );
-
-  const rawWeight =
-    1 +
-    winRateImpact * 0.2 +
-    roiImpact +
-    calibrationImpact;
-
-  const appliedWeight =
-    1 +
-    (rawWeight - 1) *
-      sampleConfidence;
-
-  return {
-    rawWeight:
-      Number(
-        clampLearningNumber(
-          rawWeight,
-          0.85,
-          1.15
-        ).toFixed(5)
-      ),
-
-    appliedWeight:
-      Number(
-        clampLearningNumber(
-          appliedWeight,
-          0.9,
-          1.1
-        ).toFixed(5)
-      ),
-
-    reason:
-      `Échantillon de ${count} prédictions`,
-  };
-}
-
-
-const LEARNING_MAX_PROBABILITY_ADJUSTMENT = 3;
-
-function normalizeAdaptiveLearningKey(value) {
-  return String(value || "")
-    .trim()
-    .toUpperCase();
-}
-
-function getAdaptiveReliabilityFactor(level) {
-  const normalized = normalizeAdaptiveLearningKey(level);
-
-  if (normalized === "HIGH") return 1;
-  if (normalized === "MEDIUM") return 0.7;
-  if (normalized === "LOW") return 0.4;
-
-  return 0;
-}
-
-/*
- * Calcule un ajustement prudent en points de probabilité.
- * L'ajustement est borné à ±3 points et ramené vers zéro
- * lorsque l'échantillon ou la fiabilité sont faibles.
- */
-function calculateAdaptiveProbabilityAdjustment(stat = {}) {
-  const sampleSize = Number(stat.sample_size ?? stat.sampleSize) || 0;
-  const winRate = Number(stat.win_rate ?? stat.winRate) || 0;
-  const averageProbability = Number(
-    stat.average_probability ?? stat.averageProbability
-  ) || 0;
-  const roi = Number(stat.roi) || 0;
-  const reliabilityLevel =
-    stat.reliability_level ?? stat.reliabilityLevel ?? "INSUFFICIENT_DATA";
-
-  if (sampleSize < LEARNING_MIN_SAMPLE_SIZE) {
-    return {
-      adjustment: 0,
-      appliedWeight: 1,
-      reason: "INSUFFICIENT_SAMPLE",
-    };
-  }
-
-  const reliabilityFactor =
-    getAdaptiveReliabilityFactor(reliabilityLevel);
-
-  if (reliabilityFactor <= 0) {
-    return {
-      adjustment: 0,
-      appliedWeight: 1,
-      reason: "INSUFFICIENT_RELIABILITY",
-    };
-  }
-
-  const sampleFactor = clampLearningNumber(
-    sampleSize / 200,
-    0.15,
-    1
-  );
-
-  const calibrationCorrection =
-    clampLearningNumber(
-      winRate - averageProbability,
-      -12,
-      12
-    ) * 0.18;
-
-  const roiCorrection =
-    (clampLearningNumber(roi, -25, 25) / 25) * 0.75;
-
-  const adjustment = clampLearningNumber(
-    (calibrationCorrection + roiCorrection) *
-      reliabilityFactor *
-      sampleFactor,
-    -LEARNING_MAX_PROBABILITY_ADJUSTMENT,
-    LEARNING_MAX_PROBABILITY_ADJUSTMENT
-  );
-
-  return {
-    adjustment: Number(adjustment.toFixed(3)),
-    appliedWeight: Number(
-      clampLearningNumber(1 + adjustment / 100, 0.97, 1.03).toFixed(5)
-    ),
-    reason: "ADAPTIVE_CALIBRATION",
-  };
-}
-
-async function getAdaptiveLearningAdjustment({
-  marketKey,
-  decisionGrade,
-  decisionType,
-  baseProbability,
-} = {}) {
-  const normalizedMarketKey =
-    normalizeAdaptiveLearningKey(marketKey);
-  const normalizedDecisionGrade =
-    normalizeAdaptiveLearningKey(decisionGrade) || "UNRATED";
-  const normalizedDecisionType =
-    normalizeAdaptiveLearningKey(decisionType) || "NO_BET";
-  const normalizedBaseProbability =
-    clampLearningNumber(baseProbability, 0, 100);
-
-  const noAdjustment = (reason) => ({
-    baseProbability: Number(normalizedBaseProbability.toFixed(3)),
-    adjustedProbability: Number(normalizedBaseProbability.toFixed(3)),
-    adjustment: 0,
-    appliedWeight: 1,
-    applied: false,
-    reason,
-    engineVersion: LEARNING_ENGINE_VERSION,
-    stat: null,
-  });
-
-  if (!normalizedMarketKey) {
-    return noAdjustment("MISSING_MARKET_KEY");
-  }
-
-  if (normalizedDecisionType === "NO_BET") {
-    return noAdjustment("NO_BET_NOT_ADJUSTED");
-  }
-
-  try {
-    const result = await pool.query(
-      `
-        SELECT
-          market_key,
-          decision_grade,
-          decision_type,
-          sample_size,
-          wins,
-          losses,
-          win_rate,
-          average_probability,
-          roi,
-          calibration_gap,
-          applied_weight,
-          reliability_level
-        FROM learning_market_stats
-        WHERE market_key = $1
-          AND decision_grade = $2
-          AND decision_type = $3
-        LIMIT 1
-      `,
-      [
-        normalizedMarketKey,
-        normalizedDecisionGrade,
-        normalizedDecisionType,
-      ]
-    );
-
-    const stat = result.rows[0];
-
-    if (!stat) {
-      return noAdjustment("NO_MATCHING_LEARNING_GROUP");
-    }
-
-    const adaptive =
-      calculateAdaptiveProbabilityAdjustment(stat);
-
-    const adjustedProbability =
-      clampLearningNumber(
-        normalizedBaseProbability + adaptive.adjustment,
-        1,
-        99
-      );
-
-    return {
-      baseProbability: Number(normalizedBaseProbability.toFixed(3)),
-      adjustedProbability: Number(adjustedProbability.toFixed(3)),
-      adjustment: adaptive.adjustment,
-      appliedWeight: adaptive.appliedWeight,
-      applied: adaptive.adjustment !== 0,
-      reason: adaptive.reason,
-      engineVersion: LEARNING_ENGINE_VERSION,
-      stat: {
-        marketKey: stat.market_key,
-        decisionGrade: stat.decision_grade,
-        decisionType: stat.decision_type,
-        sampleSize: Number(stat.sample_size) || 0,
-        winRate: Number(stat.win_rate) || 0,
-        averageProbability: Number(stat.average_probability) || 0,
-        roi: Number(stat.roi) || 0,
-        calibrationGap: Number(stat.calibration_gap) || 0,
-        reliabilityLevel: stat.reliability_level,
-      },
-    };
-  } catch (error) {
-    console.warn(
-      "ADAPTIVE LEARNING V3 : ajustement ignoré",
-      error?.message || error
-    );
-
-    return noAdjustment("LEARNING_LOOKUP_FAILED");
-  }
+function learningMarketSql() {
+  return `
+    UPPER(
+      BTRIM(
+        COALESCE(
+          NULLIF(studio_market_key, ''),
+          NULLIF(selected_outcome, '')
+        )
+      )
+    )
+  `;
 }
 
 function learningEligibleWhereSql() {
+  const probabilitySql = learningProbabilitySql();
+  const marketSql = learningMarketSql();
+
   return `
     result_status = 'COMPLETED'
     AND won IS NOT NULL
-    AND UPPER(
-      COALESCE(
-        NULLIF(studio_decision_type, ''),
-        NULLIF(bet_status, ''),
-        'NO_BET'
-      )
-    ) <> 'NO_BET'
+    AND ${marketSql} IS NOT NULL
+    AND ${probabilitySql} IS NOT NULL
+    AND ${probabilitySql} >= ${CALIBRATION_MIN_PROBABILITY}
+    AND ${probabilitySql} <= ${CALIBRATION_MAX_PROBABILITY}
   `;
 }
 
 async function readLearningDataSignature() {
-  const eligibleWhere =
-    learningEligibleWhereSql();
-
   const result = await pool.query(`
     SELECT
       COUNT(*)::INTEGER AS prediction_count,
@@ -14959,1094 +14739,679 @@ async function readLearningDataSignature() {
       MAX(updated_at) AS watermark,
       MAX(fixture_date) AS last_fixture_date
     FROM predictions
-    WHERE ${eligibleWhere}
+    WHERE ${learningEligibleWhereSql()}
   `);
 
   const row = result.rows[0] || {};
-
   return {
-    predictionCount:
-      Number(row.prediction_count) || 0,
-    maxPredictionId:
-      Number(row.max_prediction_id) || 0,
-    watermark:
-      row.watermark || null,
-    lastFixtureDate:
-      row.last_fixture_date || null,
+    predictionCount: Number(row.prediction_count) || 0,
+    maxPredictionId: Number(row.max_prediction_id) || 0,
+    watermark: row.watermark || null,
+    lastFixtureDate: row.last_fixture_date || null,
   };
 }
 
 async function readLearningState() {
-  const result = await pool.query(
-    `
-      SELECT *
-      FROM learning_state
-      WHERE state_key = $1
-      LIMIT 1
-    `,
-    ["market-stats"]
-  );
-
+  const result = await pool.query(`
+    SELECT * FROM learning_state
+    WHERE state_key = 'calibration-engine'
+    LIMIT 1
+  `);
   return result.rows[0] || null;
 }
 
-async function countLearningChangesSince(
-  watermark
-) {
-  if (!watermark) {
-    return {
-      changedPredictions: 0,
-      newPredictions: 0,
-    };
+function learningSignaturesMatch(state, signature) {
+  if (!state) return false;
+  return (
+    Number(state.last_prediction_count) === signature.predictionCount &&
+    Number(state.last_max_prediction_id) === signature.maxPredictionId &&
+    String(state.last_watermark || "") === String(signature.watermark || "") &&
+    String(state.last_fixture_date || "") === String(signature.lastFixtureDate || "")
+  );
+}
+
+async function getAdaptiveLearningAdjustment({
+  marketKey,
+  baseProbability,
+} = {}) {
+  const normalizedMarketKey = normalizeAdaptiveLearningKey(marketKey);
+  const normalizedBaseProbability = clampLearningNumber(
+    baseProbability,
+    0,
+    100
+  );
+
+  const noAdjustment = (reason) => ({
+    baseProbability: Number(normalizedBaseProbability.toFixed(3)),
+    adjustedProbability: Number(normalizedBaseProbability.toFixed(3)),
+    adjustment: 0,
+    proposedAdjustment: 0,
+    appliedWeight: 1,
+    applied: false,
+    applyEnabled: CALIBRATION_APPLY_ENABLED,
+    reason,
+    engineVersion: LEARNING_ENGINE_VERSION,
+    modelVersion: LEARNING_MODEL_VERSION,
+    bucket: null,
+    stat: null,
+  });
+
+  if (!normalizedMarketKey) return noAdjustment("MISSING_MARKET_KEY");
+  if (normalizedBaseProbability < CALIBRATION_MIN_PROBABILITY) {
+    return noAdjustment("PROBABILITY_BELOW_CALIBRATION_RANGE");
   }
 
-  const eligibleWhere =
-    learningEligibleWhereSql();
+  const bucket = getCalibrationBucket(normalizedBaseProbability);
 
-  const result = await pool.query(
-    `
-      SELECT
-        COUNT(*) FILTER (
-          WHERE updated_at > $1
-        )::INTEGER AS changed_predictions,
+  try {
+    const result = await pool.query(
+      `
+        SELECT *
+        FROM learning_calibration
+        WHERE market_key = $1
+          AND probability_bucket = $2
+        LIMIT 1
+      `,
+      [normalizedMarketKey, bucket.key]
+    );
 
-        COUNT(*) FILTER (
-          WHERE updated_at > $1
-            AND created_at > $1
-        )::INTEGER AS new_predictions
-      FROM predictions
-      WHERE ${eligibleWhere}
-    `,
-    [watermark]
-  );
+    const stat = result.rows[0];
+    if (!stat) {
+      return {
+        ...noAdjustment("NO_MATCHING_CALIBRATION_BUCKET"),
+        bucket,
+      };
+    }
 
-  const row = result.rows[0] || {};
+    const calibration = calculateCalibrationAdjustment(stat);
+    const adjustedProbability = clampLearningNumber(
+      normalizedBaseProbability + calibration.adjustment,
+      1,
+      99
+    );
 
-  return {
-    changedPredictions:
-      Number(row.changed_predictions) || 0,
-    newPredictions:
-      Number(row.new_predictions) || 0,
-  };
+    return {
+      baseProbability: Number(normalizedBaseProbability.toFixed(3)),
+      adjustedProbability: Number(adjustedProbability.toFixed(3)),
+      adjustment: calibration.adjustment,
+      proposedAdjustment: calibration.proposedAdjustment,
+      appliedWeight: calibration.appliedWeight,
+      applied: calibration.adjustment !== 0,
+      applyEnabled: CALIBRATION_APPLY_ENABLED,
+      reason: calibration.reason,
+      engineVersion: LEARNING_ENGINE_VERSION,
+      modelVersion: LEARNING_MODEL_VERSION,
+      bucket,
+      stat: {
+        marketKey: stat.market_key,
+        probabilityBucket: stat.probability_bucket,
+        sampleSize: Number(stat.sample_size) || 0,
+        predictedMean: Number(stat.predicted_mean) || 0,
+        actualMean: Number(stat.actual_mean) || 0,
+        calibrationGap: Number(stat.calibration_gap) || 0,
+        brierScore: Number(stat.brier_score) || 0,
+        logLoss: Number(stat.log_loss) || 0,
+        accuracy: Number(stat.accuracy) || 0,
+        confidence: stat.confidence,
+      },
+    };
+  } catch (error) {
+    console.warn(
+      "CALIBRATION ENGINE V1 : ajustement ignoré",
+      error?.message || error
+    );
+    return { ...noAdjustment("CALIBRATION_LOOKUP_FAILED"), bucket };
+  }
 }
 
-function learningSignaturesMatch(
-  state,
-  signature
-) {
-  if (!state) return false;
-
-  const stateWatermark =
-    state.last_watermark
-      ? new Date(
-          state.last_watermark
-        ).getTime()
-      : null;
-
-  const currentWatermark =
-    signature.watermark
-      ? new Date(
-          signature.watermark
-        ).getTime()
-      : null;
-
-  return (
-    Number(
-      state.last_prediction_count
-    ) === signature.predictionCount &&
-    Number(
-      state.last_max_prediction_id
-    ) === signature.maxPredictionId &&
-    stateWatermark === currentWatermark
-  );
-}
-
-async function saveLearningState({
-  runId,
-  startedAt,
-  finishedAt,
-  signature,
-  summary,
-}) {
-  await pool.query(
-    `
-      INSERT INTO learning_state (
-        state_key,
-        engine_version,
-        model_version,
-        last_watermark,
-        last_prediction_count,
-        last_max_prediction_id,
-        last_fixture_date,
-        last_run_id,
-        last_run_started_at,
-        last_run_finished_at,
-        full_rebuild_required,
-        last_summary,
-        updated_at
-      )
-      VALUES (
-        $1, $2, $3, $4, $5, $6, $7,
-        $8, $9, $10, FALSE, $11::jsonb, NOW()
-      )
-      ON CONFLICT (state_key)
-      DO UPDATE SET
-        engine_version = EXCLUDED.engine_version,
-        model_version = EXCLUDED.model_version,
-        last_watermark = EXCLUDED.last_watermark,
-        last_prediction_count = EXCLUDED.last_prediction_count,
-        last_max_prediction_id = EXCLUDED.last_max_prediction_id,
-        last_fixture_date = EXCLUDED.last_fixture_date,
-        last_run_id = EXCLUDED.last_run_id,
-        last_run_started_at = EXCLUDED.last_run_started_at,
-        last_run_finished_at = EXCLUDED.last_run_finished_at,
-        full_rebuild_required = FALSE,
-        last_summary = EXCLUDED.last_summary,
-        updated_at = NOW()
-    `,
-    [
-      "market-stats",
-      LEARNING_ENGINE_VERSION,
-      LEARNING_MODEL_VERSION,
-      signature.watermark,
-      signature.predictionCount,
-      signature.maxPredictionId,
-      signature.lastFixtureDate,
-      runId,
-      startedAt,
-      finishedAt,
-      JSON.stringify(summary),
-    ]
-  );
-}
-
-async function createLearningRun({
-  startedAt,
-  source,
-  mode,
-  signature,
-}) {
-  const result = await pool.query(
-    `
-      INSERT INTO learning_runs (
-        engine_version,
-        started_at,
-        status,
-        run_mode,
-        data_watermark,
-        summary
-      )
-      VALUES (
-        $1, $2, 'RUNNING', $3, $4, $5::jsonb
-      )
-      RETURNING id
-    `,
-    [
-      LEARNING_ENGINE_VERSION,
-      startedAt,
-      mode,
-      signature?.watermark || null,
-      JSON.stringify({
-        source,
-        mode,
-        modelVersion:
-          LEARNING_MODEL_VERSION,
-      }),
-    ]
-  );
-
-  return result.rows[0].id;
-}
-
-async function completeSkippedLearningRun({
-  runId,
-  startedAt,
-  source,
-  signature,
-  reason,
-}) {
-  const finishedAt =
-    new Date().toISOString();
-
-  const summary = {
-    ok: true,
-    skipped: true,
-    reason,
-    source,
-    mode: "SKIPPED",
-    engineVersion:
-      LEARNING_ENGINE_VERSION,
-    modelVersion:
-      LEARNING_MODEL_VERSION,
-    predictionsFound:
-      signature.predictionCount,
-    newPredictions: 0,
-    changedPredictions: 0,
-    groupsCalculated: 0,
-    startedAt,
-    finishedAt,
-    watermark:
-      signature.watermark,
-  };
-
-  await pool.query(
-    `
-      UPDATE learning_runs
-      SET
-        predictions_found = $1,
-        groups_calculated = 0,
-        new_predictions = 0,
-        changed_predictions = 0,
-        finished_at = $2,
-        status = 'SKIPPED',
-        run_mode = 'SKIPPED',
-        data_watermark = $3,
-        skipped_reason = $4,
-        summary = $5::jsonb
-      WHERE id = $6
-    `,
-    [
-      signature.predictionCount,
-      finishedAt,
-      signature.watermark,
-      reason,
-      JSON.stringify(summary),
-      runId,
-    ]
-  );
-
-  return summary;
-}
-
-/*
- * Change-aware rebuild :
- * - signature rapide au début ;
- * - arrêt immédiat si rien n'a changé ;
- * - recalcul SQL complet uniquement lorsqu'il est nécessaire.
- *
- * Cette stratégie évite les doubles comptages et reste correcte
- * lorsqu'un ancien match, un snapshot ou une cote est corrigé.
- */
 async function rebuildLearningEngine({
   source = "manual",
   force = false,
 } = {}) {
   if (learningEngineRunning) {
     return {
-      ok: true,
+      ok: false,
       skipped: true,
-      reason: "ALREADY_RUNNING",
+      reason: "CALIBRATION_ENGINE_ALREADY_RUNNING",
     };
   }
 
   learningEngineRunning = true;
-
-  const startedAt =
-    new Date().toISOString();
-
+  const startedAt = new Date();
   let runId = null;
 
   try {
     await ensureLearningEngineTables();
 
-    const [
-      state,
-      signatureBefore,
-    ] = await Promise.all([
+    const [state, signature] = await Promise.all([
       readLearningState(),
       readLearningDataSignature(),
     ]);
 
     const versionChanged =
       !state ||
-      state.engine_version !==
-        LEARNING_ENGINE_VERSION ||
-      state.model_version !==
-        LEARNING_MODEL_VERSION;
+      state.engine_version !== LEARNING_ENGINE_VERSION ||
+      state.model_version !== LEARNING_MODEL_VERSION;
 
-    const rebuildRequired =
-      Boolean(
-        state?.full_rebuild_required
-      );
+    const needsRebuild =
+      force ||
+      versionChanged ||
+      Boolean(state?.full_rebuild_required) ||
+      !learningSignaturesMatch(state, signature);
 
-    const unchanged =
-      learningSignaturesMatch(
-        state,
-        signatureBefore
-      );
-
-    const mode =
-      force
-        ? "FORCED_FULL_REBUILD"
-        : versionChanged
-          ? "VERSION_FULL_REBUILD"
-          : rebuildRequired
-            ? "REQUIRED_FULL_REBUILD"
-            : "CHANGE_AWARE_REBUILD";
-
-    runId =
-      await createLearningRun({
+    const runResult = await pool.query(
+      `
+        INSERT INTO learning_runs (
+          engine_version, run_mode, predictions_found,
+          started_at, status, data_watermark
+        )
+        VALUES ($1, $2, $3, $4, 'RUNNING', $5)
+        RETURNING id
+      `,
+      [
+        LEARNING_ENGINE_VERSION,
+        force ? "FORCED" : "AUTO",
+        signature.predictionCount,
         startedAt,
+        signature.watermark,
+      ]
+    );
+    runId = runResult.rows[0]?.id || null;
+
+    if (!needsRebuild) {
+      const finishedAt = new Date();
+      const summary = {
+        ok: true,
+        skipped: true,
         source,
-        mode,
-        signature:
-          signatureBefore,
-      });
+        reason: "NO_CALIBRATION_DATA_CHANGE",
+        engineVersion: LEARNING_ENGINE_VERSION,
+        modelVersion: LEARNING_MODEL_VERSION,
+        applyEnabled: CALIBRATION_APPLY_ENABLED,
+        signature,
+        startedAt,
+        finishedAt,
+      };
 
-    if (
-      !force &&
-      !versionChanged &&
-      !rebuildRequired &&
-      unchanged
-    ) {
-      const summary =
-        await completeSkippedLearningRun({
-          runId,
-          startedAt,
-          source,
-          signature:
-            signatureBefore,
-          reason:
-            "NO_NEW_LEARNING_DATA",
-        });
-
-      console.log(
-        "ADAPTIVE LEARNING ENGINE V3 : aucun changement"
+      await pool.query(
+        `
+          UPDATE learning_runs
+          SET finished_at = $1, status = 'SKIPPED',
+              skipped_reason = $2, summary = $3::jsonb
+          WHERE id = $4
+        `,
+        [finishedAt, summary.reason, JSON.stringify(summary), runId]
       );
-
       return summary;
     }
 
-    const changes =
-      await countLearningChangesSince(
-        state?.last_watermark || null
-      );
+    const probabilitySql = learningProbabilitySql();
+    const marketSql = learningMarketSql();
 
-    const eligibleWhere =
-      learningEligibleWhereSql();
-
-    const result =
-      await pool.query(`
+    const result = await pool.query(`
+      WITH eligible AS (
         SELECT
-          COALESCE(
-            NULLIF(
-              UPPER(studio_market_key),
-              ''
-            ),
-            NULLIF(
-              UPPER(selected_outcome),
-              ''
-            ),
-            'UNKNOWN'
-          ) AS market_key,
-
-          COALESCE(
-            NULLIF(
-              UPPER(studio_decision_grade),
-              ''
-            ),
-            'UNRATED'
-          ) AS decision_grade,
-
-          COALESCE(
-            NULLIF(
-              UPPER(studio_decision_type),
-              ''
-            ),
-            NULLIF(
-              UPPER(bet_status),
-              ''
-            ),
-            'NO_BET'
-          ) AS decision_type,
-
-          COUNT(*)::INTEGER
-            AS sample_size,
-
-          COUNT(*) FILTER (
-            WHERE won = TRUE
-          )::INTEGER AS wins,
-
-          COUNT(*) FILTER (
-            WHERE won = FALSE
-          )::INTEGER AS losses,
-
-          ROUND(
-            (
-              COUNT(*) FILTER (
-                WHERE won = TRUE
-              )::NUMERIC
-              /
-              NULLIF(
-                COUNT(*) FILTER (
-                  WHERE won IS NOT NULL
-                ),
-                0
-              )
-            ) * 100,
-            3
-          ) AS win_rate,
-
-          ROUND(
-            AVG(
-              COALESCE(
-                studio_probability,
-                CASE
-                  WHEN LOWER(
-                    selected_outcome
-                  ) = 'home'
-                    THEN home_probability
-
-                  WHEN LOWER(
-                    selected_outcome
-                  ) = 'draw'
-                    THEN draw_probability
-
-                  WHEN LOWER(
-                    selected_outcome
-                  ) = 'away'
-                    THEN away_probability
-
-                  ELSE NULL
-                END
-              )
-            ),
-            3
-          ) AS average_probability,
-
-          ROUND(
-            AVG(confidence),
-            3
-          ) AS average_confidence,
-
-          ROUND(
-            AVG(
-              COALESCE(
-                manual_market_odd,
-                market_odd
-              )
-            ),
-            3
-          ) AS average_market_odd,
-
-          ROUND(
-            AVG(value_percentage),
-            3
-          ) AS average_value,
-
-          ROUND(
-            COALESCE(
-              SUM(
-                CASE
-                  WHEN COALESCE(
-                    manual_market_odd,
-                    market_odd
-                  ) IS NOT NULL
-                  THEN
-                    CASE
-                      WHEN won = TRUE
-                        THEN COALESCE(
-                          manual_market_odd,
-                          market_odd
-                        ) - 1
-                      WHEN won = FALSE
-                        THEN -1
-                      ELSE 0
-                    END
-                  ELSE COALESCE(profit, 0)
-                END
-              ),
-              0
-            ),
-            3
-          ) AS total_profit,
-
-          ROUND(
-            (
-              COALESCE(
-                SUM(
-                  CASE
-                    WHEN COALESCE(
-                      manual_market_odd,
-                      market_odd
-                    ) IS NOT NULL
-                    THEN
-                      CASE
-                        WHEN won = TRUE
-                          THEN COALESCE(
-                            manual_market_odd,
-                            market_odd
-                          ) - 1
-                        WHEN won = FALSE
-                          THEN -1
-                        ELSE 0
-                      END
-                    ELSE COALESCE(profit, 0)
-                  END
-                ),
-                0
-              )
-              /
-              NULLIF(COUNT(*), 0)
-            ) * 100,
-            3
-          ) AS roi
-
+          ${marketSql} AS market_key,
+          ${probabilitySql}::NUMERIC AS probability_pct,
+          CASE WHEN won = TRUE THEN 1.0 ELSE 0.0 END AS actual,
+          LEAST(
+            95,
+            FLOOR(${probabilitySql}::NUMERIC / ${CALIBRATION_BUCKET_SIZE}) *
+              ${CALIBRATION_BUCKET_SIZE}
+          )::INTEGER AS bucket_lower
         FROM predictions
-        WHERE ${eligibleWhere}
+        WHERE ${learningEligibleWhereSql()}
+      )
+      SELECT
+        market_key,
+        CONCAT(bucket_lower, '-', LEAST(100, bucket_lower + ${CALIBRATION_BUCKET_SIZE}))
+          AS probability_bucket,
+        bucket_lower,
+        LEAST(100, bucket_lower + ${CALIBRATION_BUCKET_SIZE}) AS bucket_upper,
+        COUNT(*)::INTEGER AS sample_size,
+        COUNT(*) FILTER (WHERE actual = 1)::INTEGER AS wins,
+        COUNT(*) FILTER (WHERE actual = 0)::INTEGER AS losses,
+        AVG(probability_pct) AS predicted_mean,
+        AVG(actual) * 100 AS actual_mean,
+        (AVG(actual) * 100) - AVG(probability_pct) AS calibration_gap,
+        AVG(POWER((probability_pct / 100.0) - actual, 2)) AS brier_score,
+        AVG(
+          -(
+            actual * LN(GREATEST(0.000001, LEAST(0.999999, probability_pct / 100.0))) +
+            (1 - actual) * LN(GREATEST(0.000001, LEAST(0.999999, 1 - probability_pct / 100.0)))
+          )
+        ) AS log_loss,
+        AVG(actual) * 100 AS accuracy
+      FROM eligible
+      GROUP BY market_key, bucket_lower
+      ORDER BY sample_size DESC, market_key, bucket_lower
+    `);
 
-        GROUP BY
-          market_key,
-          decision_grade,
-          decision_type
+    const groups = result.rows.map((row) => {
+      const sampleSize = Number(row.sample_size) || 0;
+      const predictedMean = Number(row.predicted_mean) || 0;
+      const actualMean = Number(row.actual_mean) || 0;
+      const calibrationGap = Number(row.calibration_gap) || 0;
+      const confidence = getLearningReliabilityLevel(sampleSize);
+      const adjustment = calculateCalibrationAdjustment({
+        sampleSize,
+        predictedMean,
+        actualMean,
+        calibrationGap,
+      });
 
-        ORDER BY
-          sample_size DESC
-      `);
+      return {
+        marketKey: row.market_key,
+        probabilityBucket: row.probability_bucket,
+        bucketLower: Number(row.bucket_lower),
+        bucketUpper: Number(row.bucket_upper),
+        sampleSize,
+        wins: Number(row.wins) || 0,
+        losses: Number(row.losses) || 0,
+        predictedMean,
+        actualMean,
+        calibrationGap,
+        brierScore: Number(row.brier_score) || 0,
+        logLoss: Number(row.log_loss) || 0,
+        accuracy: Number(row.accuracy) || 0,
+        proposedAdjustment: adjustment.proposedAdjustment,
+        appliedAdjustment: adjustment.adjustment,
+        confidence,
+      };
+    });
 
-    const groups =
-      result.rows.map(
-        (row) => {
-          const sampleSize =
-            Number(row.sample_size) || 0;
-
-          const wins =
-            Number(row.wins) || 0;
-
-          const losses =
-            Number(row.losses) || 0;
-
-          const winRate =
-            Number(row.win_rate) || 0;
-
-          const averageProbability =
-            Number(
-              row.average_probability
-            ) || 0;
-
-          const roi =
-            Number(row.roi) || 0;
-
-          const calibrationGap =
-            Number(
-              (
-                averageProbability -
-                winRate
-              ).toFixed(3)
-            );
-
-          const reliabilityLevel =
-            getLearningReliabilityLevel(
-              sampleSize
-            );
-
-          const weight =
-            calculateLearningWeight({
-              sampleSize,
-              winRate,
-              roi,
-              calibrationGap,
-            });
-
-          return {
-            marketKey:
-              row.market_key,
-
-            decisionGrade:
-              row.decision_grade,
-
-            decisionType:
-              row.decision_type,
-
-            sampleSize,
-            wins,
-            losses,
-            winRate,
-
-            averageProbability,
-
-            averageConfidence:
-              Number(
-                row.average_confidence
-              ) || 0,
-
-            averageMarketOdd:
-              Number(
-                row.average_market_odd
-              ) || 0,
-
-            averageValue:
-              Number(
-                row.average_value
-              ) || 0,
-
-            totalProfit:
-              Number(
-                row.total_profit
-              ) || 0,
-
-            roi,
-            calibrationGap,
-            reliabilityLevel,
-
-            rawWeight:
-              weight.rawWeight,
-
-            appliedWeight:
-              weight.appliedWeight,
-          };
-        }
-      );
-
-    const client =
-      await pool.connect();
-
+    const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      /*
-       * Supprime les anciens groupes qui n'existent plus.
-       * Sans cela, une correction NO_BET pourrait laisser
-       * une statistique obsolète dans la table.
-       */
-      await client.query(`
-        DELETE FROM learning_market_stats
+      const previousResult = await client.query(`
+        SELECT market_key, probability_bucket, sample_size,
+               proposed_adjustment, applied_adjustment
+        FROM learning_calibration
       `);
+      const previousMap = new Map(
+        previousResult.rows.map((row) => [
+          `${row.market_key}::${row.probability_bucket}`,
+          row,
+        ])
+      );
+
+      await client.query(`DELETE FROM learning_calibration`);
 
       for (const group of groups) {
         await client.query(
           `
-            INSERT INTO
-              learning_market_stats (
-                market_key,
-                decision_grade,
-                decision_type,
-
-                sample_size,
-                wins,
-                losses,
-
-                win_rate,
-                average_probability,
-                average_confidence,
-                average_market_odd,
-                average_value,
-
-                total_profit,
-                roi,
-                calibration_gap,
-
-                raw_weight,
-                applied_weight,
-
-                reliability_level,
-                engine_version,
-
-                calculated_at,
-                updated_at
-              )
-            VALUES (
-              $1, $2, $3,
-              $4, $5, $6,
-              $7, $8, $9, $10, $11,
-              $12, $13, $14,
-              $15, $16,
-              $17, $18,
-              NOW(), NOW()
+            INSERT INTO learning_calibration (
+              market_key, probability_bucket, bucket_lower, bucket_upper,
+              sample_size, wins, losses, predicted_mean, actual_mean,
+              calibration_gap, brier_score, log_loss, accuracy,
+              proposed_adjustment, applied_adjustment, confidence,
+              engine_version, model_version, calculated_at, updated_at
+            ) VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW()
             )
           `,
           [
             group.marketKey,
-            group.decisionGrade,
-            group.decisionType,
+            group.probabilityBucket,
+            group.bucketLower,
+            group.bucketUpper,
             group.sampleSize,
             group.wins,
             group.losses,
-            group.winRate,
-            group.averageProbability,
-            group.averageConfidence,
-            group.averageMarketOdd,
-            group.averageValue,
-            group.totalProfit,
-            group.roi,
+            group.predictedMean,
+            group.actualMean,
             group.calibrationGap,
-            group.rawWeight,
-            group.appliedWeight,
-            group.reliabilityLevel,
+            group.brierScore,
+            group.logLoss,
+            group.accuracy,
+            group.proposedAdjustment,
+            group.appliedAdjustment,
+            group.confidence,
             LEARNING_ENGINE_VERSION,
+            LEARNING_MODEL_VERSION,
           ]
         );
+
+        const previous = previousMap.get(
+          `${group.marketKey}::${group.probabilityBucket}`
+        );
+
+        const changed =
+          !previous ||
+          Number(previous.proposed_adjustment) !== group.proposedAdjustment ||
+          Number(previous.sample_size) !== group.sampleSize;
+
+        if (changed) {
+          await client.query(
+            `
+              INSERT INTO learning_history (
+                market_key, probability_bucket, previous_adjustment,
+                new_adjustment, previous_sample_size, sample_size,
+                predicted_mean, actual_mean, calibration_gap,
+                brier_score, log_loss, confidence,
+                engine_version, model_version, run_id
+              ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            `,
+            [
+              group.marketKey,
+              group.probabilityBucket,
+              previous ? Number(previous.proposed_adjustment) : null,
+              group.proposedAdjustment,
+              previous ? Number(previous.sample_size) : null,
+              group.sampleSize,
+              group.predictedMean,
+              group.actualMean,
+              group.calibrationGap,
+              group.brierScore,
+              group.logLoss,
+              group.confidence,
+              LEARNING_ENGINE_VERSION,
+              LEARNING_MODEL_VERSION,
+              runId,
+            ]
+          );
+        }
       }
 
+      const finishedAt = new Date();
+      const summary = {
+        ok: true,
+        skipped: false,
+        source,
+        forced: force,
+        engineVersion: LEARNING_ENGINE_VERSION,
+        modelVersion: LEARNING_MODEL_VERSION,
+        applyEnabled: CALIBRATION_APPLY_ENABLED,
+        predictionsFound: signature.predictionCount,
+        groupsCalculated: groups.length,
+        signature,
+        startedAt,
+        finishedAt,
+      };
+
+      await client.query(
+        `
+          INSERT INTO learning_state (
+            state_key, engine_version, model_version,
+            last_watermark, last_prediction_count, last_max_prediction_id,
+            last_fixture_date, last_run_id, last_run_started_at,
+            last_run_finished_at, full_rebuild_required, last_summary,
+            updated_at
+          ) VALUES (
+            'calibration-engine',$1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,$10::jsonb,NOW()
+          )
+          ON CONFLICT (state_key) DO UPDATE SET
+            engine_version = EXCLUDED.engine_version,
+            model_version = EXCLUDED.model_version,
+            last_watermark = EXCLUDED.last_watermark,
+            last_prediction_count = EXCLUDED.last_prediction_count,
+            last_max_prediction_id = EXCLUDED.last_max_prediction_id,
+            last_fixture_date = EXCLUDED.last_fixture_date,
+            last_run_id = EXCLUDED.last_run_id,
+            last_run_started_at = EXCLUDED.last_run_started_at,
+            last_run_finished_at = EXCLUDED.last_run_finished_at,
+            full_rebuild_required = FALSE,
+            last_summary = EXCLUDED.last_summary,
+            updated_at = NOW()
+        `,
+        [
+          LEARNING_ENGINE_VERSION,
+          LEARNING_MODEL_VERSION,
+          signature.watermark,
+          signature.predictionCount,
+          signature.maxPredictionId,
+          signature.lastFixtureDate,
+          runId,
+          startedAt,
+          finishedAt,
+          JSON.stringify(summary),
+        ]
+      );
+
+      await client.query(
+        `
+          UPDATE learning_runs
+          SET finished_at = $1, status = 'COMPLETED',
+              groups_calculated = $2, summary = $3::jsonb
+          WHERE id = $4
+        `,
+        [finishedAt, groups.length, JSON.stringify(summary), runId]
+      );
+
       await client.query("COMMIT");
+      return summary;
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
     } finally {
       client.release();
     }
-
-    const signatureAfter =
-      await readLearningDataSignature();
-
-    const finishedAt =
-      new Date().toISOString();
-
-    const summary = {
-      ok: true,
-      skipped: false,
-      source,
-      mode,
-
-      engineVersion:
-        LEARNING_ENGINE_VERSION,
-      modelVersion:
-        LEARNING_MODEL_VERSION,
-
-      predictionsFound:
-        signatureAfter.predictionCount,
-
-      newPredictions:
-        state
-          ? changes.newPredictions
-          : signatureAfter.predictionCount,
-
-      changedPredictions:
-        state
-          ? changes.changedPredictions
-          : signatureAfter.predictionCount,
-
-      groupsCalculated:
-        groups.length,
-
-      reliableGroups:
-        groups.filter(
-          (group) =>
-            group.reliabilityLevel !==
-            "INSUFFICIENT_DATA"
-        ).length,
-
-      versionChanged,
-      force,
-
-      previousWatermark:
-        state?.last_watermark || null,
-      watermark:
-        signatureAfter.watermark,
-
-      startedAt,
-      finishedAt,
-      groups,
-    };
-
-    await pool.query(
-      `
-        UPDATE learning_runs
-        SET
-          predictions_found = $1,
-          groups_calculated = $2,
-          new_predictions = $3,
-          changed_predictions = $4,
-          finished_at = $5,
-          status = 'COMPLETED',
-          run_mode = $6,
-          data_watermark = $7,
-          skipped_reason = NULL,
-          summary = $8::jsonb
-        WHERE id = $9
-      `,
-      [
-        summary.predictionsFound,
-        summary.groupsCalculated,
-        summary.newPredictions,
-        summary.changedPredictions,
-        finishedAt,
-        mode,
-        signatureAfter.watermark,
-        JSON.stringify(summary),
-        runId,
-      ]
-    );
-
-    await saveLearningState({
-      runId,
-      startedAt,
-      finishedAt,
-      signature:
-        signatureAfter,
-      summary,
-    });
-
-    console.log(
-      "ADAPTIVE LEARNING ENGINE V3 : terminé",
-      {
-        mode,
-        predictionsFound:
-          summary.predictionsFound,
-        newPredictions:
-          summary.newPredictions,
-        changedPredictions:
-          summary.changedPredictions,
-        groupsCalculated:
-          summary.groupsCalculated,
-        reliableGroups:
-          summary.reliableGroups,
-      }
-    );
-
-    return summary;
   } catch (error) {
-    const finishedAt =
-      new Date().toISOString();
-
+    const finishedAt = new Date();
     if (runId) {
       await pool.query(
         `
           UPDATE learning_runs
-          SET
-            finished_at = $1,
-            status = 'FAILED',
-            error_message = $2
+          SET finished_at = $1, status = 'FAILED', error_message = $2
           WHERE id = $3
         `,
-        [
-          finishedAt,
-          error?.message ||
-            "Erreur inconnue",
-          runId,
-        ]
-      ).catch(() => {});
+        [finishedAt, error?.message || "Erreur inconnue", runId]
+      ).catch(() => null);
     }
 
-    console.error(
-      "ADAPTIVE LEARNING ENGINE V3 : erreur",
-      error
-    );
-
+    console.error("ERREUR CALIBRATION ENGINE V1 :", error);
     return {
       ok: false,
       source,
       startedAt,
       finishedAt,
-      error:
-        error?.message ||
-        "Erreur inconnue",
+      error: error?.message || "Erreur inconnue",
     };
   } finally {
     learningEngineRunning = false;
   }
 }
 
-/*
- * Lancement manuel du Learning Engine.
- *
- * Normal :
- *   GET /internal/rebuild-learning-engine
- *
- * Rebuild complet forcé :
- *   GET /internal/rebuild-learning-engine?force=1
- */
 app.get(
   "/internal/rebuild-learning-engine",
   async (req, res) => {
-    const force =
-      parseLearningBoolean(
-        req.query.force
-      );
-
-    const summary =
-      await rebuildLearningEngine({
-        source: "manual-route",
-        force,
-      });
-
-    return res
-      .status(
-        summary.ok
-          ? 200
-          : 500
-      )
-      .json(summary);
+    const force = parseLearningBoolean(req.query.force);
+    const summary = await rebuildLearningEngine({
+      source: "manual-route",
+      force,
+    });
+    return res.status(summary.ok ? 200 : 500).json(summary);
   }
 );
 
-/*
- * État synthétique du Adaptive Learning V3.
- */
+/* Alias explicite pour la nouvelle architecture. */
+app.get(
+  "/internal/rebuild-calibration-engine",
+  async (req, res) => {
+    const force = parseLearningBoolean(req.query.force);
+    const summary = await rebuildLearningEngine({
+      source: "manual-calibration-route",
+      force,
+    });
+    return res.status(summary.ok ? 200 : 500).json(summary);
+  }
+);
+
 app.get(
   "/internal/learning/status",
   async (req, res) => {
     try {
       await ensureLearningEngineTables();
-
-      const [
-        state,
-        signature,
-        latestRunResult,
-      ] = await Promise.all([
-        readLearningState(),
-        readLearningDataSignature(),
-        pool.query(`
-          SELECT
-            id,
-            engine_version,
-            run_mode,
-            predictions_found,
-            groups_calculated,
-            new_predictions,
-            changed_predictions,
-            started_at,
-            finished_at,
-            status,
-            skipped_reason,
-            error_message,
-            data_watermark
-          FROM learning_runs
-          ORDER BY started_at DESC, id DESC
-          LIMIT 1
-        `),
-      ]);
+      const [state, signature, latestRunResult, groupCountResult] =
+        await Promise.all([
+          readLearningState(),
+          readLearningDataSignature(),
+          pool.query(`
+            SELECT * FROM learning_runs
+            ORDER BY started_at DESC, id DESC LIMIT 1
+          `),
+          pool.query(`SELECT COUNT(*)::INTEGER AS count FROM learning_calibration`),
+        ]);
 
       const versionChanged =
         !state ||
-        state.engine_version !==
-          LEARNING_ENGINE_VERSION ||
-        state.model_version !==
-          LEARNING_MODEL_VERSION;
+        state.engine_version !== LEARNING_ENGINE_VERSION ||
+        state.model_version !== LEARNING_MODEL_VERSION;
 
       return res.json({
         ok: true,
-        running:
-          learningEngineRunning,
-        engineVersion:
-          LEARNING_ENGINE_VERSION,
-        modelVersion:
-          LEARNING_MODEL_VERSION,
+        engine: "CALIBRATION_ENGINE",
+        running: learningEngineRunning,
+        engineVersion: LEARNING_ENGINE_VERSION,
+        modelVersion: LEARNING_MODEL_VERSION,
+        applyEnabled: CALIBRATION_APPLY_ENABLED,
+        observationOnly: !CALIBRATION_APPLY_ENABLED,
+        bucketSize: CALIBRATION_BUCKET_SIZE,
+        minimumProbability: CALIBRATION_MIN_PROBABILITY,
+        maximumAdjustment: CALIBRATION_MAX_ADJUSTMENT,
+        groupsCalculated: Number(groupCountResult.rows[0]?.count) || 0,
         needsRebuild:
           versionChanged ||
-          Boolean(
-            state?.full_rebuild_required
-          ) ||
-          !learningSignaturesMatch(
-            state,
-            signature
-          ),
+          Boolean(state?.full_rebuild_required) ||
+          !learningSignaturesMatch(state, signature),
         versionChanged,
         signature,
         state,
-        latestRun:
-          latestRunResult.rows[0] ||
-          null,
+        latestRun: latestRunResult.rows[0] || null,
       });
     } catch (error) {
       return res.status(500).json({
         ok: false,
         error:
           error?.message ||
-          "Impossible de lire le statut du Learning Engine",
+          "Impossible de lire le statut du Calibration Engine",
       });
     }
   }
 );
 
-/*
- * Prévisualise l'ajustement adaptatif sans modifier une prédiction.
- */
 app.get(
   "/public/learning/adaptive-adjustment",
   async (req, res) => {
     try {
       await ensureLearningEngineTables();
-
-      const result =
-        await getAdaptiveLearningAdjustment({
-          marketKey: req.query.marketKey,
-          decisionGrade: req.query.decisionGrade,
-          decisionType: req.query.decisionType,
-          baseProbability: req.query.probability,
-        });
-
-      return res.json({
-        ok: true,
-        ...result,
+      const result = await getAdaptiveLearningAdjustment({
+        marketKey: req.query.marketKey,
+        baseProbability: req.query.probability,
       });
+      return res.json({ ok: true, ...result });
     } catch (error) {
       return res.status(500).json({
         ok: false,
         error:
           error?.message ||
-          "Impossible de calculer l'ajustement adaptatif",
+          "Impossible de calculer la calibration",
       });
     }
   }
 );
 
-/*
- * Lecture des statistiques calculées.
- */
+app.get(
+  "/public/calibration/preview",
+  async (req, res) => {
+    try {
+      await ensureLearningEngineTables();
+      const result = await getAdaptiveLearningAdjustment({
+        marketKey: req.query.marketKey,
+        baseProbability: req.query.probability,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error: error?.message || "Impossible de prévisualiser la calibration",
+      });
+    }
+  }
+);
+
 app.get(
   "/public/learning/market-stats",
   async (req, res) => {
     try {
       await ensureLearningEngineTables();
-
-      const result =
-        await pool.query(`
-          SELECT
-            market_key,
-            decision_grade,
-            decision_type,
-
-            sample_size,
-            wins,
-            losses,
-
-            win_rate,
-            average_probability,
-            average_confidence,
-            average_market_odd,
-            average_value,
-
-            total_profit,
-            roi,
-            calibration_gap,
-
-            raw_weight,
-            applied_weight,
-
-            reliability_level,
-            engine_version,
-            calculated_at
-
-          FROM learning_market_stats
-
-          ORDER BY
-            sample_size DESC,
-            market_key ASC,
-            decision_grade ASC
-        `);
+      const result = await pool.query(`
+        SELECT
+          market_key, probability_bucket, bucket_lower, bucket_upper,
+          sample_size, wins, losses, predicted_mean, actual_mean,
+          calibration_gap, brier_score, log_loss, accuracy,
+          proposed_adjustment, applied_adjustment, confidence,
+          engine_version, model_version, calculated_at
+        FROM learning_calibration
+        ORDER BY sample_size DESC, market_key ASC, bucket_lower ASC
+      `);
 
       return res.json({
         ok: true,
-        count:
-          result.rows.length,
-        engineVersion:
-          LEARNING_ENGINE_VERSION,
-        modelVersion:
-          LEARNING_MODEL_VERSION,
-        stats:
-          result.rows,
+        count: result.rows.length,
+        engineVersion: LEARNING_ENGINE_VERSION,
+        modelVersion: LEARNING_MODEL_VERSION,
+        applyEnabled: CALIBRATION_APPLY_ENABLED,
+        stats: result.rows,
       });
     } catch (error) {
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          stats: [],
-          error:
-            error?.message ||
-            "Impossible de charger les statistiques du Learning Engine",
-        });
+      return res.status(500).json({
+        ok: false,
+        stats: [],
+        error:
+          error?.message ||
+          "Impossible de charger les statistiques de calibration",
+      });
+    }
+  }
+);
+
+app.get(
+  "/public/calibration/history",
+  async (req, res) => {
+    try {
+      await ensureLearningEngineTables();
+      const limit = Math.min(
+        500,
+        Math.max(1, Number(req.query.limit) || 100)
+      );
+      const marketKey = normalizeAdaptiveLearningKey(req.query.marketKey);
+      const bucket = String(req.query.bucket || "").trim();
+
+      const values = [];
+      const where = [];
+      if (marketKey) {
+        values.push(marketKey);
+        where.push(`market_key = $${values.length}`);
+      }
+      if (bucket) {
+        values.push(bucket);
+        where.push(`probability_bucket = $${values.length}`);
+      }
+      values.push(limit);
+
+      const result = await pool.query(
+        `
+          SELECT * FROM learning_history
+          ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+          ORDER BY created_at DESC, id DESC
+          LIMIT $${values.length}
+        `,
+        values
+      );
+
+      return res.json({
+        ok: true,
+        count: result.rows.length,
+        history: result.rows,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        history: [],
+        error: error?.message || "Impossible de charger l'historique de calibration",
+      });
     }
   }
 );
