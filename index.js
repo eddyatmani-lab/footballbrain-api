@@ -15295,224 +15295,166 @@ app.get(
 );
 
 
-// === STATISTIQUES GLOBALES DU BILAN ===
-/*
- * À ajouter dans le fichier principal Express de footballbrain-api,
- * après la création de `app` et de `pool`.
- *
- * Cette route complète /internal/stats avec :
- * - decisionLevels globaux ;
- * - comparisons globales ;
- * sans calculer les chiffres depuis les rapports paginés du navigateur.
- */
+/* ==========================================================================\n * BILAN V3 — STATISTIQUES GLOBALES + COTES MANUELLES ADMIN\n * ========================================================================== */
+async function ensureBilanV3Columns() {
+  await pool.query(`
+    ALTER TABLE predictions
+      ADD COLUMN IF NOT EXISTS manual_market_odd NUMERIC,
+      ADD COLUMN IF NOT EXISTS manual_odd_source TEXT,
+      ADD COLUMN IF NOT EXISTS manual_odd_entered_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS manual_odd_entered_by TEXT;
+  `);
+}
+
+function requireOptionalAdminKey(req, res) {
+  const configuredKey = String(process.env.ADMIN_API_KEY || "").trim();
+  if (!configuredKey) return true;
+
+  const receivedKey = String(req.headers["x-admin-key"] || "").trim();
+  if (receivedKey === configuredKey) return true;
+
+  res.status(401).json({
+    ok: false,
+    error: "Clé administrateur invalide.",
+  });
+  return false;
+}
+
+function parseBilanSnapshot(value) {
+  if (value && typeof value === "object") return value;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function numberOrBilan(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function firstDefinedBilan(...values) {
+  return values.find(
+    (value) => value !== undefined && value !== null && value !== ""
+  );
+}
+
+function getHighestScoreStudioMarket(prediction = {}) {
+  const snapshot = parseBilanSnapshot(prediction.studio_snapshot);
+  const markets = Array.isArray(snapshot?.markets)
+    ? snapshot.markets
+    : Array.isArray(snapshot?.studio?.markets)
+      ? snapshot.studio.markets
+      : [];
+
+  if (markets.length === 0) return snapshot?.primaryMarket || {};
+
+  return markets.reduce((best, current) => {
+    if (!current) return best;
+    if (!best) return current;
+
+    const currentScore = numberOrBilan(
+      current?.decision?.score ??
+        current?.marketDecision?.score ??
+        current?.decisionScore ??
+        current?.score,
+      Number.NEGATIVE_INFINITY
+    );
+    const bestScore = numberOrBilan(
+      best?.decision?.score ??
+        best?.marketDecision?.score ??
+        best?.decisionScore ??
+        best?.score,
+      Number.NEGATIVE_INFINITY
+    );
+
+    return currentScore > bestScore ? current : best;
+  }, null) || {};
+}
+
+function getGlobalDecisionCategory(prediction = {}) {
+  const market = getHighestScoreStudioMarket(prediction);
+  const type = String(
+    firstDefinedBilan(
+      market?.decision?.type,
+      market?.marketDecision?.type,
+      prediction.studio_decision_type,
+      prediction.bet_status,
+      ""
+    )
+  )
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, "_");
+
+  if (["VALUE_BET", "STRONG_OPPORTUNITY"].includes(type)) return "strong";
+  if (["BET", "RECOMMENDED_BET", "OPPORTUNITY"].includes(type)) return "opportunity";
+  if (["WATCH", "PRUDENCE", "TO_WATCH", "MOST_PROBABLE_MARKET", "À_SURVEILLER", "A_SURVEILLER"].includes(type)) return "watch";
+  if (["AVOID", "BALANCED_MARKET"].includes(type)) return "avoid";
+
+  const probability = numberOrBilan(
+    firstDefinedBilan(
+      market?.fairOdds?.calibratedProbability,
+      market?.calibratedProbability,
+      market?.probability,
+      prediction.studio_probability,
+      prediction.home_probability,
+      prediction.draw_probability,
+      prediction.away_probability
+    ),
+    0
+  );
+  const score = numberOrBilan(
+    firstDefinedBilan(
+      market?.decision?.score,
+      market?.marketDecision?.score,
+      market?.decisionScore,
+      prediction.studio_decision_score,
+      prediction.confidence
+    ),
+    0
+  );
+  const risk = numberOrBilan(prediction.risk, 50);
+  const value = numberOrBilan(prediction.value_percentage, 0);
+
+  if (probability >= 60 && score >= 65 && risk <= 55 && value >= 3) return "strong";
+  if (probability >= 54 && score >= 58 && risk <= 65) return "opportunity";
+  if (probability >= 47 || score >= 50) return "watch";
+
+  // Aucun match terminé ne reste hors des quatre niveaux.
+  return "avoid";
+}
 
 app.get("/public/bilan/stats", async (req, res) => {
   try {
+    await ensureBilanV3Columns();
+
     const { rows } = await pool.query(`
-      SELECT to_jsonb(p) AS prediction
-      FROM predictions p
-      ORDER BY COALESCE(
-        NULLIF(to_jsonb(p)->>'fixture_date', '')::timestamptz,
-        NULLIF(to_jsonb(p)->>'created_at', '')::timestamptz,
-        NOW()
-      ) DESC
+      SELECT
+        fixture_id,
+        result_status,
+        bet_status,
+        confidence,
+        risk,
+        home_probability,
+        draw_probability,
+        away_probability,
+        value_percentage,
+        market_odd,
+        manual_market_odd,
+        won,
+        profit,
+        studio_snapshot,
+        studio_probability,
+        studio_decision_score,
+        studio_decision_type
+      FROM predictions
+      WHERE result_status = 'COMPLETED'
     `);
-
-    const numberOr = (value, fallback = 0) => {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) ? parsed : fallback;
-    };
-
-    const firstDefined = (...values) =>
-      values.find(
-        (value) =>
-          value !== undefined &&
-          value !== null &&
-          value !== ""
-      );
-
-    const parseSnapshot = (value) => {
-      if (value && typeof value === "object") return value;
-      if (typeof value === "string") {
-        try {
-          return JSON.parse(value);
-        } catch {
-          return {};
-        }
-      }
-      return {};
-    };
-
-    const getDecisionScore = (market = {}) =>
-      numberOr(
-        market?.decision?.score ??
-          market?.marketDecision?.score ??
-          market?.decisionScore ??
-          market?.score,
-        Number.NEGATIVE_INFINITY
-      );
-
-    const getPrimaryMarket = (prediction = {}) => {
-      const snapshot = parseSnapshot(prediction.studio_snapshot);
-      const markets = Array.isArray(snapshot?.markets)
-        ? snapshot.markets
-        : Array.isArray(snapshot?.studio?.markets)
-          ? snapshot.studio.markets
-          : [];
-
-      if (markets.length === 0) {
-        return snapshot?.primaryMarket || {};
-      }
-
-      return markets.reduce((best, current) => {
-        if (!current) return best;
-        if (!best) return current;
-        return getDecisionScore(current) > getDecisionScore(best)
-          ? current
-          : best;
-      }, null) || {};
-    };
-
-    const normalizeDecisionType = (prediction = {}, market = {}) =>
-      String(
-        firstDefined(
-          market?.decision?.type,
-          market?.marketDecision?.type,
-          prediction.studio_decision_type,
-          prediction.bet_status,
-          "NO_BET"
-        )
-      )
-        .trim()
-        .toUpperCase()
-        .replace(/[\s-]+/g, "_");
-
-    const getCategory = (prediction = {}, market = {}) => {
-      const type = normalizeDecisionType(prediction, market);
-
-      if (["VALUE_BET", "STRONG_OPPORTUNITY"].includes(type)) {
-        return "strong";
-      }
-
-      if (["BET", "RECOMMENDED_BET", "OPPORTUNITY"].includes(type)) {
-        return "opportunity";
-      }
-
-      if (["WATCH", "PRUDENCE", "TO_WATCH", "MOST_PROBABLE_MARKET"].includes(type)) {
-        return "watch";
-      }
-
-      if (["AVOID", "BALANCED_MARKET"].includes(type)) {
-        return "avoid";
-      }
-
-      const probability = numberOr(
-        firstDefined(
-          prediction.studio_probability,
-          prediction.prediction_probability,
-          prediction.probability,
-          market?.fairOdds?.calibratedProbability,
-          market?.calibratedProbability,
-          market?.probability
-        )
-      );
-
-      const confidence = numberOr(
-        firstDefined(
-          prediction.studio_decision_score,
-          prediction.decision_score,
-          prediction.confidence,
-          market?.decision?.score,
-          market?.marketDecision?.score,
-          market?.decisionScore,
-          market?.score
-        ),
-        50
-      );
-
-      const risk = numberOr(
-        firstDefined(prediction.risk_score, prediction.risk),
-        50
-      );
-
-      const valueEdge = numberOr(
-        firstDefined(prediction.value_percentage, prediction.value_edge)
-      );
-
-      if (
-        probability >= 60 &&
-        confidence >= 65 &&
-        risk <= 55 &&
-        valueEdge >= 3
-      ) {
-        return "strong";
-      }
-
-      if (
-        probability >= 54 &&
-        confidence >= 58 &&
-        risk <= 65
-      ) {
-        return "opportunity";
-      }
-
-      if (probability >= 47 || confidence >= 50) {
-        return "watch";
-      }
-
-      return "avoid";
-    };
-
-    const getResultStatus = (prediction = {}) => {
-      if (prediction.won === true) return "win";
-      if (prediction.won === false) return "loss";
-
-      const status = String(prediction.result_status || "")
-        .trim()
-        .toLowerCase();
-
-      if (["win", "won"].includes(status)) return "win";
-      if (["loss", "lost"].includes(status)) return "loss";
-      return null;
-    };
-
-    const getRealOdd = (prediction = {}, market = {}) => {
-      const odd = Number(
-        firstDefined(
-          market?.odds?.marketOdd,
-          prediction.market_odd,
-          prediction.bookmaker_odd,
-          prediction.odds
-        )
-      );
-      return Number.isFinite(odd) && odd > 1 ? odd : null;
-    };
-
-    const getProbability = (prediction = {}, market = {}) => {
-      const probability = Number(
-        firstDefined(
-          prediction.studio_probability,
-          prediction.prediction_probability,
-          prediction.probability,
-          market?.fairOdds?.calibratedProbability,
-          market?.calibratedProbability,
-          market?.probability
-        )
-      );
-
-      return Number.isFinite(probability) &&
-        probability > 0 &&
-        probability < 100
-        ? probability
-        : null;
-    };
-
-    const emptySimulation = () => ({ stakes: 0, profit: 0, roi: 0 });
-    const comparisons = {
-      notPlayed: emptySimulation(),
-      allRealMarkets: emptySimulation(),
-      theoreticalOdds: emptySimulation(),
-    };
 
     const decisionLevels = {
       strong: 0,
@@ -15521,62 +15463,149 @@ app.get("/public/bilan/stats", async (req, res) => {
       avoid: 0,
     };
 
-    for (const row of rows) {
-      const prediction = row.prediction || {};
-      const resultStatus = getResultStatus(prediction);
-      if (!resultStatus) continue;
-
-      const market = getPrimaryMarket(prediction);
-      const category = getCategory(prediction, market);
-      decisionLevels[category] += 1;
-
-      const realOdd = getRealOdd(prediction, market);
-      const probability = getProbability(prediction, market);
-
-      if (realOdd !== null) {
-        const profit = resultStatus === "win" ? realOdd - 1 : -1;
-
-        comparisons.allRealMarkets.stakes += 1;
-        comparisons.allRealMarkets.profit += profit;
-
-        if (category === "watch" || category === "avoid") {
-          comparisons.notPlayed.stakes += 1;
-          comparisons.notPlayed.profit += profit;
-        }
-      } else if (probability !== null) {
-        const theoreticalOdd = Math.max(
-          1.01,
-          Math.min(100, 100 / probability)
-        );
-        const profit = resultStatus === "win"
-          ? theoreticalOdd - 1
-          : -1;
-
-        comparisons.theoreticalOdds.stakes += 1;
-        comparisons.theoreticalOdds.profit += profit;
-      }
+    let manualOddsCount = 0;
+    for (const prediction of rows) {
+      decisionLevels[getGlobalDecisionCategory(prediction)] += 1;
+      if (Number(prediction.manual_market_odd) > 1) manualOddsCount += 1;
     }
 
-    for (const simulation of Object.values(comparisons)) {
-      simulation.profit = Number(simulation.profit.toFixed(2));
-      simulation.roi = simulation.stakes > 0
-        ? Number(((simulation.profit / simulation.stakes) * 100).toFixed(1))
-        : 0;
-    }
+    const baseStatsResponse = await pool.query(`
+      SELECT
+        COUNT(*)::INTEGER AS total_predictions,
+        COUNT(*) FILTER (WHERE result_status = 'COMPLETED')::INTEGER AS completed_predictions,
+        COUNT(*) FILTER (WHERE result_status = 'PENDING')::INTEGER AS pending_predictions,
+        COUNT(*) FILTER (WHERE bet_status = 'NO_BET')::INTEGER AS no_bet,
+        COUNT(*) FILTER (
+          WHERE result_status = 'COMPLETED'
+            AND bet_status <> 'NO_BET'
+            AND won IS NOT NULL
+        )::INTEGER AS settled_bets,
+        COUNT(*) FILTER (WHERE won = TRUE)::INTEGER AS wins,
+        COUNT(*) FILTER (WHERE won = FALSE)::INTEGER AS losses,
+        COALESCE(SUM(profit) FILTER (
+          WHERE result_status = 'COMPLETED' AND bet_status <> 'NO_BET'
+        ), 0)::NUMERIC AS total_profit,
+        COALESCE(AVG(confidence), 0)::NUMERIC AS average_confidence
+      FROM predictions
+    `);
 
-    res.json({
+    const row = baseStatsResponse.rows[0] || {};
+    const settledBets = Number(row.settled_bets || 0);
+    const wins = Number(row.wins || 0);
+    const totalProfit = Number(row.total_profit || 0);
+
+    return res.json({
       ok: true,
       stats: {
+        totalPredictions: Number(row.total_predictions || 0),
+        completedPredictions: Number(row.completed_predictions || 0),
+        pendingPredictions: Number(row.pending_predictions || 0),
+        noBet: Number(row.no_bet || 0),
+        settledBets,
+        wins,
+        losses: Number(row.losses || 0),
+        winRate: settledBets > 0 ? Number(((wins / settledBets) * 100).toFixed(1)) : 0,
+        totalProfit: Number(totalProfit.toFixed(2)),
+        roi: settledBets > 0 ? Number(((totalProfit / settledBets) * 100).toFixed(1)) : 0,
+        averageConfidence: Number(Number(row.average_confidence || 0).toFixed(1)),
         decisionLevels,
-        comparisons,
+        decisionLevelsTotal: Object.values(decisionLevels).reduce((sum, value) => sum + value, 0),
+        manualOdds: {
+          completedWithManualOdd: manualOddsCount,
+          completedWithoutManualOdd: Math.max(0, rows.length - manualOddsCount),
+        },
       },
     });
   } catch (error) {
-    console.error("Erreur /public/bilan/stats :", error);
-    res.status(500).json({
+    console.error("ERREUR /public/bilan/stats :", error);
+    return res.status(500).json({
       ok: false,
-      error: error?.message || "Erreur statistiques globales du Bilan",
+      error: error.message || "Impossible de calculer les statistiques globales du Bilan.",
     });
+  }
+});
+
+app.get("/internal/admin/bilan/markets", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+
+  try {
+    await ensureBilanV3Columns();
+    const onlyMissing = String(req.query.missingOdd || "") === "1";
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+    const { rows } = await pool.query(`
+      SELECT
+        fixture_id,
+        fixture_date,
+        league_name,
+        home_team_name,
+        away_team_name,
+        home_goals,
+        away_goals,
+        studio_market_key,
+        studio_market_label,
+        studio_decision_type,
+        studio_decision_score,
+        result_status,
+        won,
+        market_odd,
+        manual_market_odd,
+        manual_odd_source,
+        manual_odd_entered_at,
+        manual_odd_entered_by
+      FROM predictions
+      WHERE result_status = 'COMPLETED'
+        AND ($1::boolean = FALSE OR manual_market_odd IS NULL)
+      ORDER BY fixture_date DESC NULLS LAST, updated_at DESC NULLS LAST
+      LIMIT $2 OFFSET $3
+    `, [onlyMissing, limit, offset]);
+
+    return res.json({ ok: true, count: rows.length, limit, offset, markets: rows });
+  } catch (error) {
+    console.error("ERREUR /internal/admin/bilan/markets :", error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.put("/internal/admin/bilan/markets/:fixtureId/odd", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+
+  try {
+    await ensureBilanV3Columns();
+    const fixtureId = Number(req.params.fixtureId);
+    const odd = Number(req.body?.odd);
+    const source = String(req.body?.source || "Saisie manuelle").trim();
+    const enteredBy = String(req.body?.enteredBy || "admin").trim();
+
+    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+      return res.status(400).json({ ok: false, error: "fixtureId invalide." });
+    }
+    if (!Number.isFinite(odd) || odd <= 1 || odd > 1000) {
+      return res.status(400).json({ ok: false, error: "La cote doit être supérieure à 1." });
+    }
+
+    const { rows } = await pool.query(`
+      UPDATE predictions
+      SET
+        manual_market_odd = $1,
+        manual_odd_source = $2,
+        manual_odd_entered_by = $3,
+        manual_odd_entered_at = NOW(),
+        updated_at = NOW()
+      WHERE fixture_id = $4
+      RETURNING fixture_id, manual_market_odd, manual_odd_source,
+                manual_odd_entered_at, manual_odd_entered_by
+    `, [odd, source, enteredBy, fixtureId]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "Prédiction introuvable." });
+    }
+
+    return res.json({ ok: true, market: rows[0] });
+  } catch (error) {
+    console.error("ERREUR PUT cote manuelle :", error);
+    return res.status(500).json({ ok: false, error: error.message });
   }
 });
 
