@@ -11287,6 +11287,43 @@ async function runAutomaticResultSync() {
     ALTER TABLE predictions
     ADD COLUMN IF NOT EXISTS
       studio_saved_at TIMESTAMPTZ;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      analysis_status TEXT;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      analysis_error TEXT;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      analysis_status_updated_at TIMESTAMPTZ;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_rebuild_attempts INTEGER NOT NULL DEFAULT 0;
+
+    ALTER TABLE predictions
+    ADD COLUMN IF NOT EXISTS
+      studio_last_rebuild_at TIMESTAMPTZ;
+
+    UPDATE predictions
+    SET
+      analysis_status = CASE
+        WHEN studio_snapshot IS NOT NULL
+         AND jsonb_typeof(studio_snapshot) = 'object'
+         AND NULLIF(BTRIM(studio_market_key), '') IS NOT NULL
+         AND NULLIF(BTRIM(studio_market_label), '') IS NOT NULL
+         AND studio_probability IS NOT NULL
+         AND studio_decision_score IS NOT NULL
+          THEN 'READY'
+        WHEN result_status = 'COMPLETED'
+          THEN 'REBUILD_REQUIRED'
+        ELSE 'PENDING_API'
+      END,
+      analysis_status_updated_at = COALESCE(analysis_status_updated_at, NOW())
+    WHERE analysis_status IS NULL;
   `);
 
   console.log(
@@ -11798,6 +11835,9 @@ async function saveStudioSnapshot({
         studio_analysis_version = $7,
         studio_snapshot = $8::jsonb,
         studio_saved_at = NOW(),
+        analysis_status = 'READY',
+        analysis_error = NULL,
+        analysis_status_updated_at = NOW(),
         updated_at = NOW()
       WHERE fixture_id = $9
       RETURNING
@@ -13288,7 +13328,8 @@ function buildAutomaticStudioSnapshot(
 }
 
 async function rebuildAutomaticStudioSnapshot(
-  fixtureId
+  fixtureId,
+  { allowHistorical = false } = {}
 ) {
   const normalizedFixtureId =
     Number(fixtureId);
@@ -13408,7 +13449,8 @@ async function rebuildAutomaticStudioSnapshot(
       kickoff.getTime()
     ) &&
     kickoff.getTime() <=
-      Date.now()
+      Date.now() &&
+    !allowHistorical
   ) {
     return {
       fixtureId:
@@ -15526,6 +15568,77 @@ app.get("/public/bilan/stats", async (req, res) => {
 });
 
 
+async function markStudioAnalysisStatus(
+  fixtureId,
+  status,
+  errorMessage = null,
+  { incrementAttempt = false } = {}
+) {
+  const allowedStatuses = new Set([
+    "READY",
+    "PENDING_API",
+    "REBUILD_REQUIRED",
+    "ERROR",
+  ]);
+
+  const normalizedStatus = String(status || "").toUpperCase();
+
+  if (!allowedStatuses.has(normalizedStatus)) {
+    throw new Error(`analysis_status invalide : ${normalizedStatus}`);
+  }
+
+  await pool.query(
+    `
+      UPDATE predictions
+      SET
+        analysis_status = $1,
+        analysis_error = $2,
+        analysis_status_updated_at = NOW(),
+        studio_last_rebuild_at = CASE
+          WHEN $3::boolean THEN NOW()
+          ELSE studio_last_rebuild_at
+        END,
+        studio_rebuild_attempts = studio_rebuild_attempts +
+          CASE WHEN $3::boolean THEN 1 ELSE 0 END,
+        updated_at = NOW()
+      WHERE fixture_id = $4
+    `,
+    [
+      normalizedStatus,
+      errorMessage ? String(errorMessage).slice(0, 2000) : null,
+      Boolean(incrementAttempt),
+      Number(fixtureId),
+    ]
+  );
+}
+
+function classifyStudioRebuildError(error) {
+  const message = String(
+    error?.response?.data?.message ||
+    error?.response?.data?.error ||
+    error?.message ||
+    "Erreur inconnue"
+  );
+
+  const normalized = message.toLowerCase();
+  const apiUnavailable =
+    normalized.includes("quota") ||
+    normalized.includes("rate limit") ||
+    normalized.includes("too many requests") ||
+    normalized.includes("429") ||
+    normalized.includes("api_football") ||
+    normalized.includes("api-football") ||
+    normalized.includes("timeout") ||
+    normalized.includes("econnreset") ||
+    normalized.includes("enotfound");
+
+  return {
+    status: apiUnavailable ? "PENDING_API" : "ERROR",
+    probableCause: apiUnavailable ? "API_INDISPONIBLE_OU_QUOTA" : "ERREUR_RECONSTRUCTION",
+    message,
+  };
+}
+
 /*
  * ADMIN — VÉRIFICATION MARCHÉ BILAN
  *
@@ -15606,6 +15719,12 @@ app.get("/internal/admin/brainstudio/rebuild-needed", async (req, res) => {
             studio_decision_grade,
             studio_analysis_version,
             studio_saved_at,
+            analysis_status,
+            analysis_error,
+            analysis_status_updated_at,
+            studio_rebuild_attempts,
+            studio_last_rebuild_at,
+            created_at,
             updated_at,
             ARRAY_REMOVE(ARRAY[
               CASE WHEN studio_snapshot IS NULL THEN 'SNAPSHOT_ABSENT' END,
@@ -15656,10 +15775,21 @@ app.get("/internal/admin/brainstudio/rebuild-needed", async (req, res) => {
         offset + matchesResult.rows.length < needsRebuild
           ? offset + matchesResult.rows.length
           : null,
-      matches: matchesResult.rows.map((row) => ({
-        ...row,
-        status: "REBUILD_REQUIRED",
-      })),
+      matches: matchesResult.rows.map((row) => {
+        const reasons = Array.isArray(row.reasons) ? row.reasons : [];
+        const probableCause =
+          row.analysis_status === "PENDING_API"
+            ? "API_INDISPONIBLE_OU_QUOTA"
+            : reasons.includes("SNAPSHOT_ABSENT") && !row.studio_saved_at
+              ? "ANALYSE_BRAIN_STUDIO_JAMAIS_SAUVEGARDEE"
+              : "SNAPSHOT_INCOMPLET_OU_ANCIEN";
+
+        return {
+          ...row,
+          status: row.analysis_status || "REBUILD_REQUIRED",
+          probableCause,
+        };
+      }),
     });
   } catch (error) {
     console.error(
@@ -15674,6 +15804,150 @@ app.get("/internal/admin/brainstudio/rebuild-needed", async (req, res) => {
         error?.message ||
         "Impossible d'effectuer la vérification des marchés du Bilan.",
     });
+  }
+});
+
+app.post("/internal/admin/brainstudio/rebuild-missing", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+
+  if (automaticStudioRebuildRunning) {
+    return res.status(409).json({
+      ok: false,
+      error: "Une reconstruction Brain Studio est déjà en cours.",
+    });
+  }
+
+  automaticStudioRebuildRunning = true;
+
+  try {
+    await ensureStudioPredictionColumns();
+
+    const requestedLimit = Number(req.body?.limit);
+    const limit =
+      Number.isInteger(requestedLimit) && requestedLimit > 0
+        ? Math.min(requestedLimit, 100)
+        : 100;
+
+    const requestedFixtureIds = Array.isArray(req.body?.fixtureIds)
+      ? [...new Set(
+          req.body.fixtureIds
+            .map(Number)
+            .filter((id) => Number.isInteger(id) && id > 0)
+        )]
+      : [];
+
+    const params = [];
+    let fixtureFilter = "";
+
+    if (requestedFixtureIds.length > 0) {
+      params.push(requestedFixtureIds);
+      fixtureFilter = `AND fixture_id = ANY($${params.length}::int[])`;
+    }
+
+    params.push(limit);
+
+    const candidatesResult = await pool.query(
+      `
+        SELECT fixture_id, home_team_name, away_team_name
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+          AND (
+            studio_snapshot IS NULL
+            OR jsonb_typeof(studio_snapshot) <> 'object'
+            OR NULLIF(BTRIM(studio_market_key), '') IS NULL
+            OR NULLIF(BTRIM(studio_market_label), '') IS NULL
+            OR studio_probability IS NULL
+            OR studio_decision_score IS NULL
+          )
+          ${fixtureFilter}
+        ORDER BY fixture_date ASC NULLS LAST, fixture_id ASC
+        LIMIT $${params.length}
+      `,
+      params
+    );
+
+    const results = [];
+    let rebuilt = 0;
+    let pendingApi = 0;
+    let failed = 0;
+
+    for (const candidate of candidatesResult.rows) {
+      const fixtureId = Number(candidate.fixture_id);
+
+      try {
+        await markStudioAnalysisStatus(
+          fixtureId,
+          "REBUILD_REQUIRED",
+          null,
+          { incrementAttempt: true }
+        );
+
+        const rebuiltResult = await rebuildAutomaticStudioSnapshot(
+          fixtureId,
+          { allowHistorical: true }
+        );
+
+        await markStudioAnalysisStatus(fixtureId, "READY");
+        rebuilt += 1;
+
+        results.push({
+          fixtureId,
+          homeTeam: candidate.home_team_name || null,
+          awayTeam: candidate.away_team_name || null,
+          ok: true,
+          status: "READY",
+          marketKey: rebuiltResult?.primaryMarket?.key || null,
+          marketLabel: rebuiltResult?.primaryMarket?.label || null,
+        });
+      } catch (error) {
+        const classification = classifyStudioRebuildError(error);
+
+        await markStudioAnalysisStatus(
+          fixtureId,
+          classification.status,
+          classification.message
+        );
+
+        if (classification.status === "PENDING_API") {
+          pendingApi += 1;
+        } else {
+          failed += 1;
+        }
+
+        results.push({
+          fixtureId,
+          homeTeam: candidate.home_team_name || null,
+          awayTeam: candidate.away_team_name || null,
+          ok: false,
+          status: classification.status,
+          probableCause: classification.probableCause,
+          error: classification.message,
+        });
+      }
+    }
+
+    return res.json({
+      ok: failed === 0,
+      requested: candidatesResult.rows.length,
+      processed: results.length,
+      rebuilt,
+      pendingApi,
+      failed,
+      remainingAuditRecommended: true,
+      results,
+    });
+  } catch (error) {
+    console.error(
+      "ERREUR /internal/admin/brainstudio/rebuild-missing :",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || "Impossible de reconstruire les analyses.",
+    });
+  } finally {
+    automaticStudioRebuildRunning = false;
   }
 });
 
