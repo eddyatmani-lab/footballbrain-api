@@ -10896,7 +10896,141 @@ async function checkDailyFullAnalysisSchedule() {
     );
   }
 }
+/**
+ * BILAN PUBLIC — RAPPORTS TERMINÉS PAGINÉS
+ *
+ * Cette route ne renvoie pas les énormes snapshots complets.
+ * Elle retourne uniquement les informations nécessaires
+ * pour afficher les cartes du Bilan.
+ */
+app.get(
+  "/public/bilan/reports",
+  async (req, res) => {
+    try {
+      const requestedLimit = Number(
+        req.query.limit
+      );
 
+      const requestedOffset = Number(
+        req.query.offset
+      );
+
+      const limit =
+        Number.isInteger(requestedLimit) &&
+        requestedLimit > 0
+          ? Math.min(requestedLimit, 100)
+          : 20;
+
+      const offset =
+        Number.isInteger(requestedOffset) &&
+        requestedOffset >= 0
+          ? requestedOffset
+          : 0;
+
+      /*
+       * On demande une ligne supplémentaire afin de savoir
+       * s'il reste une page, sans lancer un COUNT(*) séparé.
+       */
+      const queryLimit = limit + 1;
+
+      const result = await pool.query(
+        `
+          SELECT
+            id,
+            fixture_id,
+            fixture_date,
+
+            league_id,
+            league_name,
+
+            home_team_id,
+            home_team_name,
+            away_team_id,
+            away_team_name,
+
+            home_goals,
+            away_goals,
+
+            decision,
+            selected_outcome,
+            bet_status,
+            confidence,
+            risk,
+
+            home_probability,
+            draw_probability,
+            away_probability,
+
+            fair_odd,
+            market_odd,
+            value_percentage,
+
+            result_status,
+            won,
+            profit,
+
+            studio_market_key,
+            studio_market_label,
+            studio_probability,
+            studio_decision_score,
+            studio_decision_type,
+            studio_decision_grade,
+            studio_analysis_version,
+
+            updated_at
+          FROM predictions
+          WHERE result_status = 'COMPLETED'
+          ORDER BY
+            fixture_date DESC NULLS LAST,
+            updated_at DESC NULLS LAST,
+            id DESC
+          LIMIT $1
+          OFFSET $2
+        `,
+        [queryLimit, offset]
+      );
+
+      const hasMore =
+        result.rows.length > limit;
+
+      const reports = hasMore
+        ? result.rows.slice(0, limit)
+        : result.rows;
+
+      return res.json({
+        ok: true,
+
+        count: reports.length,
+        limit,
+        offset,
+
+        hasMore,
+
+        nextOffset: hasMore
+          ? offset + reports.length
+          : null,
+
+        reports,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /public/bilan/reports :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        reports: [],
+        count: 0,
+        hasMore: false,
+        nextOffset: null,
+        error:
+          error.message ||
+          "Impossible de charger les rapports du Bilan.",
+      });
+    }
+  }
+);
 /*
  * DÉMARRAGE DU SERVEUR
  */
@@ -15288,4 +15422,3 @@ checkDailyFullAnalysisSchedule()
   });
   }
 );
- 
