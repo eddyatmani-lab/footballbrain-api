@@ -11817,10 +11817,27 @@ async function saveStudioSnapshot({
       decisionType
     );
 
+  const normalizedDecisionGrade =
+    decisionGrade
+      ? String(decisionGrade).toUpperCase()
+      : "UNRATED";
+
+  const adaptiveLearning =
+    await getAdaptiveLearningAdjustment({
+      marketKey: normalizedMarketKey,
+      decisionGrade: normalizedDecisionGrade,
+      decisionType: normalizedDecisionType,
+      baseProbability: normalizedProbability,
+    });
+
+  const finalStudioProbability =
+    adaptiveLearning.adjustedProbability;
+
   const compactSnapshot =
-    compactStudioSnapshot(
-      snapshot || {}
-    );
+    compactStudioSnapshot({
+      ...(snapshot || {}),
+      adaptiveLearning,
+    });
 
   const result = await queryWithRetry(
     `
@@ -11828,23 +11845,32 @@ async function saveStudioSnapshot({
       SET
         studio_market_key = $1,
         studio_market_label = $2,
-        studio_probability = $3,
-        studio_decision_score = $4,
-        studio_decision_type = $5,
-        studio_decision_grade = $6,
-        studio_analysis_version = $7,
-        studio_snapshot = $8::jsonb,
+        studio_base_probability = $3,
+        studio_probability = $4,
+        studio_decision_score = $5,
+        studio_decision_type = $6,
+        studio_decision_grade = $7,
+        studio_analysis_version = $8,
+        studio_snapshot = $9::jsonb,
+        learning_probability_adjustment = $10,
+        learning_applied_weight = $11,
+        learning_engine_version = $12,
+        learning_applied_at = NOW(),
         studio_saved_at = NOW(),
         analysis_status = 'READY',
         analysis_error = NULL,
         analysis_status_updated_at = NOW(),
         updated_at = NOW()
-      WHERE fixture_id = $9
+      WHERE fixture_id = $13
       RETURNING
         fixture_id,
         studio_market_key,
         studio_market_label,
+        studio_base_probability,
         studio_probability,
+        learning_probability_adjustment,
+        learning_applied_weight,
+        learning_engine_version,
         studio_decision_score,
         studio_decision_type,
         studio_decision_grade,
@@ -11861,15 +11887,13 @@ async function saveStudioSnapshot({
 
       normalizedProbability,
 
+      finalStudioProbability,
+
       normalizedDecisionScore,
 
       normalizedDecisionType,
 
-      decisionGrade
-        ? String(
-            decisionGrade
-          ).toUpperCase()
-        : null,
+      normalizedDecisionGrade,
 
       String(
         analysisVersion ||
@@ -11879,6 +11903,12 @@ async function saveStudioSnapshot({
       JSON.stringify(
         compactSnapshot
       ),
+
+      adaptiveLearning.adjustment,
+
+      adaptiveLearning.appliedWeight,
+
+      LEARNING_ENGINE_VERSION,
 
       normalizedFixtureId,
     ]
@@ -14391,7 +14421,7 @@ app.get(
 );
     /*
  * ============================================================
- * FOOTBALLBRAIN — LEARNING ENGINE V2
+ * FOOTBALLBRAIN — ADAPTIVE LEARNING ENGINE V3
  * ============================================================
  *
  * Principes :
@@ -14407,7 +14437,7 @@ app.get(
 let learningEngineRunning = false;
 
 const LEARNING_ENGINE_VERSION =
-  "learning-engine-v2.0";
+  "learning-engine-v3.0";
 
 /*
  * À incrémenter lorsqu'une modification du modèle exige
@@ -14415,7 +14445,7 @@ const LEARNING_ENGINE_VERSION =
  */
 const LEARNING_MODEL_VERSION =
   process.env.LEARNING_MODEL_VERSION ||
-  "footballbrain-model-v1";
+  "footballbrain-model-v2-adaptive";
 
 const LEARNING_MIN_SAMPLE_SIZE = 20;
 const LEARNING_TARGET_WIN_RATE = 55;
@@ -14454,7 +14484,7 @@ function parseLearningBoolean(value) {
 }
 
 /*
- * Crée/migre les tables nécessaires au Learning Engine V2.
+ * Crée/migre les tables nécessaires au Adaptive Learning Engine V3.
  */
 async function ensureLearningEngineTables() {
   await pool.query(`
@@ -14462,7 +14492,12 @@ async function ensureLearningEngineTables() {
       ADD COLUMN IF NOT EXISTS manual_market_odd NUMERIC,
       ADD COLUMN IF NOT EXISTS manual_odd_source TEXT,
       ADD COLUMN IF NOT EXISTS manual_odd_entered_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS manual_odd_entered_by TEXT;
+      ADD COLUMN IF NOT EXISTS manual_odd_entered_by TEXT,
+      ADD COLUMN IF NOT EXISTS studio_base_probability NUMERIC(7,3),
+      ADD COLUMN IF NOT EXISTS learning_probability_adjustment NUMERIC(7,3),
+      ADD COLUMN IF NOT EXISTS learning_applied_weight NUMERIC(8,5),
+      ADD COLUMN IF NOT EXISTS learning_engine_version TEXT,
+      ADD COLUMN IF NOT EXISTS learning_applied_at TIMESTAMPTZ;
 
     CREATE TABLE IF NOT EXISTS
       learning_market_stats (
@@ -14585,7 +14620,7 @@ async function ensureLearningEngineTables() {
   `);
 
   console.log(
-    "✅ Tables Learning Engine V2 vérifiées"
+    "✅ Tables Adaptive Learning Engine V3 vérifiées"
   );
 }
 
@@ -14702,6 +14737,201 @@ function calculateLearningWeight({
     reason:
       `Échantillon de ${count} prédictions`,
   };
+}
+
+
+const LEARNING_MAX_PROBABILITY_ADJUSTMENT = 3;
+
+function normalizeAdaptiveLearningKey(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase();
+}
+
+function getAdaptiveReliabilityFactor(level) {
+  const normalized = normalizeAdaptiveLearningKey(level);
+
+  if (normalized === "HIGH") return 1;
+  if (normalized === "MEDIUM") return 0.7;
+  if (normalized === "LOW") return 0.4;
+
+  return 0;
+}
+
+/*
+ * Calcule un ajustement prudent en points de probabilité.
+ * L'ajustement est borné à ±3 points et ramené vers zéro
+ * lorsque l'échantillon ou la fiabilité sont faibles.
+ */
+function calculateAdaptiveProbabilityAdjustment(stat = {}) {
+  const sampleSize = Number(stat.sample_size ?? stat.sampleSize) || 0;
+  const winRate = Number(stat.win_rate ?? stat.winRate) || 0;
+  const averageProbability = Number(
+    stat.average_probability ?? stat.averageProbability
+  ) || 0;
+  const roi = Number(stat.roi) || 0;
+  const reliabilityLevel =
+    stat.reliability_level ?? stat.reliabilityLevel ?? "INSUFFICIENT_DATA";
+
+  if (sampleSize < LEARNING_MIN_SAMPLE_SIZE) {
+    return {
+      adjustment: 0,
+      appliedWeight: 1,
+      reason: "INSUFFICIENT_SAMPLE",
+    };
+  }
+
+  const reliabilityFactor =
+    getAdaptiveReliabilityFactor(reliabilityLevel);
+
+  if (reliabilityFactor <= 0) {
+    return {
+      adjustment: 0,
+      appliedWeight: 1,
+      reason: "INSUFFICIENT_RELIABILITY",
+    };
+  }
+
+  const sampleFactor = clampLearningNumber(
+    sampleSize / 200,
+    0.15,
+    1
+  );
+
+  const calibrationCorrection =
+    clampLearningNumber(
+      winRate - averageProbability,
+      -12,
+      12
+    ) * 0.18;
+
+  const roiCorrection =
+    (clampLearningNumber(roi, -25, 25) / 25) * 0.75;
+
+  const adjustment = clampLearningNumber(
+    (calibrationCorrection + roiCorrection) *
+      reliabilityFactor *
+      sampleFactor,
+    -LEARNING_MAX_PROBABILITY_ADJUSTMENT,
+    LEARNING_MAX_PROBABILITY_ADJUSTMENT
+  );
+
+  return {
+    adjustment: Number(adjustment.toFixed(3)),
+    appliedWeight: Number(
+      clampLearningNumber(1 + adjustment / 100, 0.97, 1.03).toFixed(5)
+    ),
+    reason: "ADAPTIVE_CALIBRATION",
+  };
+}
+
+async function getAdaptiveLearningAdjustment({
+  marketKey,
+  decisionGrade,
+  decisionType,
+  baseProbability,
+} = {}) {
+  const normalizedMarketKey =
+    normalizeAdaptiveLearningKey(marketKey);
+  const normalizedDecisionGrade =
+    normalizeAdaptiveLearningKey(decisionGrade) || "UNRATED";
+  const normalizedDecisionType =
+    normalizeAdaptiveLearningKey(decisionType) || "NO_BET";
+  const normalizedBaseProbability =
+    clampLearningNumber(baseProbability, 0, 100);
+
+  const noAdjustment = (reason) => ({
+    baseProbability: Number(normalizedBaseProbability.toFixed(3)),
+    adjustedProbability: Number(normalizedBaseProbability.toFixed(3)),
+    adjustment: 0,
+    appliedWeight: 1,
+    applied: false,
+    reason,
+    engineVersion: LEARNING_ENGINE_VERSION,
+    stat: null,
+  });
+
+  if (!normalizedMarketKey) {
+    return noAdjustment("MISSING_MARKET_KEY");
+  }
+
+  if (normalizedDecisionType === "NO_BET") {
+    return noAdjustment("NO_BET_NOT_ADJUSTED");
+  }
+
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          market_key,
+          decision_grade,
+          decision_type,
+          sample_size,
+          wins,
+          losses,
+          win_rate,
+          average_probability,
+          roi,
+          calibration_gap,
+          applied_weight,
+          reliability_level
+        FROM learning_market_stats
+        WHERE market_key = $1
+          AND decision_grade = $2
+          AND decision_type = $3
+        LIMIT 1
+      `,
+      [
+        normalizedMarketKey,
+        normalizedDecisionGrade,
+        normalizedDecisionType,
+      ]
+    );
+
+    const stat = result.rows[0];
+
+    if (!stat) {
+      return noAdjustment("NO_MATCHING_LEARNING_GROUP");
+    }
+
+    const adaptive =
+      calculateAdaptiveProbabilityAdjustment(stat);
+
+    const adjustedProbability =
+      clampLearningNumber(
+        normalizedBaseProbability + adaptive.adjustment,
+        1,
+        99
+      );
+
+    return {
+      baseProbability: Number(normalizedBaseProbability.toFixed(3)),
+      adjustedProbability: Number(adjustedProbability.toFixed(3)),
+      adjustment: adaptive.adjustment,
+      appliedWeight: adaptive.appliedWeight,
+      applied: adaptive.adjustment !== 0,
+      reason: adaptive.reason,
+      engineVersion: LEARNING_ENGINE_VERSION,
+      stat: {
+        marketKey: stat.market_key,
+        decisionGrade: stat.decision_grade,
+        decisionType: stat.decision_type,
+        sampleSize: Number(stat.sample_size) || 0,
+        winRate: Number(stat.win_rate) || 0,
+        averageProbability: Number(stat.average_probability) || 0,
+        roi: Number(stat.roi) || 0,
+        calibrationGap: Number(stat.calibration_gap) || 0,
+        reliabilityLevel: stat.reliability_level,
+      },
+    };
+  } catch (error) {
+    console.warn(
+      "ADAPTIVE LEARNING V3 : ajustement ignoré",
+      error?.message || error
+    );
+
+    return noAdjustment("LEARNING_LOOKUP_FAILED");
+  }
 }
 
 function learningEligibleWhereSql() {
@@ -15081,7 +15311,7 @@ async function rebuildLearningEngine({
         });
 
       console.log(
-        "LEARNING ENGINE V2 : aucun changement"
+        "ADAPTIVE LEARNING ENGINE V3 : aucun changement"
       );
 
       return summary;
@@ -15548,7 +15778,7 @@ async function rebuildLearningEngine({
     });
 
     console.log(
-      "LEARNING ENGINE V2 : terminé",
+      "ADAPTIVE LEARNING ENGINE V3 : terminé",
       {
         mode,
         predictionsFound:
@@ -15589,7 +15819,7 @@ async function rebuildLearningEngine({
     }
 
     console.error(
-      "LEARNING ENGINE V2 : erreur",
+      "ADAPTIVE LEARNING ENGINE V3 : erreur",
       error
     );
 
@@ -15641,7 +15871,7 @@ app.get(
 );
 
 /*
- * État synthétique du Learning V2.
+ * État synthétique du Adaptive Learning V3.
  */
 app.get(
   "/internal/learning/status",
@@ -15714,6 +15944,38 @@ app.get(
         error:
           error?.message ||
           "Impossible de lire le statut du Learning Engine",
+      });
+    }
+  }
+);
+
+/*
+ * Prévisualise l'ajustement adaptatif sans modifier une prédiction.
+ */
+app.get(
+  "/public/learning/adaptive-adjustment",
+  async (req, res) => {
+    try {
+      await ensureLearningEngineTables();
+
+      const result =
+        await getAdaptiveLearningAdjustment({
+          marketKey: req.query.marketKey,
+          decisionGrade: req.query.decisionGrade,
+          decisionType: req.query.decisionType,
+          baseProbability: req.query.probability,
+        });
+
+      return res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de calculer l'ajustement adaptatif",
       });
     }
   }
