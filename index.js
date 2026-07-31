@@ -1,4 +1,35 @@
 require("dotenv").config();
+function parseEnvironmentBoolean(value, defaultValue = false) {
+  if (value === undefined || value === null || value === "") {
+    return defaultValue;
+  }
+
+  return ["1", "true", "yes", "oui", "on"].includes(
+    String(value).trim().toLowerCase()
+  );
+}
+
+/*
+ * Interrupteur général des appels externes API-Football.
+ *
+ * true  = les appels API-Football sont autorisés
+ * false = aucun appel API-Football n'est autorisé
+ */
+const API_FOOTBALL_ENABLED = parseEnvironmentBoolean(
+  process.env.API_FOOTBALL_ENABLED,
+  true
+);
+
+/*
+ * Interrupteur des tâches automatiques internes.
+ *
+ * true  = watchers et schedulers actifs
+ * false = aucun setInterval/setTimeout métier n'est lancé
+ */
+const AUTOMATIC_SCHEDULERS_ENABLED = parseEnvironmentBoolean(
+  process.env.AUTOMATIC_SCHEDULERS_ENABLED,
+  true
+);
 const express = require("express");
 const axios = require("axios");
 
@@ -91,12 +122,23 @@ async function callApiFootball(
   endpoint,
   params = {}
 ) {
+  if (!API_FOOTBALL_ENABLED) {
+    const error = new Error(
+      "API-Football temporairement désactivée par configuration."
+    );
+
+    error.code = "API_FOOTBALL_DISABLED";
+    error.status = 503;
+    error.endpoint = endpoint;
+
+    throw error;
+  }
+
   const response = await axios.get(
     `${API_BASE_URL}${endpoint}`,
     {
       headers: {
-        "x-apisports-key":
-          getApiKey(),
+        "x-apisports-key": getApiKey(),
       },
       params,
       timeout: 15000,
@@ -16277,6 +16319,101 @@ app.put("/internal/admin/bilan/markets/:fixtureId/odd", async (req, res) => {
   }
 });
 
+function startAutomaticSchedulers() {
+  if (!AUTOMATIC_SCHEDULERS_ENABLED) {
+    console.log(
+      "⏸️ Tous les schedulers automatiques sont désactivés."
+    );
+
+    console.log(
+      "ℹ️ Pour les réactiver : AUTOMATIC_SCHEDULERS_ENABLED=true"
+    );
+
+    return;
+  }
+
+  startLineupWatcherScheduler();
+
+  /*
+   * Premier rafraîchissement des résultats
+   * deux minutes après le démarrage.
+   */
+  setTimeout(() => {
+    runAutomaticResultSync();
+  }, 2 * 60 * 1000);
+
+  /*
+   * Synchronisation des résultats toutes les 15 minutes.
+   */
+  setInterval(() => {
+    runAutomaticResultSync();
+  }, 15 * 60 * 1000);
+
+  /*
+   * Premier cycle Brain Studio trois minutes
+   * après le démarrage du serveur.
+   */
+  setTimeout(() => {
+    runAutomaticStudioScheduler({
+      source: "startup",
+    }).catch((error) => {
+      console.error(
+        "ERREUR DÉMARRAGE BRAIN STUDIO SCHEDULER :",
+        error
+      );
+    });
+  }, STUDIO_SCHEDULER_FIRST_RUN_DELAY_MS);
+
+  /*
+   * Brain Studio toutes les 15 minutes.
+   */
+  setInterval(() => {
+    runAutomaticStudioScheduler({
+      source: "interval",
+    }).catch((error) => {
+      console.error(
+        "ERREUR INTERVAL BRAIN STUDIO SCHEDULER :",
+        error
+      );
+    });
+  }, STUDIO_SCHEDULER_INTERVAL_MS);
+
+  /*
+   * Vérification chaque minute de l'heure
+   * prévue pour l'analyse quotidienne.
+   */
+  setInterval(() => {
+    checkDailyFullAnalysisSchedule().catch((error) => {
+      console.error(
+        "ERREUR PLANIFICATEUR ANALYSE QUOTIDIENNE :",
+        error
+      );
+    });
+  }, 60 * 1000);
+
+  /*
+   * Première vérification au démarrage.
+   */
+  checkDailyFullAnalysisSchedule().catch((error) => {
+    console.error(
+      "ERREUR PREMIÈRE VÉRIFICATION QUOTIDIENNE :",
+      error
+    );
+  });
+
+  console.log(
+    "✅ Synchronisation des résultats : toutes les 15 minutes"
+  );
+
+  console.log(
+    "✅ Brain Studio Scheduler : toutes les 15 minutes"
+  );
+
+  console.log(
+    "✅ Planificateur quotidien : actif"
+  );
+}
+
 app.listen(
   PORT,
   "0.0.0.0",
@@ -16284,13 +16421,31 @@ app.listen(
     console.log(
       `FootballBrain API running on 0.0.0.0:${PORT}`
     );
-ensureStudioPredictionColumns()
-  .catch((error) => {
-    console.error(
-      "ERREUR COLONNES STUDIO :",
-      error
+
+    console.log(
+      `API-Football : ${
+        API_FOOTBALL_ENABLED
+          ? "✅ autorisée"
+          : "⏸️ désactivée"
+      }`
     );
-    });
+
+    console.log(
+      `Schedulers automatiques : ${
+        AUTOMATIC_SCHEDULERS_ENABLED
+          ? "✅ actifs"
+          : "⏸️ désactivés"
+      }`
+    );
+
+    ensureStudioPredictionColumns()
+      .catch((error) => {
+        console.error(
+          "ERREUR COLONNES STUDIO :",
+          error
+        );
+      });
+
     aiEventEngine
       .ensureTables()
       .catch((error) => {
@@ -16299,110 +16454,20 @@ ensureStudioPredictionColumns()
           error
         );
       });
+
     ensureLearningEngineTables()
-  .catch((error) => {
-    console.error(
-      "ERREUR TABLES LEARNING ENGINE :",
-      error
-    );
-  });
+      .catch((error) => {
+        console.error(
+          "ERREUR TABLES LEARNING ENGINE :",
+          error
+        );
+      });
+
     /*
-     * Premier rafraîchissement des
-     * résultats deux minutes après
-     * le démarrage.
-     *
-     * Environ deux appels API.
+     * Les initialisations SQL restent actives.
+     * Seules les tâches consommatrices d'API
+     * dépendent de l'interrupteur.
      */
-    setTimeout(() => {
-      runAutomaticResultSync();
-    }, 2 * 60 * 1000);
-
-    /*
-     * Résultats toutes les 15 minutes.
-     *
-     * Hier + aujourd’hui :
-     * environ deux appels API par cycle.
-     *
-     * 96 cycles par jour × 2 appels
-     * ≈ 192 appels par jour.
-     */
-    setInterval(() => {
-      runAutomaticResultSync();
-    }, 15 * 60 * 1000);
-/*
- * Premier cycle Brain Studio trois minutes
- * après le démarrage du serveur.
- */
-setTimeout(() => {
-  runAutomaticStudioScheduler({
-    source:
-      "startup",
-  }).catch((error) => {
-    console.error(
-      "ERREUR DÉMARRAGE BRAIN STUDIO SCHEDULER :",
-      error
-    );
-  });
-}, STUDIO_SCHEDULER_FIRST_RUN_DELAY_MS);
-
-/*
- * Brain Studio toutes les 15 minutes.
- */
-setInterval(() => {
-  runAutomaticStudioScheduler({
-    source:
-      "interval",
-  }).catch((error) => {
-    console.error(
-      "ERREUR INTERVAL BRAIN STUDIO SCHEDULER :",
-      error
-    );
-  });
-}, STUDIO_SCHEDULER_INTERVAL_MS);
-
-console.log(
-  "✅ Brain Studio Scheduler : toutes les 15 min"
-);
-    /*
-     * IMPORTANT :
-     * aucune analyse complète automatique
-     * toutes les 15 minutes.
-     *
-     * Les analyses quotidiennes seront
-     * remises ensuite avec un seul cycle
-     * contrôlé et des compétitions filtrées.
-     */
-
-    console.log(
-      "✅ Synchronisation groupée : 15 min"
-    );
-
-    console.log(
-      "⏸️ Analyse générale répétée : désactivée"
-    );
-    /*
- * Vérification chaque minute de l’heure
- * prévue pour l’analyse quotidienne.
- */
-setInterval(() => {
-  checkDailyFullAnalysisSchedule()
-    .catch((error) => {
-      console.error(
-        "ERREUR PLANIFICATEUR ANALYSE QUOTIDIENNE :",
-        error
-      );
-    });
-}, 60 * 1000);
-
-/*
- * Première vérification au démarrage.
- */
-checkDailyFullAnalysisSchedule()
-  .catch((error) => {
-    console.error(
-      "ERREUR PREMIÈRE VÉRIFICATION QUOTIDIENNE :",
-      error
-    );
-  });
+    startAutomaticSchedulers();
   }
 );
