@@ -15375,6 +15375,9 @@ app.get(
 );
 app.get("/public/calibration/summary", async (req, res) => {
   try {
+
+    await ensureLearningEngineTables();
+
     const { rows } = await pool.query(`
       SELECT
         market_key,
@@ -15383,8 +15386,9 @@ app.get("/public/calibration/summary", async (req, res) => {
         accuracy,
         brier_score,
         log_loss,
-        calibration_gap
-      FROM calibration_stats
+        calibration_gap,
+        calculated_at
+      FROM learning_calibration
     `);
 
     const totalBuckets = rows.length;
@@ -15473,7 +15477,15 @@ app.get("/public/calibration/summary", async (req, res) => {
 
         totalPredictions,
 
-        lastUpdated: new Date().toISOString(),
+       lastUpdated:
+  rows.length > 0
+    ? rows.reduce((latest, row) => {
+        if (!latest) return row.calculated_at;
+        return new Date(row.calculated_at) > new Date(latest)
+          ? row.calculated_at
+          : latest;
+      }, null)
+    : null,
       },
     });
   } catch (error) {
