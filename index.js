@@ -15373,7 +15373,118 @@ app.get(
     }
   }
 );
+app.get("/public/calibration/summary", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        market_key,
+        probability_bucket,
+        sample_size,
+        accuracy,
+        brier_score,
+        log_loss,
+        calibration_gap
+      FROM calibration_stats
+    `);
 
+    const totalBuckets = rows.length;
+
+    let healthyBuckets = 0;
+    let warningBuckets = 0;
+    let criticalBuckets = 0;
+
+    let totalAccuracy = 0;
+    let totalGap = 0;
+    let totalBrier = 0;
+    let totalLogLoss = 0;
+    let totalPredictions = 0;
+
+    const marketStats = {};
+
+    for (const row of rows) {
+      const gap = Math.abs(Number(row.calibration_gap) || 0);
+
+      if (gap < 3) {
+        healthyBuckets++;
+      } else if (gap < 7) {
+        warningBuckets++;
+      } else {
+        criticalBuckets++;
+      }
+
+      totalAccuracy += Number(row.accuracy) || 0;
+      totalGap += gap;
+      totalBrier += Number(row.brier_score) || 0;
+      totalLogLoss += Number(row.log_loss) || 0;
+      totalPredictions += Number(row.sample_size) || 0;
+
+      if (!marketStats[row.market_key]) {
+        marketStats[row.market_key] = {
+          totalGap: 0,
+          buckets: 0,
+        };
+      }
+
+      marketStats[row.market_key].totalGap += gap;
+      marketStats[row.market_key].buckets++;
+    }
+
+    const averages = Object.entries(marketStats).map(([market, value]) => ({
+      market,
+      averageGap: value.totalGap / value.buckets,
+    }));
+
+    averages.sort((a, b) => a.averageGap - b.averageGap);
+
+    res.json({
+      ok: true,
+      summary: {
+        totalBuckets,
+
+        healthyBuckets,
+        warningBuckets,
+        criticalBuckets,
+
+        averageAccuracy:
+          totalBuckets > 0
+            ? Number((totalAccuracy / totalBuckets).toFixed(2))
+            : 0,
+
+        averageBrierScore:
+          totalBuckets > 0
+            ? Number((totalBrier / totalBuckets).toFixed(4))
+            : 0,
+
+        averageLogLoss:
+          totalBuckets > 0
+            ? Number((totalLogLoss / totalBuckets).toFixed(4))
+            : 0,
+
+        averageCalibrationGap:
+          totalBuckets > 0
+            ? Number((totalGap / totalBuckets).toFixed(2))
+            : 0,
+
+        bestMarket: averages.length ? averages[0].market : null,
+
+        worstMarket: averages.length
+          ? averages[averages.length - 1].market
+          : null,
+
+        totalPredictions,
+
+        lastUpdated: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
 app.get("/public/calibration/stats", async (req, res) => {
   try {
     await ensureLearningEngineTables();
