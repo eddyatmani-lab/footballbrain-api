@@ -88,6 +88,125 @@ const API_BASE_URL =
   "https://v3.football.api-sports.io";
 
 const DEFAULT_BOOKMAKER = 4; // Pinnacle
+
+
+/*
+ * Protection centrale API-Football.
+ * Tous les appels externes passent par cette file unique afin d'éviter
+ * les pics simultanés provoqués par Brain Studio, les watchers et les
+ * reconstructions historiques.
+ */
+const API_FOOTBALL_MIN_INTERVAL_MS = Math.max(
+  1000,
+  Number(process.env.API_FOOTBALL_MIN_INTERVAL_MS) || 1500
+);
+const API_FOOTBALL_MAX_RETRIES = Math.max(
+  0,
+  Math.min(6, Number(process.env.API_FOOTBALL_MAX_RETRIES) || 4)
+);
+const API_FOOTBALL_CACHE_ENABLED = parseEnvironmentBoolean(
+  process.env.API_FOOTBALL_CACHE_ENABLED,
+  true
+);
+
+let apiFootballQueue = Promise.resolve();
+let apiFootballLastRequestAt = 0;
+const apiFootballResponseCache = new Map();
+
+function waitApiFootball(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function stableApiFootballCacheKey(endpoint, params = {}) {
+  const normalized = Object.keys(params)
+    .sort()
+    .reduce((accumulator, key) => {
+      accumulator[key] = params[key];
+      return accumulator;
+    }, {});
+
+  return `${endpoint}:${JSON.stringify(normalized)}`;
+}
+
+function getApiFootballCacheTtl(endpoint, params = {}) {
+  if (endpoint === "/fixtures/lineups") return 5 * 60 * 1000;
+  if (endpoint === "/injuries") return 20 * 60 * 1000;
+  if (endpoint === "/odds") return 10 * 60 * 1000;
+  if (endpoint === "/fixtures/headtohead") return 6 * 60 * 60 * 1000;
+  if (endpoint === "/teams/statistics") return 60 * 60 * 1000;
+
+  if (endpoint === "/fixtures") {
+    if (params?.date) return 5 * 60 * 1000;
+    if (params?.last) return 30 * 60 * 1000;
+    if (params?.id) return 2 * 60 * 1000;
+    return 5 * 60 * 1000;
+  }
+
+  return 2 * 60 * 1000;
+}
+
+function getRetryAfterMilliseconds(error, attempt) {
+  const retryAfter = error?.response?.headers?.["retry-after"];
+  const numericRetryAfter = Number(retryAfter);
+
+  if (Number.isFinite(numericRetryAfter) && numericRetryAfter > 0) {
+    return Math.min(120000, numericRetryAfter * 1000);
+  }
+
+  return Math.min(60000, 5000 * (2 ** attempt));
+}
+
+async function executeQueuedApiFootballRequest(endpoint, params = {}) {
+  const elapsed = Date.now() - apiFootballLastRequestAt;
+  const remainingDelay = API_FOOTBALL_MIN_INTERVAL_MS - elapsed;
+
+  if (remainingDelay > 0) {
+    await waitApiFootball(remainingDelay);
+  }
+
+  for (let attempt = 0; attempt <= API_FOOTBALL_MAX_RETRIES; attempt += 1) {
+    try {
+      apiFootballLastRequestAt = Date.now();
+
+      return await axios.get(`${API_BASE_URL}${endpoint}`, {
+        headers: {
+          "x-apisports-key": getApiKey(),
+        },
+        params,
+        timeout: 20000,
+      });
+    } catch (error) {
+      const status = error?.response?.status || error?.status || null;
+      const retryable =
+        status === 429 ||
+        status === 408 ||
+        status >= 500 ||
+        ["ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN"].includes(
+          error?.code
+        );
+
+      if (!retryable || attempt >= API_FOOTBALL_MAX_RETRIES) {
+        throw error;
+      }
+
+      const delay =
+        status === 429
+          ? getRetryAfterMilliseconds(error, attempt)
+          : Math.min(30000, 2000 * (2 ** attempt));
+
+      console.warn("API-FOOTBALL : nouvelle tentative", {
+        endpoint,
+        status,
+        attempt: attempt + 1,
+        delayMs: delay,
+      });
+
+      await waitApiFootball(delay);
+    }
+  }
+
+  throw new Error("Échec API-Football après plusieurs tentatives.");
+}
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -120,7 +239,8 @@ function getApiKey() {
 
 async function callApiFootball(
   endpoint,
-  params = {}
+  params = {},
+  options = {}
 ) {
   if (!API_FOOTBALL_ENABLED) {
     const error = new Error(
@@ -130,20 +250,34 @@ async function callApiFootball(
     error.code = "API_FOOTBALL_DISABLED";
     error.status = 503;
     error.endpoint = endpoint;
-
     throw error;
   }
 
-  const response = await axios.get(
-    `${API_BASE_URL}${endpoint}`,
-    {
-      headers: {
-        "x-apisports-key": getApiKey(),
-      },
-      params,
-      timeout: 15000,
+  const forceRefresh = options?.forceRefresh === true;
+  const cacheKey = stableApiFootballCacheKey(endpoint, params);
+  const cacheTtl = getApiFootballCacheTtl(endpoint, params);
+
+  if (API_FOOTBALL_CACHE_ENABLED && !forceRefresh) {
+    const cached = apiFootballResponseCache.get(cacheKey);
+
+    if (cached && Date.now() - cached.createdAt < cacheTtl) {
+      return cached.response;
     }
+  }
+
+  const task = apiFootballQueue.then(() =>
+    executeQueuedApiFootballRequest(endpoint, params)
   );
+
+  apiFootballQueue = task.catch(() => undefined);
+  const response = await task;
+
+  if (API_FOOTBALL_CACHE_ENABLED) {
+    apiFootballResponseCache.set(cacheKey, {
+      createdAt: Date.now(),
+      response,
+    });
+  }
 
   return response;
 }
@@ -4719,7 +4853,8 @@ function getApiKey() {
 
 async function callApiFootball(
   endpoint,
-  params = {}
+  params = {},
+  options = {}
 ) {
   if (!API_FOOTBALL_ENABLED) {
     const error = new Error(
@@ -4729,21 +4864,34 @@ async function callApiFootball(
     error.code = "API_FOOTBALL_DISABLED";
     error.status = 503;
     error.endpoint = endpoint;
-
     throw error;
   }
 
-  const response = await axios.get(
-    `${API_BASE_URL}${endpoint}`,
-    {
-      headers: {
-        "x-apisports-key":
-          getApiKey(),
-      },
-      params,
-      timeout: 15000,
+  const forceRefresh = options?.forceRefresh === true;
+  const cacheKey = stableApiFootballCacheKey(endpoint, params);
+  const cacheTtl = getApiFootballCacheTtl(endpoint, params);
+
+  if (API_FOOTBALL_CACHE_ENABLED && !forceRefresh) {
+    const cached = apiFootballResponseCache.get(cacheKey);
+
+    if (cached && Date.now() - cached.createdAt < cacheTtl) {
+      return cached.response;
     }
+  }
+
+  const task = apiFootballQueue.then(() =>
+    executeQueuedApiFootballRequest(endpoint, params)
   );
+
+  apiFootballQueue = task.catch(() => undefined);
+  const response = await task;
+
+  if (API_FOOTBALL_CACHE_ENABLED) {
+    apiFootballResponseCache.set(cacheKey, {
+      createdAt: Date.now(),
+      response,
+    });
+  }
 
   return response;
 }
@@ -13732,7 +13880,7 @@ const STUDIO_SCHEDULER_MAX_MATCHES =
   100;
 
 const STUDIO_SCHEDULER_DELAY_BETWEEN_MATCHES_MS =
-  5000;
+  8000;
 
 let studioSchedulerRunning =
   false;
@@ -16249,6 +16397,9 @@ app.post("/internal/admin/brainstudio/rebuild-missing", async (req, res) => {
           error: classification.message,
         });
       }
+
+      // Évite qu'une reconstruction massive enchaîne les analyses sans pause.
+      await waitApiFootball(3000);
     }
 
     return res.json({
