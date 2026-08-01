@@ -10230,19 +10230,48 @@ app.get(
         req.query.limit
       );
 
+      /*
+       * Lots courts : une analyse complète déclenche plusieurs appels
+       * API-Football. On limite volontairement chaque passage afin
+       * d'éviter les requêtes HTTP internes trop longues et les 429.
+       */
       const limit = Math.min(
-  300,
-  Math.max(
-    1,
-    Number.isInteger(requestedLimit)
-      ? requestedLimit
-      : 200
-  )
-);
+        20,
+        Math.max(
+          1,
+          Number.isInteger(requestedLimit)
+            ? requestedLimit
+            : 8
+        )
+      );
 
       const force =
         String(req.query.force || "") ===
         "1";
+
+      const enabledLeagueIds =
+        await getEnabledLeagueIds();
+
+      if (enabledLeagueIds.size === 0) {
+        return res.json({
+          ok: true,
+          date,
+          force,
+          summary: {
+            fixturesFromApi: 0,
+            fixturesFound: 0,
+            alreadyComplete: 0,
+            rebuilt: 0,
+            failed: 0,
+            remaining: 0,
+            enabledLeagues: 0,
+          },
+          alreadyComplete: [],
+          results: [],
+          warning:
+            "Aucune compétition n'est activée dans le League Manager.",
+        });
+      }
 
       /*
        * 1. Récupérer les fixtures du jour
@@ -10287,6 +10316,10 @@ app.get(
   fixtureId > 0 &&
   item?.teams?.home?.name &&
   item?.teams?.away?.name &&
+  isLeagueEnabled(
+    item,
+    enabledLeagueIds
+  ) &&
   !excludedStatuses.includes(
     status
   ) &&
@@ -10300,10 +10333,15 @@ app.get(
           ok: true,
           date,
           summary: {
+            fixturesFromApi:
+              rawFixtures.length,
             fixturesFound: 0,
             alreadyComplete: 0,
             rebuilt: 0,
             failed: 0,
+            remaining: 0,
+            enabledLeagues:
+              enabledLeagueIds.size,
           },
           results: [],
         });
@@ -10403,8 +10441,9 @@ const selectedFixturesToRebuild =
   `${baseUrl}/internal/analyze/${fixtureId}` +
   `${force ? "?refresh=1" : ""}`;
 
-// Attendre 2 secondes entre chaque analyse
-await wait(2000);
+// Petite respiration entre deux analyses ; la file API centrale
+// impose déjà son propre intervalle entre chaque requête externe.
+await wait(500);
 
 const response = await fetch(
   analysisUrl,
@@ -10489,14 +10528,26 @@ const response = await fetch(
         force,
 
         summary: {
+          fixturesFromApi:
+            rawFixtures.length,
           fixturesFound:
             fixtures.length,
           alreadyComplete:
             alreadyComplete.length,
+          selectedForBatch:
+            selectedFixturesToRebuild.length,
           rebuilt:
             rebuilt.length,
           failed:
             failed.length,
+          remaining:
+            Math.max(
+              0,
+              fixturesToRebuild.length -
+                rebuilt.length
+            ),
+          enabledLeagues:
+            enabledLeagueIds.size,
         },
 
         alreadyComplete,
@@ -10541,7 +10592,7 @@ async function runAutomaticDailyAnalysis({
       `http://127.0.0.1:${PORT}` +
       `/internal/rebuild-daily-analysis` +
       `?date=${encodeURIComponent(date)}` +
-      `&limit=300`;
+      `&limit=8`;
 
     console.log(
       `ANALYSE QUOTIDIENNE : démarrage ${date}`
@@ -11618,7 +11669,7 @@ let lastDailyFullAnalysisDate = null;
 let lastDailyFullAnalysisAttemptAt = 0;
 
 const DAILY_ANALYSIS_RETRY_INTERVAL_MS =
-  30 * 60 * 1000;
+  3 * 60 * 1000;
 
 function getParisTimeParts() {
   const parts =
@@ -11717,6 +11768,9 @@ async function checkDailyFullAnalysisSchedule() {
     const rebuilt =
       Number(summary.rebuilt || 0);
 
+    const remaining =
+      Number(summary.remaining || 0);
+
     const covered =
       alreadyComplete + rebuilt;
 
@@ -11727,6 +11781,7 @@ async function checkDailyFullAnalysisSchedule() {
      */
     if (
       failed === 0 &&
+      remaining === 0 &&
       covered >= fixturesFound
     ) {
       lastDailyFullAnalysisDate =
@@ -11737,7 +11792,7 @@ async function checkDailyFullAnalysisSchedule() {
       );
     } else {
       console.warn(
-        `ANALYSE COMPLÈTE : journée incomplète (${covered}/${fixturesFound}, ${failed} échec(s)). Nouvelle tentative dans 30 minutes.`
+        `ANALYSE COMPLÈTE : journée incomplète (${covered}/${fixturesFound}, ${failed} échec(s)). Nouveau lot dans environ 3 minutes.`
       );
     }
   } catch (error) {
