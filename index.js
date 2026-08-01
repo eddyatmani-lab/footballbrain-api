@@ -667,6 +667,543 @@ app.get("/fixtures-test", async (req, res) => {
     );
   }
 });
+
+/*
+ * ============================================================
+ * LEAGUE MANAGER — CATALOGUE ET RÉGLAGES PERSISTANTS
+ * ============================================================
+ *
+ * Sprint 1 :
+ * - synchronise le catalogue API-Football vers PostgreSQL ;
+ * - permet d'activer/désactiver une compétition ;
+ * - ne filtre pas encore les analyses automatiques.
+ */
+const LEAGUE_MANAGER_PRIORITIES = new Set([
+  "LOW",
+  "NORMAL",
+  "HIGH",
+  "CRITICAL",
+]);
+
+function normalizeLeagueManagerPriority(value) {
+  const normalized = String(value || "NORMAL")
+    .trim()
+    .toUpperCase();
+
+  return LEAGUE_MANAGER_PRIORITIES.has(normalized)
+    ? normalized
+    : "NORMAL";
+}
+
+function normalizeLeagueManagerType(value) {
+  const normalized = String(value || "unknown")
+    .trim()
+    .toLowerCase();
+
+  if (normalized === "league") return "league";
+  if (normalized === "cup") return "cup";
+
+  return normalized || "unknown";
+}
+
+function selectLeagueManagerSeason(seasons = []) {
+  if (!Array.isArray(seasons) || seasons.length === 0) {
+    return null;
+  }
+
+  const current = seasons.find(
+    (season) => season?.current === true
+  );
+
+  if (current) return current;
+
+  return [...seasons].sort(
+    (first, second) =>
+      Number(second?.year || 0) -
+      Number(first?.year || 0)
+  )[0] || null;
+}
+
+function computeLeagueCoverageScore(coverage = {}) {
+  const fixtures = coverage?.fixtures || {};
+  const odds = coverage?.odds || {};
+
+  const flags = [
+    fixtures?.events,
+    fixtures?.lineups,
+    fixtures?.statistics_fixtures,
+    fixtures?.statistics_players,
+    coverage?.standings,
+    coverage?.players,
+    coverage?.top_scorers,
+    coverage?.top_assists,
+    coverage?.top_cards,
+    coverage?.injuries,
+    coverage?.predictions,
+    odds?.pre_match,
+    odds?.live,
+  ];
+
+  const available = flags.filter(Boolean).length;
+
+  return Math.round(
+    (available / Math.max(1, flags.length)) * 100
+  );
+}
+
+async function ensureLeagueManagerTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_settings (
+      league_id BIGINT PRIMARY KEY,
+      league_name TEXT NOT NULL,
+      country_name TEXT,
+      country_code TEXT,
+      country_flag TEXT,
+      league_logo TEXT,
+      league_type TEXT NOT NULL DEFAULT 'unknown',
+      current_season INTEGER,
+      season_start DATE,
+      season_end DATE,
+      coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+      coverage_score INTEGER NOT NULL DEFAULT 0,
+      enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      priority TEXT NOT NULL DEFAULT 'NORMAL',
+      notes TEXT,
+      last_catalog_sync_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_league_settings_enabled
+    ON league_settings(enabled);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_league_settings_country
+    ON league_settings(country_name);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_league_settings_type
+    ON league_settings(league_type);
+  `);
+}
+
+async function syncLeagueManagerCatalogue({ forceRefresh = false } = {}) {
+  const response = await callApiFootball(
+    "/leagues",
+    { current: "true" },
+    { forceRefresh }
+  );
+
+  const entries = Array.isArray(response.data?.response)
+    ? response.data.response
+    : [];
+
+  let synced = 0;
+
+  for (const entry of entries) {
+    const leagueId = Number(entry?.league?.id);
+
+    if (!Number.isInteger(leagueId) || leagueId <= 0) {
+      continue;
+    }
+
+    const selectedSeason = selectLeagueManagerSeason(
+      entry?.seasons
+    );
+
+    const coverage = selectedSeason?.coverage || {};
+    const coverageScore = computeLeagueCoverageScore(
+      coverage
+    );
+
+    await pool.query(
+      `
+        INSERT INTO league_settings (
+          league_id,
+          league_name,
+          country_name,
+          country_code,
+          country_flag,
+          league_logo,
+          league_type,
+          current_season,
+          season_start,
+          season_end,
+          coverage,
+          coverage_score,
+          last_catalog_sync_at,
+          updated_at
+        )
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7,
+          $8, $9, $10, $11::jsonb, $12,
+          NOW(), NOW()
+        )
+        ON CONFLICT (league_id)
+        DO UPDATE SET
+          league_name = EXCLUDED.league_name,
+          country_name = EXCLUDED.country_name,
+          country_code = EXCLUDED.country_code,
+          country_flag = EXCLUDED.country_flag,
+          league_logo = EXCLUDED.league_logo,
+          league_type = EXCLUDED.league_type,
+          current_season = EXCLUDED.current_season,
+          season_start = EXCLUDED.season_start,
+          season_end = EXCLUDED.season_end,
+          coverage = EXCLUDED.coverage,
+          coverage_score = EXCLUDED.coverage_score,
+          last_catalog_sync_at = NOW(),
+          updated_at = NOW()
+      `,
+      [
+        leagueId,
+        String(entry?.league?.name || `Ligue ${leagueId}`),
+        entry?.country?.name || null,
+        entry?.country?.code || null,
+        entry?.country?.flag || null,
+        entry?.league?.logo || null,
+        normalizeLeagueManagerType(entry?.league?.type),
+        Number.isFinite(Number(selectedSeason?.year))
+          ? Number(selectedSeason.year)
+          : null,
+        selectedSeason?.start || null,
+        selectedSeason?.end || null,
+        JSON.stringify(coverage),
+        coverageScore,
+      ]
+    );
+
+    synced += 1;
+  }
+
+  return {
+    received: entries.length,
+    synced,
+  };
+}
+
+app.get(
+  "/internal/league-manager/leagues",
+  async (req, res) => {
+    try {
+      await ensureLeagueManagerTables();
+
+      const search = String(req.query.search || "")
+        .trim()
+        .toLowerCase();
+      const country = String(req.query.country || "")
+        .trim();
+      const type = String(req.query.type || "")
+        .trim()
+        .toLowerCase();
+      const enabled = String(req.query.enabled || "")
+        .trim()
+        .toLowerCase();
+
+      const values = [];
+      const where = [];
+
+      if (search) {
+        values.push(`%${search}%`);
+        where.push(
+          `(LOWER(league_name) LIKE $${values.length} OR CAST(league_id AS TEXT) LIKE $${values.length})`
+        );
+      }
+
+      if (country) {
+        values.push(country);
+        where.push(`country_name = $${values.length}`);
+      }
+
+      if (type) {
+        values.push(type);
+        where.push(`league_type = $${values.length}`);
+      }
+
+      if (enabled === "true" || enabled === "false") {
+        values.push(enabled === "true");
+        where.push(`enabled = $${values.length}`);
+      }
+
+      const result = await pool.query(
+        `
+          SELECT
+            league_id,
+            league_name,
+            country_name,
+            country_code,
+            country_flag,
+            league_logo,
+            league_type,
+            current_season,
+            season_start,
+            season_end,
+            coverage,
+            coverage_score,
+            enabled,
+            priority,
+            notes,
+            last_catalog_sync_at,
+            updated_at
+          FROM league_settings
+          ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+          ORDER BY
+            enabled DESC,
+            CASE priority
+              WHEN 'CRITICAL' THEN 4
+              WHEN 'HIGH' THEN 3
+              WHEN 'NORMAL' THEN 2
+              ELSE 1
+            END DESC,
+            country_name ASC NULLS LAST,
+            league_name ASC
+        `,
+        values
+      );
+
+      const summaryResult = await pool.query(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE enabled = TRUE)::int AS enabled,
+          COUNT(DISTINCT country_name)::int AS countries,
+          ROUND(AVG(coverage_score))::int AS average_coverage
+        FROM league_settings
+      `);
+
+      const countriesResult = await pool.query(`
+        SELECT DISTINCT country_name
+        FROM league_settings
+        WHERE country_name IS NOT NULL
+          AND BTRIM(country_name) <> ''
+        ORDER BY country_name ASC
+      `);
+
+      return res.json({
+        ok: true,
+        summary: summaryResult.rows[0] || {
+          total: 0,
+          enabled: 0,
+          countries: 0,
+          average_coverage: 0,
+        },
+        countries: countriesResult.rows.map(
+          (row) => row.country_name
+        ),
+        leagues: result.rows.map((row) => ({
+          leagueId: Number(row.league_id),
+          name: row.league_name,
+          country: row.country_name,
+          countryCode: row.country_code,
+          countryFlag: row.country_flag,
+          logo: row.league_logo,
+          type: row.league_type,
+          currentSeason: row.current_season,
+          seasonStart: row.season_start,
+          seasonEnd: row.season_end,
+          coverage: row.coverage || {},
+          coverageScore: Number(row.coverage_score || 0),
+          enabled: row.enabled === true,
+          priority: row.priority || "NORMAL",
+          notes: row.notes || "",
+          lastCatalogSyncAt: row.last_catalog_sync_at,
+          updatedAt: row.updated_at,
+        })),
+      });
+    } catch (error) {
+      console.error("ERREUR LEAGUE MANAGER LISTE :", error);
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de charger le League Manager.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/internal/league-manager/sync",
+  async (req, res) => {
+    try {
+      await ensureLeagueManagerTables();
+
+      const result = await syncLeagueManagerCatalogue({
+        forceRefresh: req.query.force === "1",
+      });
+
+      return res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      console.error("ERREUR SYNCHRONISATION LIGUES :", error);
+
+      return res
+        .status(error?.status || error?.response?.status || 500)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "Impossible de synchroniser les compétitions.",
+        });
+    }
+  }
+);
+
+app.patch(
+  "/internal/league-manager/leagues/:leagueId",
+  async (req, res) => {
+    try {
+      await ensureLeagueManagerTables();
+
+      const leagueId = Number(req.params.leagueId);
+
+      if (!Number.isInteger(leagueId) || leagueId <= 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "leagueId invalide",
+        });
+      }
+
+      const currentResult = await pool.query(
+        `
+          SELECT enabled, priority, notes
+          FROM league_settings
+          WHERE league_id = $1
+          LIMIT 1
+        `,
+        [leagueId]
+      );
+
+      if (currentResult.rows.length === 0) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "Compétition introuvable. Lancez d'abord la synchronisation.",
+        });
+      }
+
+      const current = currentResult.rows[0];
+      const enabled =
+        typeof req.body?.enabled === "boolean"
+          ? req.body.enabled
+          : current.enabled === true;
+      const priority =
+        req.body?.priority !== undefined
+          ? normalizeLeagueManagerPriority(req.body.priority)
+          : normalizeLeagueManagerPriority(current.priority);
+      const notes =
+        req.body?.notes !== undefined
+          ? String(req.body.notes || "").slice(0, 1000)
+          : current.notes || "";
+
+      const result = await pool.query(
+        `
+          UPDATE league_settings
+          SET
+            enabled = $2,
+            priority = $3,
+            notes = $4,
+            updated_at = NOW()
+          WHERE league_id = $1
+          RETURNING *
+        `,
+        [leagueId, enabled, priority, notes]
+      );
+
+      const row = result.rows[0];
+
+      return res.json({
+        ok: true,
+        league: {
+          leagueId: Number(row.league_id),
+          enabled: row.enabled === true,
+          priority: row.priority,
+          notes: row.notes || "",
+          updatedAt: row.updated_at,
+        },
+      });
+    } catch (error) {
+      console.error("ERREUR MISE À JOUR LIGUE :", error);
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de modifier cette compétition.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/internal/league-manager/bulk",
+  async (req, res) => {
+    try {
+      await ensureLeagueManagerTables();
+
+      const rawIds = Array.isArray(req.body?.leagueIds)
+        ? req.body.leagueIds
+        : [];
+      const leagueIds = [
+        ...new Set(
+          rawIds
+            .map((value) => Number(value))
+            .filter(
+              (value) => Number.isInteger(value) && value > 0
+            )
+        ),
+      ];
+
+      if (leagueIds.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "Aucune compétition valide sélectionnée.",
+        });
+      }
+
+      if (typeof req.body?.enabled !== "boolean") {
+        return res.status(400).json({
+          ok: false,
+          error: "Le champ enabled doit être un booléen.",
+        });
+      }
+
+      const result = await pool.query(
+        `
+          UPDATE league_settings
+          SET enabled = $2, updated_at = NOW()
+          WHERE league_id = ANY($1::bigint[])
+          RETURNING league_id
+        `,
+        [leagueIds, req.body.enabled]
+      );
+
+      return res.json({
+        ok: true,
+        updated: result.rowCount,
+      });
+    } catch (error) {
+      console.error("ERREUR MISE À JOUR GROUPÉE LIGUES :", error);
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de modifier les compétitions sélectionnées.",
+      });
+    }
+  }
+);
+
 app.get("/leagues", async (req, res) => {
   try {
     const response = await callApiFootball("/leagues");
@@ -16664,6 +17201,14 @@ app.listen(
       .catch((error) => {
         console.error(
           "ERREUR TABLE AI_EVENTS :",
+          error
+        );
+      });
+
+    ensureLeagueManagerTables()
+      .catch((error) => {
+        console.error(
+          "ERREUR TABLE LEAGUE MANAGER :",
           error
         );
       });
