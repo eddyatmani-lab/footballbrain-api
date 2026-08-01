@@ -241,6 +241,10 @@ app.get("/health", (req, res) => {
         process.env
           .API_FOOTBALL_KEY
       ),
+    apiFootballEnabled:
+      API_FOOTBALL_ENABLED,
+    automaticSchedulersEnabled:
+      AUTOMATIC_SCHEDULERS_ENABLED,
   });
 });
 
@@ -545,22 +549,21 @@ app.get("/leagues", async (req, res) => {
 });
 app.get("/status", async (req, res) => {
   try {
-    const response = await axios.get(
-      "https://v3.football.api-sports.io/status",
-      {
-        headers: {
-          "x-apisports-key":
-            process.env.API_FOOTBALL_KEY,
-        },
-      }
+    const response = await callApiFootball(
+      "/status"
     );
 
-    res.json(response.data);
+    return res.json(response.data);
   } catch (error) {
-    res.json(
-      error.response?.data ||
-      error.message
-    );
+    return res
+      .status(error.status || error.response?.status || 500)
+      .json({
+        ok: false,
+        code: error.code || null,
+        error:
+          error.response?.data ||
+          error.message,
+      });
   }
 });
 app.get("/internal/match/:fixtureId", async (req, res) => {
@@ -4718,6 +4721,18 @@ async function callApiFootball(
   endpoint,
   params = {}
 ) {
+  if (!API_FOOTBALL_ENABLED) {
+    const error = new Error(
+      "API-Football temporairement désactivée par configuration."
+    );
+
+    error.code = "API_FOOTBALL_DISABLED";
+    error.status = 503;
+    error.endpoint = endpoint;
+
+    throw error;
+  }
+
   const response = await axios.get(
     `${API_BASE_URL}${endpoint}`,
     {
@@ -4989,22 +5004,21 @@ app.get("/leagues", async (req, res) => {
 });
 app.get("/status", async (req, res) => {
   try {
-    const response = await axios.get(
-      "https://v3.football.api-sports.io/status",
-      {
-        headers: {
-          "x-apisports-key":
-            process.env.API_FOOTBALL_KEY,
-        },
-      }
+    const response = await callApiFootball(
+      "/status"
     );
 
-    res.json(response.data);
+    return res.json(response.data);
   } catch (error) {
-    res.json(
-      error.response?.data ||
-      error.message
-    );
+    return res
+      .status(error.status || error.response?.status || 500)
+      .json({
+        ok: false,
+        code: error.code || null,
+        error:
+          error.response?.data ||
+          error.message,
+      });
   }
 });
 app.get("/internal/match/:fixtureId", async (req, res) => {
@@ -10482,20 +10496,47 @@ async function runLineupWatcher() {
       false;
   }
 }
-/*
- * Premier contrôle 45 secondes
- * après le démarrage du serveur.
- */
-setTimeout(() => {
-  runLineupWatcher();
-}, 45_000);
+let lineupWatcherSchedulerStarted = false;
 
-/*
- * Nouveau contrôle toutes les 10 minutes.
- */
-setInterval(() => {
-  runLineupWatcher();
-}, 10 * 60 * 1000);
+function startLineupWatcherScheduler() {
+  if (lineupWatcherSchedulerStarted) {
+    console.log(
+      "⏭️ Lineup Watcher Scheduler déjà démarré."
+    );
+    return;
+  }
+
+  lineupWatcherSchedulerStarted = true;
+
+  /*
+   * Premier contrôle 45 secondes
+   * après le démarrage du serveur.
+   */
+  setTimeout(() => {
+    runLineupWatcher().catch((error) => {
+      console.error(
+        "ERREUR PREMIER LINEUP WATCHER :",
+        error
+      );
+    });
+  }, 45_000);
+
+  /*
+   * Nouveau contrôle toutes les 10 minutes.
+   */
+  setInterval(() => {
+    runLineupWatcher().catch((error) => {
+      console.error(
+        "ERREUR INTERVAL LINEUP WATCHER :",
+        error
+      );
+    });
+  }, 10 * 60 * 1000);
+
+  console.log(
+    "✅ Lineup Watcher Scheduler : toutes les 10 minutes"
+  );
+}
 let hourlyOddsWatcherRunning = false;
 
 function normalizeSelectedOutcome(
@@ -16332,6 +16373,17 @@ function startAutomaticSchedulers() {
     return;
   }
 
+  if (!API_FOOTBALL_ENABLED) {
+    console.log(
+      "⏸️ Schedulers non démarrés : API_FOOTBALL_ENABLED=false"
+    );
+    console.log(
+      "ℹ️ Le serveur, Learning, Calibration et les routes SQL restent accessibles."
+    );
+    return;
+  }
+
+  startLineupWatcherScheduler();
 
   /*
    * Premier rafraîchissement des résultats
