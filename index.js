@@ -9910,63 +9910,32 @@ const response = await fetch(
 );
 let dailyAnalysisJobRunning = false;
 
-async function runAutomaticDailyAnalysis() {
+async function runAutomaticDailyAnalysis({
+  date = getParisDateString(),
+} = {}) {
   if (dailyAnalysisJobRunning) {
     console.log(
       "ANALYSE QUOTIDIENNE : tâche déjà en cours"
     );
-    return;
+
+    return {
+      ok: true,
+      skipped: true,
+      reason: "ALREADY_RUNNING",
+    };
   }
-let lastDailyFullAnalysisDate = null;
-
-function getParisTimeParts() {
-  const parts =
-    new Intl.DateTimeFormat(
-      "en-CA",
-      {
-        timeZone: "Europe/Paris",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        hourCycle: "h23",
-      }
-    ).formatToParts(new Date());
-
-  const values = {};
-
-  for (const part of parts) {
-    if (part.type !== "literal") {
-      values[part.type] =
-        part.value;
-    }
-  }
-
-  return {
-    date:
-      `${values.year}-` +
-      `${values.month}-` +
-      `${values.day}`,
-
-    hour:
-      Number(values.hour),
-
-    minute:
-      Number(values.minute),
-  };
-}
 
   dailyAnalysisJobRunning = true;
 
   try {
     const url =
-  `http://127.0.0.1:${PORT}` +
-  `/internal/rebuild-daily-analysis` +
-  `?limit=300`;
+      `http://127.0.0.1:${PORT}` +
+      `/internal/rebuild-daily-analysis` +
+      `?date=${encodeURIComponent(date)}` +
+      `&limit=300`;
 
     console.log(
-      "ANALYSE QUOTIDIENNE : démarrage"
+      `ANALYSE QUOTIDIENNE : démarrage ${date}`
     );
 
     const response = await fetch(url, {
@@ -9988,11 +9957,15 @@ function getParisTimeParts() {
       "ANALYSE QUOTIDIENNE : terminée",
       data.summary
     );
+
+    return data;
   } catch (error) {
     console.error(
       "ERREUR ANALYSE QUOTIDIENNE :",
       error.message
     );
+
+    throw error;
   } finally {
     dailyAnalysisJobRunning = false;
   }
@@ -11028,15 +11001,16 @@ async function runHourlyOddsWatcher() {
 /*
  * PLANIFICATEUR DE L’ANALYSE COMPLÈTE
  *
- * Cette variable mémorise la dernière date
- * pour laquelle l’analyse quotidienne a été lancée.
+ * Après 03h00 (heure de Paris), le backend vérifie que les analyses
+ * du jour ont bien été générées. Un redémarrage après 03h00 déclenche
+ * donc un rattrapage au lieu d’attendre le lendemain.
  */
 let lastDailyFullAnalysisDate = null;
+let lastDailyFullAnalysisAttemptAt = 0;
 
-/*
- * Retourne la date et l’heure actuelles
- * dans le fuseau horaire Europe/Paris.
- */
+const DAILY_ANALYSIS_RETRY_INTERVAL_MS =
+  30 * 60 * 1000;
+
 function getParisTimeParts() {
   const parts =
     new Intl.DateTimeFormat(
@@ -11075,54 +11049,91 @@ function getParisTimeParts() {
   };
 }
 
-/*
- * Vérifie si l’analyse complète doit être lancée.
- *
- * Elle s’exécute une seule fois par jour,
- * entre 03h00 et 03h09, heure de Paris.
- */
 async function checkDailyFullAnalysisSchedule() {
   const paris =
     getParisTimeParts();
 
-  const isScheduledWindow =
-    paris.hour === 3 &&
-    paris.minute < 10;
-
-  const alreadyRunToday =
-    lastDailyFullAnalysisDate ===
-    paris.date;
+  /*
+   * Avant 03h00, on ne lance rien. Après 03h00, un démarrage tardif
+   * ou un déploiement Railway peut encore rattraper les analyses.
+   */
+  if (paris.hour < 3) {
+    return;
+  }
 
   if (
-    !isScheduledWindow ||
-    alreadyRunToday
+    lastDailyFullAnalysisDate ===
+    paris.date
   ) {
     return;
   }
 
-  /*
-   * On mémorise immédiatement la date
-   * pour empêcher deux lancements simultanés.
-   */
-  lastDailyFullAnalysisDate =
-    paris.date;
+  if (dailyAnalysisJobRunning) {
+    return;
+  }
+
+  const now = Date.now();
+
+  if (
+    now - lastDailyFullAnalysisAttemptAt <
+    DAILY_ANALYSIS_RETRY_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  lastDailyFullAnalysisAttemptAt = now;
 
   console.log(
-    `ANALYSE COMPLÈTE PLANIFIÉE : ${paris.date}`
+    `ANALYSE COMPLÈTE : contrôle/rattrapage ${paris.date}`
   );
 
   try {
-    await runAutomaticDailyAnalysis();
-  } catch (error) {
-    /*
-     * En cas d’échec, le prochain contrôle
-     * pourra effectuer une nouvelle tentative.
-     */
-    lastDailyFullAnalysisDate =
-      null;
+    const result =
+      await runAutomaticDailyAnalysis({
+        date: paris.date,
+      });
 
+    const summary =
+      result?.summary || {};
+
+    const failed =
+      Number(summary.failed || 0);
+
+    const fixturesFound =
+      Number(summary.fixturesFound || 0);
+
+    const alreadyComplete =
+      Number(summary.alreadyComplete || 0);
+
+    const rebuilt =
+      Number(summary.rebuilt || 0);
+
+    const covered =
+      alreadyComplete + rebuilt;
+
+    /*
+     * On marque la journée comme terminée uniquement lorsque le cycle
+     * n’a produit aucun échec et que tous les matchs éligibles sont
+     * couverts. Sinon, une nouvelle tentative aura lieu 30 min après.
+     */
+    if (
+      failed === 0 &&
+      covered >= fixturesFound
+    ) {
+      lastDailyFullAnalysisDate =
+        paris.date;
+
+      console.log(
+        `ANALYSE COMPLÈTE : journée ${paris.date} couverte (${covered}/${fixturesFound})`
+      );
+    } else {
+      console.warn(
+        `ANALYSE COMPLÈTE : journée incomplète (${covered}/${fixturesFound}, ${failed} échec(s)). Nouvelle tentative dans 30 minutes.`
+      );
+    }
+  } catch (error) {
     console.error(
-      "ANALYSE COMPLÈTE PLANIFIÉE : erreur",
+      "ANALYSE COMPLÈTE : erreur",
       error.message
     );
   }
