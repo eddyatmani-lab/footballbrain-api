@@ -13285,7 +13285,20 @@ app.get(
  * ============================================================
  */
 
-let automaticStudioRebuildRunning = false;
+/*
+ * Verrous Brain Studio séparés.
+ *
+ * - manualSnapshotRebuildRunning :
+ *   protège uniquement la route manuelle de test d'un match.
+ *
+ * - adminStudioRebuildRunning :
+ *   protège uniquement la reconstruction groupée depuis Admin.
+ *
+ * Le scheduler possède déjà son propre verrou :
+ * studioSchedulerRunning.
+ */
+let manualSnapshotRebuildRunning = false;
+let adminStudioRebuildRunning = false;
 
 function studioNumber(
   value,
@@ -14478,8 +14491,8 @@ app.get(
   "/internal/rebuild-studio-snapshot/:fixtureId",
   async (req, res) => {
     if (
-      automaticStudioRebuildRunning
-    ) {
+  manualSnapshotRebuildRunning
+) {
       return res
         .status(409)
         .json({
@@ -14489,9 +14502,8 @@ app.get(
         });
     }
 
-    automaticStudioRebuildRunning =
-      true;
-
+manualSnapshotRebuildRunning =
+  true;
     try {
       const result =
         await rebuildAutomaticStudioSnapshot(
@@ -14518,8 +14530,8 @@ app.get(
             "Erreur inconnue",
         });
     } finally {
-      automaticStudioRebuildRunning =
-        false;
+      manualSnapshotRebuildRunning =
+  false;
     }
   }
 );
@@ -16954,19 +16966,51 @@ app.get("/internal/admin/brainstudio/rebuild-needed", async (req, res) => {
     });
   }
 });
+app.get(
+  "/internal/admin/brainstudio/rebuild-status",
+  async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
 
+    return res.json({
+      ok: true,
+
+      adminRebuild: {
+        running:
+          adminStudioRebuildRunning,
+      },
+
+      manualSnapshotRebuild: {
+        running:
+          manualSnapshotRebuildRunning,
+      },
+
+      scheduler: {
+        running:
+          studioSchedulerRunning,
+        lastStartedAt:
+          studioSchedulerLastStartedAt,
+        lastFinishedAt:
+          studioSchedulerLastFinishedAt,
+      },
+    });
+  }
+);
 app.post("/internal/admin/brainstudio/rebuild-missing", async (req, res) => {
   if (!requireOptionalAdminKey(req, res)) return;
 
-  if (automaticStudioRebuildRunning) {
-    return res.status(409).json({
-      ok: false,
-      error: "Une reconstruction Brain Studio est déjà en cours.",
-    });
-  }
+if (adminStudioRebuildRunning) {
+  return res.status(409).json({
+    ok: false,
+    code: "ADMIN_STUDIO_REBUILD_ALREADY_RUNNING",
+    retryable: true,
+    error:
+      "Une reconstruction Admin Brain Studio est déjà en cours.",
+  });
+}
 
-  automaticStudioRebuildRunning = true;
-
+adminStudioRebuildRunning = true;
   try {
     await ensureStudioPredictionColumns();
 
@@ -17097,9 +17141,9 @@ app.post("/internal/admin/brainstudio/rebuild-missing", async (req, res) => {
       ok: false,
       error: error?.message || "Impossible de reconstruire les analyses.",
     });
-  } finally {
-    automaticStudioRebuildRunning = false;
-  }
+ } finally {
+  adminStudioRebuildRunning = false;
+}
 });
 
 app.get("/internal/admin/bilan/markets", async (req, res) => {
