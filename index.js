@@ -793,7 +793,41 @@ async function ensureLeagueManagerTables() {
     ON league_settings(league_type);
   `);
 }
+async function getEnabledLeagueIds() {
+  await ensureLeagueManagerTables();
 
+  const result = await pool.query(`
+    SELECT league_id
+    FROM league_settings
+    WHERE enabled = TRUE
+  `);
+
+  return new Set(
+    result.rows
+      .map((row) => Number(row.league_id))
+      .filter(
+        (leagueId) =>
+          Number.isInteger(leagueId) &&
+          leagueId > 0
+      )
+  );
+}
+
+function isLeagueEnabled(
+  fixture = {},
+  enabledLeagueIds = new Set()
+) {
+  const leagueId = Number(
+    fixture?.league?.id ??
+      fixture?.league_id ??
+      fixture?.leagueId
+  );
+
+  return (
+    Number.isInteger(leagueId) &&
+    enabledLeagueIds.has(leagueId)
+  );
+}
 async function syncLeagueManagerCatalogue({ forceRefresh = false } = {}) {
   const response = await callApiFootball(
     "/leagues",
@@ -9744,7 +9778,28 @@ app.get(
             "Date invalide. Format attendu : YYYY-MM-DD",
         });
       }
+const enabledLeagueIds =
+  await getEnabledLeagueIds();
 
+if (enabledLeagueIds.size === 0) {
+  return res.json({
+    ok: true,
+    date,
+
+    summary: {
+      fixturesFromApi: 0,
+      fixtures: 0,
+      analyzed: 0,
+      pending: 0,
+      enabledLeagues: 0,
+    },
+
+    matches: [],
+
+    warning:
+      "Aucune compétition n'est activée dans le League Manager.",
+  });
+}
       const fixturesResponse =
   await callApiFootball(
     "/fixtures",
@@ -9768,13 +9823,17 @@ const fixtures = rawFixtures
     const awayName =
       item?.teams?.away?.name;
 
-    return (
-      Number.isInteger(fixtureId) &&
-      fixtureId > 0 &&
-      Boolean(homeName) &&
-      Boolean(awayName) &&
-      !isExcludedFixture(item)
-    );
+   return (
+  Number.isInteger(fixtureId) &&
+  fixtureId > 0 &&
+  Boolean(homeName) &&
+  Boolean(awayName) &&
+  isLeagueEnabled(
+    item,
+    enabledLeagueIds
+  ) &&
+  !isExcludedFixture(item)
+);
   })
   .sort((a, b) =>
     String(
@@ -10084,16 +10143,29 @@ const fixtures = rawFixtures
         date,
 
         summary: {
-          fixtures:
-            matches.length,
+  fixturesFromApi:
+    rawFixtures.length,
 
-          analyzed:
-            analyzedMatches.length,
+  fixtures:
+    matches.length,
 
-          pending:
-            matches.length -
-            analyzedMatches.length,
-        },
+  analyzed:
+    analyzedMatches.length,
+
+  pending:
+    matches.length -
+    analyzedMatches.length,
+
+  enabledLeagues:
+    enabledLeagueIds.size,
+
+  excludedByLeagueManager:
+    Math.max(
+      0,
+      rawFixtures.length -
+        matches.length
+    ),
+},
 
         matches,
       });
