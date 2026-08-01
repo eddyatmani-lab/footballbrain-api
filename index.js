@@ -16305,11 +16305,10 @@ app.get(
  */
 
 const CALIBRATION_RECOMMENDATION_STATUSES = new Set([
-  "PROPOSED",
-  "APPROVED",
-  "REJECTED",
+  "OBSERVING",
   "ACTIVE",
-  "PAUSED",
+  "COOLDOWN",
+  "REVERTED",
   "EXPIRED",
 ]);
 
@@ -16404,7 +16403,7 @@ async function ensureCalibrationDecisionTables() {
 
       severity TEXT NOT NULL DEFAULT 'INFO',
       priority_score NUMERIC NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'PROPOSED',
+      status TEXT NOT NULL DEFAULT 'OBSERVING',
 
       title TEXT NOT NULL,
       explanation TEXT NOT NULL,
@@ -16437,16 +16436,30 @@ async function ensureCalibrationDecisionTables() {
       source_calculated_at TIMESTAMPTZ,
 
       generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      reviewed_at TIMESTAMPTZ,
-      reviewed_by TEXT,
-      review_note TEXT,
-
-      activated_at TIMESTAMPTZ,
-      expires_at TIMESTAMPTZ,
-
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  /*
+   * Ajout progressif des colonnes d'auto-évaluation.
+   * Ce bloc fonctionne même si la table existe déjà.
+   */
+  await pool.query(`
+    ALTER TABLE calibration_recommendations
+      ADD COLUMN IF NOT EXISTS activated_sample_size INTEGER,
+      ADD COLUMN IF NOT EXISTS last_evaluated_sample_size INTEGER,
+      ADD COLUMN IF NOT EXISTS baseline_gap NUMERIC,
+      ADD COLUMN IF NOT EXISTS baseline_brier_score NUMERIC,
+      ADD COLUMN IF NOT EXISTS effectiveness_score NUMERIC;
+  `);
+
+  /*
+   * Met à jour la valeur par défaut de l'ancien statut.
+   */
+  await pool.query(`
+    ALTER TABLE calibration_recommendations
+    ALTER COLUMN status SET DEFAULT 'OBSERVING';
   `);
 
   await pool.query(`
@@ -16535,8 +16548,13 @@ function getCalibrationDecisionSeverity({
         evidence.score >= 2
           ? "CRITICAL"
           : "HIGH",
-      priority: 4 + evidence.score,
-      diagnostic: "CRITICAL_BIAS",
+
+      priority:
+        4 + evidence.score,
+
+      diagnostic:
+        "CRITICAL_BIAS",
+
       evidence,
     };
   }
@@ -16547,8 +16565,13 @@ function getCalibrationDecisionSeverity({
         evidence.score >= 2
           ? "HIGH"
           : "MEDIUM",
-      priority: 3 + evidence.score,
-      diagnostic: "IMPORTANT_BIAS",
+
+      priority:
+        3 + evidence.score,
+
+      diagnostic:
+        "IMPORTANT_BIAS",
+
       evidence,
     };
   }
@@ -16556,7 +16579,8 @@ function getCalibrationDecisionSeverity({
   if (gap >= 3) {
     return {
       severity: "MEDIUM",
-      priority: 2 + evidence.score,
+      priority:
+        2 + evidence.score,
       diagnostic: "WATCH",
       evidence,
     };
@@ -16564,13 +16588,57 @@ function getCalibrationDecisionSeverity({
 
   return {
     severity: "LOW",
-    priority: 1 + evidence.score,
+    priority:
+      1 + evidence.score,
     diagnostic: "HEALTHY",
     evidence,
   };
 }
 
-function buildMarketCalibrationRecommendation(row = {}) {
+function getAutomaticCalibrationStatus({
+  sampleSize,
+  absoluteGap,
+  evidenceLevel,
+  action,
+}) {
+  /*
+   * Pas assez de données :
+   * on observe seulement.
+   */
+  if (
+    action ===
+    "WAIT_FOR_MORE_DATA"
+  ) {
+    return "OBSERVING";
+  }
+
+  /*
+   * Une calibration devient active automatiquement
+   * uniquement si :
+   *
+   * - au moins 100 observations ;
+   * - biais d'au moins 5 points ;
+   * - niveau de preuve MEDIUM ou HIGH ;
+   * - action réelle de correction.
+   */
+  if (
+    sampleSize >= 100 &&
+    absoluteGap >= 5 &&
+    ["MEDIUM", "HIGH"].includes(
+      evidenceLevel
+    ) &&
+    action ===
+      "ADJUST_PROBABILITY"
+  ) {
+    return "ACTIVE";
+  }
+
+  return "OBSERVING";
+}
+
+function buildMarketCalibrationRecommendation(
+  row = {}
+) {
   const marketKey = String(
     row.market_key || "UNKNOWN"
   )
@@ -16578,26 +16646,40 @@ function buildMarketCalibrationRecommendation(row = {}) {
     .toUpperCase();
 
   const probabilityBucket = String(
-    row.probability_bucket || "UNKNOWN"
+    row.probability_bucket ||
+      "UNKNOWN"
   ).trim();
 
   const sampleSize =
-    calibrationDecisionNumber(row.sample_size);
+    calibrationDecisionNumber(
+      row.sample_size
+    );
 
   const predictedAverage =
-    calibrationDecisionNumber(row.predicted_mean);
+    calibrationDecisionNumber(
+      row.predicted_mean
+    );
 
   const actualRate =
-    calibrationDecisionNumber(row.actual_mean);
+    calibrationDecisionNumber(
+      row.actual_mean
+    );
 
   /*
-   * Positif = probabilité surestimée.
-   * Négatif = probabilité sous-estimée.
+   * Positif :
+   * la probabilité est surestimée.
+   *
+   * Négatif :
+   * la probabilité est sous-estimée.
    */
   const calibrationGap =
-    predictedAverage - actualRate;
+    predictedAverage -
+    actualRate;
 
-  const absoluteGap = Math.abs(calibrationGap);
+  const absoluteGap =
+    Math.abs(
+      calibrationGap
+    );
 
   const classification =
     getCalibrationDecisionSeverity({
@@ -16607,11 +16689,12 @@ function buildMarketCalibrationRecommendation(row = {}) {
 
   /*
    * Correction prudente :
-   * seulement 50 % du biais observé,
+   * seulement 50 % du biais,
    * avec un plafond de ±6 points.
    */
   const proposedAdjustment =
-    classification.evidence.key === "INSUFFICIENT"
+    classification.evidence.key ===
+    "INSUFFICIENT"
       ? 0
       : clampCalibrationDecision(
           -calibrationGap * 0.5,
@@ -16626,21 +16709,42 @@ function buildMarketCalibrationRecommendation(row = {}) {
         ? "UP"
         : "NONE";
 
-  let action = "KEEP_PROBABILITY";
+  let action =
+    "KEEP_PROBABILITY";
 
   if (
     classification.evidence.key ===
     "INSUFFICIENT"
   ) {
-    action = "WAIT_FOR_MORE_DATA";
+    action =
+      "WAIT_FOR_MORE_DATA";
   } else if (
-    Math.abs(proposedAdjustment) >= 0.5
+    Math.abs(
+      proposedAdjustment
+    ) >= 0.5
   ) {
-    action = "ADJUST_PROBABILITY";
+    action =
+      "ADJUST_PROBABILITY";
   }
 
+  /*
+   * Statut déterminé automatiquement.
+   */
+  const automaticStatus =
+    getAutomaticCalibrationStatus({
+      sampleSize,
+      absoluteGap,
+
+      evidenceLevel:
+        classification.evidence
+          .key,
+
+      action,
+    });
+
   const title =
-    action === "WAIT_FOR_MORE_DATA"
+    action ===
+    "WAIT_FOR_MORE_DATA"
       ? `${marketKey} ${probabilityBucket} : données insuffisantes`
       : direction === "DOWN"
         ? `Réduire ${marketKey} sur le bucket ${probabilityBucket}`
@@ -16677,12 +16781,20 @@ function buildMarketCalibrationRecommendation(row = {}) {
           : "La probabilité moyenne correspond au taux de réussite réel.";
 
   const recommendationText =
-    action === "WAIT_FOR_MORE_DATA"
+    action ===
+    "WAIT_FOR_MORE_DATA"
       ? "Attendre davantage de résultats avant toute modification."
-      : action === "KEEP_PROBABILITY"
+      : action ===
+          "KEEP_PROBABILITY"
         ? "Conserver le réglage actuel."
-        : `${direction === "DOWN" ? "Réduire" : "Augmenter"} prudemment la probabilité de ${roundCalibrationDecision(
-            Math.abs(proposedAdjustment),
+        : `${
+            direction === "DOWN"
+              ? "Réduire"
+              : "Augmenter"
+          } prudemment la probabilité de ${roundCalibrationDecision(
+            Math.abs(
+              proposedAdjustment
+            ),
             1
           )} point(s).`;
 
@@ -16692,7 +16804,8 @@ function buildMarketCalibrationRecommendation(row = {}) {
           (
             predictedAverage +
             proposedAdjustment
-          ) / predictedAverage,
+          ) /
+            predictedAverage,
           0.75,
           1.25
         )
@@ -16707,10 +16820,13 @@ function buildMarketCalibrationRecommendation(row = {}) {
 
   const evidence = {
     sampleSize,
+
     evidenceLevel:
       classification.evidence.key,
+
     evidenceLabel:
-      classification.evidence.label,
+      classification.evidence
+        .label,
 
     predictedAverage:
       roundCalibrationDecision(
@@ -16781,13 +16897,17 @@ function buildMarketCalibrationRecommendation(row = {}) {
   return {
     recommendationKey,
 
-    type: "PROBABILITY_BIAS",
-    scopeType: "MARKET_BUCKET",
+    type:
+      "PROBABILITY_BIAS",
+
+    scopeType:
+      "MARKET_BUCKET",
 
     marketKey,
     probabilityBucket,
 
-    periodKey: "ALL_TIME",
+    periodKey:
+      "ALL_TIME",
 
     severity:
       classification.severity,
@@ -16795,7 +16915,12 @@ function buildMarketCalibrationRecommendation(row = {}) {
     priorityScore:
       classification.priority,
 
-    status: "PROPOSED",
+    /*
+     * Plus de PROPOSED.
+     * Le statut est choisi automatiquement.
+     */
+    status:
+      automaticStatus,
 
     title,
     explanation,
@@ -16852,7 +16977,6 @@ function buildMarketCalibrationRecommendation(row = {}) {
       row.calculated_at || null,
   };
 }
-
 async function generateCalibrationRecommendations({
   source = "manual",
 } = {}) {
@@ -16900,28 +17024,23 @@ async function generateCalibrationRecommendations({
      * Les décisions déjà validées ou actives ne sont jamais
      * automatiquement remises en PROPOSED.
      */
-    const existingResult = await pool.query(
-      `
-        SELECT id, status
-        FROM calibration_recommendations
-        WHERE recommendation_key = $1
-        LIMIT 1
-      `,
-      [item.recommendationKey]
-    );
+   const existingResult = await pool.query(
+  `
+    SELECT
+      id,
+      status,
+      proposed_adjustment
+    FROM calibration_recommendations
+    WHERE recommendation_key = $1
+    LIMIT 1
+  `,
+  [item.recommendationKey]
+);
 
     const existing =
       existingResult.rows[0] || null;
 
-    if (
-      existing &&
-      ["APPROVED", "ACTIVE", "PAUSED"].includes(
-        existing.status
-      )
-    ) {
-      preserved += 1;
-      continue;
-    }
+    
 
     const result = await pool.query(
       `
