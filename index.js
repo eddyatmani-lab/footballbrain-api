@@ -16332,7 +16332,6 @@ function startAutomaticSchedulers() {
     return;
   }
 
-  startLineupWatcherScheduler();
 
   /*
    * Premier rafraîchissement des résultats
