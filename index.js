@@ -16293,15 +16293,14 @@ app.get(
 );
 /*
  * ==========================================================================
- * CALIBRATION CENTER — REGISTRE DÉCISIONNEL V1
+ * CALIBRATION CENTER — MOTEUR DÉCISIONNEL AUTONOME V2
  * ==========================================================================
  *
- * Learning reste la mémoire statistique.
+ * Learning conserve la mémoire statistique.
+ * Calibration Center lit cette mémoire, génère des calibrations,
+ * les active avec garde-fous, puis mesure automatiquement leur efficacité.
  *
- * Cette table conserve uniquement les diagnostics et recommandations
- * produits par le Calibration Center.
- *
- * Aucun ajustement n'est appliqué automatiquement à Brain Studio.
+ * Aucun bouton d'approbation n'est nécessaire.
  */
 
 const CALIBRATION_RECOMMENDATION_STATUSES = new Set([
@@ -16320,9 +16319,18 @@ const CALIBRATION_RECOMMENDATION_SEVERITIES = new Set([
   "CRITICAL",
 ]);
 
+const CALIBRATION_EVALUATION_MIN_NEW_SAMPLES = 50;
+const CALIBRATION_MIN_GAP_IMPROVEMENT = 1;
+const CALIBRATION_MAX_BRIER_DEGRADATION = 0.02;
+const CALIBRATION_MAX_GAP_DEGRADATION = 2;
+const CALIBRATION_MAX_ADJUSTMENT_STEP = 1;
+
+let calibrationAutoEvaluationRunning = false;
+let automaticCalibrationCycleRunning = false;
+
 function normalizeCalibrationRecommendationStatus(
   value,
-  fallback = "PROPOSED"
+  fallback = "OBSERVING"
 ) {
   const normalized = String(value || fallback)
     .trim()
@@ -16333,53 +16341,24 @@ function normalizeCalibrationRecommendationStatus(
     : fallback;
 }
 
-function normalizeCalibrationRecommendationSeverity(
-  value,
-  fallback = "INFO"
-) {
-  const normalized = String(value || fallback)
-    .trim()
-    .toUpperCase();
-
-  return CALIBRATION_RECOMMENDATION_SEVERITIES.has(normalized)
-    ? normalized
-    : fallback;
-}
-
 function calibrationDecisionNumber(value, fallback = 0) {
   const parsed = Number(value);
-
-  return Number.isFinite(parsed)
-    ? parsed
-    : fallback;
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function clampCalibrationDecision(
-  value,
-  minimum,
-  maximum
-) {
+function clampCalibrationDecision(value, minimum, maximum) {
   return Math.min(
     maximum,
-    Math.max(
-      minimum,
-      calibrationDecisionNumber(value)
-    )
+    Math.max(minimum, calibrationDecisionNumber(value))
   );
 }
 
-function roundCalibrationDecision(
-  value,
-  decimals = 2
-) {
+function roundCalibrationDecision(value, decimals = 2) {
   const factor = 10 ** decimals;
 
   return (
     Math.round(
-      (
-        calibrationDecisionNumber(value) +
-        Number.EPSILON
-      ) * factor
+      (calibrationDecisionNumber(value) + Number.EPSILON) * factor
     ) / factor
   );
 }
@@ -16393,12 +16372,10 @@ async function ensureCalibrationDecisionTables() {
 
       type TEXT NOT NULL,
       scope_type TEXT NOT NULL DEFAULT 'MARKET',
-
       market_key TEXT,
       league_id BIGINT,
       confidence_band TEXT,
       probability_bucket TEXT,
-
       period_key TEXT NOT NULL DEFAULT 'ALL_TIME',
 
       severity TEXT NOT NULL DEFAULT 'INFO',
@@ -16435,15 +16412,30 @@ async function ensureCalibrationDecisionTables() {
       source_model_version TEXT,
       source_calculated_at TIMESTAMPTZ,
 
+      activated_sample_size INTEGER,
+      last_evaluated_sample_size INTEGER,
+      baseline_gap NUMERIC,
+      baseline_brier_score NUMERIC,
+      effectiveness_score NUMERIC,
+
+      previous_status TEXT,
+      evaluation_count INTEGER NOT NULL DEFAULT 0,
+      last_evaluated_at TIMESTAMPTZ,
+      last_evaluation_reason TEXT,
+      gap_improvement NUMERIC,
+      brier_improvement NUMERIC,
+
       generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      activated_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
+
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
   /*
-   * Ajout progressif des colonnes d'auto-évaluation.
-   * Ce bloc fonctionne même si la table existe déjà.
+   * Migration progressive pour les bases où la table existait déjà.
    */
   await pool.query(`
     ALTER TABLE calibration_recommendations
@@ -16451,15 +16443,72 @@ async function ensureCalibrationDecisionTables() {
       ADD COLUMN IF NOT EXISTS last_evaluated_sample_size INTEGER,
       ADD COLUMN IF NOT EXISTS baseline_gap NUMERIC,
       ADD COLUMN IF NOT EXISTS baseline_brier_score NUMERIC,
-      ADD COLUMN IF NOT EXISTS effectiveness_score NUMERIC;
+      ADD COLUMN IF NOT EXISTS effectiveness_score NUMERIC,
+      ADD COLUMN IF NOT EXISTS previous_status TEXT,
+      ADD COLUMN IF NOT EXISTS evaluation_count INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS last_evaluation_reason TEXT,
+      ADD COLUMN IF NOT EXISTS gap_improvement NUMERIC,
+      ADD COLUMN IF NOT EXISTS brier_improvement NUMERIC,
+      ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
   `);
 
-  /*
-   * Met à jour la valeur par défaut de l'ancien statut.
-   */
   await pool.query(`
     ALTER TABLE calibration_recommendations
     ALTER COLUMN status SET DEFAULT 'OBSERVING';
+  `);
+
+  /*
+   * Convertit les anciens statuts manuels vers le nouveau cycle autonome.
+   */
+  await pool.query(`
+    UPDATE calibration_recommendations
+    SET
+      status = CASE
+        WHEN status IN ('PROPOSED', 'APPROVED', 'PAUSED') THEN 'OBSERVING'
+        WHEN status = 'REJECTED' THEN 'REVERTED'
+        ELSE status
+      END,
+      updated_at = NOW()
+    WHERE status IN ('PROPOSED', 'APPROVED', 'PAUSED', 'REJECTED');
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS calibration_recommendation_events (
+      id BIGSERIAL PRIMARY KEY,
+
+      recommendation_id BIGINT NOT NULL
+        REFERENCES calibration_recommendations(id)
+        ON DELETE CASCADE,
+
+      recommendation_key TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+
+      previous_status TEXT,
+      new_status TEXT,
+
+      previous_adjustment NUMERIC,
+      new_adjustment NUMERIC,
+
+      sample_size INTEGER,
+      new_samples INTEGER,
+
+      baseline_gap NUMERIC,
+      current_gap NUMERIC,
+      gap_improvement NUMERIC,
+
+      baseline_brier_score NUMERIC,
+      current_brier_score NUMERIC,
+      brier_improvement NUMERIC,
+
+      effectiveness_score NUMERIC,
+
+      reason TEXT,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
   await pool.query(`
@@ -16471,7 +16520,7 @@ async function ensureCalibrationDecisionTables() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS
       idx_calibration_recommendations_market
-    ON calibration_recommendations(market_key);
+    ON calibration_recommendations(market_key, probability_bucket);
   `);
 
   await pool.query(`
@@ -16484,6 +16533,15 @@ async function ensureCalibrationDecisionTables() {
     CREATE INDEX IF NOT EXISTS
       idx_calibration_recommendations_generated
     ON calibration_recommendations(generated_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_calibration_events_recommendation
+    ON calibration_recommendation_events(
+      recommendation_id,
+      created_at DESC
+    );
   `);
 }
 
@@ -16525,9 +16583,8 @@ function getCalibrationDecisionSeverity({
   sampleSize,
   absoluteGap,
 }) {
-  const evidence = getCalibrationEvidenceLevel(
-    sampleSize
-  );
+  const evidence = getCalibrationEvidenceLevel(sampleSize);
+  const gap = Math.abs(calibrationDecisionNumber(absoluteGap));
 
   if (evidence.key === "INSUFFICIENT") {
     return {
@@ -16538,40 +16595,20 @@ function getCalibrationDecisionSeverity({
     };
   }
 
-  const gap = Math.abs(
-    calibrationDecisionNumber(absoluteGap)
-  );
-
   if (gap >= 10) {
     return {
-      severity:
-        evidence.score >= 2
-          ? "CRITICAL"
-          : "HIGH",
-
-      priority:
-        4 + evidence.score,
-
-      diagnostic:
-        "CRITICAL_BIAS",
-
+      severity: evidence.score >= 2 ? "CRITICAL" : "HIGH",
+      priority: 4 + evidence.score,
+      diagnostic: "CRITICAL_BIAS",
       evidence,
     };
   }
 
   if (gap >= 5) {
     return {
-      severity:
-        evidence.score >= 2
-          ? "HIGH"
-          : "MEDIUM",
-
-      priority:
-        3 + evidence.score,
-
-      diagnostic:
-        "IMPORTANT_BIAS",
-
+      severity: evidence.score >= 2 ? "HIGH" : "MEDIUM",
+      priority: 3 + evidence.score,
+      diagnostic: "IMPORTANT_BIAS",
       evidence,
     };
   }
@@ -16579,8 +16616,7 @@ function getCalibrationDecisionSeverity({
   if (gap >= 3) {
     return {
       severity: "MEDIUM",
-      priority:
-        2 + evidence.score,
+      priority: 2 + evidence.score,
       diagnostic: "WATCH",
       evidence,
     };
@@ -16588,8 +16624,7 @@ function getCalibrationDecisionSeverity({
 
   return {
     severity: "LOW",
-    priority:
-      1 + evidence.score,
+    priority: 1 + evidence.score,
     diagnostic: "HEALTHY",
     evidence,
   };
@@ -16601,34 +16636,15 @@ function getAutomaticCalibrationStatus({
   evidenceLevel,
   action,
 }) {
-  /*
-   * Pas assez de données :
-   * on observe seulement.
-   */
-  if (
-    action ===
-    "WAIT_FOR_MORE_DATA"
-  ) {
+  if (action === "WAIT_FOR_MORE_DATA") {
     return "OBSERVING";
   }
 
-  /*
-   * Une calibration devient active automatiquement
-   * uniquement si :
-   *
-   * - au moins 100 observations ;
-   * - biais d'au moins 5 points ;
-   * - niveau de preuve MEDIUM ou HIGH ;
-   * - action réelle de correction.
-   */
   if (
     sampleSize >= 100 &&
     absoluteGap >= 5 &&
-    ["MEDIUM", "HIGH"].includes(
-      evidenceLevel
-    ) &&
-    action ===
-      "ADJUST_PROBABILITY"
+    ["MEDIUM", "HIGH"].includes(evidenceLevel) &&
+    action === "ADJUST_PROBABILITY"
   ) {
     return "ACTIVE";
   }
@@ -16636,71 +16652,35 @@ function getAutomaticCalibrationStatus({
   return "OBSERVING";
 }
 
-function buildMarketCalibrationRecommendation(
-  row = {}
-) {
-  const marketKey = String(
-    row.market_key || "UNKNOWN"
-  )
+function buildMarketCalibrationRecommendation(row = {}) {
+  const marketKey = String(row.market_key || "UNKNOWN")
     .trim()
     .toUpperCase();
 
   const probabilityBucket = String(
-    row.probability_bucket ||
-      "UNKNOWN"
+    row.probability_bucket || "UNKNOWN"
   ).trim();
 
-  const sampleSize =
-    calibrationDecisionNumber(
-      row.sample_size
-    );
-
-  const predictedAverage =
-    calibrationDecisionNumber(
-      row.predicted_mean
-    );
-
-  const actualRate =
-    calibrationDecisionNumber(
-      row.actual_mean
-    );
+  const sampleSize = calibrationDecisionNumber(row.sample_size);
+  const predictedAverage = calibrationDecisionNumber(row.predicted_mean);
+  const actualRate = calibrationDecisionNumber(row.actual_mean);
 
   /*
-   * Positif :
-   * la probabilité est surestimée.
-   *
-   * Négatif :
-   * la probabilité est sous-estimée.
+   * Positif = surestimation.
+   * Négatif = sous-estimation.
    */
-  const calibrationGap =
-    predictedAverage -
-    actualRate;
+  const calibrationGap = predictedAverage - actualRate;
+  const absoluteGap = Math.abs(calibrationGap);
 
-  const absoluteGap =
-    Math.abs(
-      calibrationGap
-    );
+  const classification = getCalibrationDecisionSeverity({
+    sampleSize,
+    absoluteGap,
+  });
 
-  const classification =
-    getCalibrationDecisionSeverity({
-      sampleSize,
-      absoluteGap,
-    });
-
-  /*
-   * Correction prudente :
-   * seulement 50 % du biais,
-   * avec un plafond de ±6 points.
-   */
   const proposedAdjustment =
-    classification.evidence.key ===
-    "INSUFFICIENT"
+    classification.evidence.key === "INSUFFICIENT"
       ? 0
-      : clampCalibrationDecision(
-          -calibrationGap * 0.5,
-          -6,
-          6
-        );
+      : clampCalibrationDecision(-calibrationGap * 0.5, -6, 6);
 
   const direction =
     calibrationGap > 0
@@ -16709,42 +16689,23 @@ function buildMarketCalibrationRecommendation(
         ? "UP"
         : "NONE";
 
-  let action =
-    "KEEP_PROBABILITY";
+  let action = "KEEP_PROBABILITY";
 
-  if (
-    classification.evidence.key ===
-    "INSUFFICIENT"
-  ) {
-    action =
-      "WAIT_FOR_MORE_DATA";
-  } else if (
-    Math.abs(
-      proposedAdjustment
-    ) >= 0.5
-  ) {
-    action =
-      "ADJUST_PROBABILITY";
+  if (classification.evidence.key === "INSUFFICIENT") {
+    action = "WAIT_FOR_MORE_DATA";
+  } else if (Math.abs(proposedAdjustment) >= 0.5) {
+    action = "ADJUST_PROBABILITY";
   }
 
-  /*
-   * Statut déterminé automatiquement.
-   */
-  const automaticStatus =
-    getAutomaticCalibrationStatus({
-      sampleSize,
-      absoluteGap,
-
-      evidenceLevel:
-        classification.evidence
-          .key,
-
-      action,
-    });
+  const automaticStatus = getAutomaticCalibrationStatus({
+    sampleSize,
+    absoluteGap,
+    evidenceLevel: classification.evidence.key,
+    action,
+  });
 
   const title =
-    action ===
-    "WAIT_FOR_MORE_DATA"
+    action === "WAIT_FOR_MORE_DATA"
       ? `${marketKey} ${probabilityBucket} : données insuffisantes`
       : direction === "DOWN"
         ? `Réduire ${marketKey} sur le bucket ${probabilityBucket}`
@@ -16753,8 +16714,7 @@ function buildMarketCalibrationRecommendation(
           : `${marketKey} ${probabilityBucket} est bien calibré`;
 
   const explanation =
-    classification.evidence.key ===
-    "INSUFFICIENT"
+    classification.evidence.key === "INSUFFICIENT"
       ? `${sampleSize} observations seulement. Le volume est insuffisant pour produire une calibration forte.`
       : calibrationGap > 0
         ? `La probabilité moyenne annoncée est de ${roundCalibrationDecision(
@@ -16781,31 +16741,21 @@ function buildMarketCalibrationRecommendation(
           : "La probabilité moyenne correspond au taux de réussite réel.";
 
   const recommendationText =
-    action ===
-    "WAIT_FOR_MORE_DATA"
+    action === "WAIT_FOR_MORE_DATA"
       ? "Attendre davantage de résultats avant toute modification."
-      : action ===
-          "KEEP_PROBABILITY"
+      : action === "KEEP_PROBABILITY"
         ? "Conserver le réglage actuel."
         : `${
-            direction === "DOWN"
-              ? "Réduire"
-              : "Augmenter"
+            direction === "DOWN" ? "Réduire" : "Augmenter"
           } prudemment la probabilité de ${roundCalibrationDecision(
-            Math.abs(
-              proposedAdjustment
-            ),
+            Math.abs(proposedAdjustment),
             1
           )} point(s).`;
 
   const coefficient =
     predictedAverage > 0
       ? clampCalibrationDecision(
-          (
-            predictedAverage +
-            proposedAdjustment
-          ) /
-            predictedAverage,
+          (predictedAverage + proposedAdjustment) / predictedAverage,
           0.75,
           1.25
         )
@@ -16820,163 +16770,131 @@ function buildMarketCalibrationRecommendation(
 
   const evidence = {
     sampleSize,
-
-    evidenceLevel:
-      classification.evidence.key,
-
-    evidenceLabel:
-      classification.evidence
-        .label,
-
-    predictedAverage:
-      roundCalibrationDecision(
-        predictedAverage,
-        2
-      ),
-
-    actualRate:
-      roundCalibrationDecision(
-        actualRate,
-        2
-      ),
-
-    calibrationGap:
-      roundCalibrationDecision(
-        calibrationGap,
-        2
-      ),
-
-    absoluteGap:
-      roundCalibrationDecision(
-        absoluteGap,
-        2
-      ),
-
-    brierScore:
-      roundCalibrationDecision(
-        row.brier_score,
-        4
-      ),
-
-    logLoss:
-      roundCalibrationDecision(
-        row.log_loss,
-        4
-      ),
-
-    accuracy:
-      roundCalibrationDecision(
-        row.accuracy,
-        2
-      ),
+    evidenceLevel: classification.evidence.key,
+    evidenceLabel: classification.evidence.label,
+    predictedAverage: roundCalibrationDecision(predictedAverage, 2),
+    actualRate: roundCalibrationDecision(actualRate, 2),
+    calibrationGap: roundCalibrationDecision(calibrationGap, 2),
+    absoluteGap: roundCalibrationDecision(absoluteGap, 2),
+    brierScore: roundCalibrationDecision(row.brier_score, 4),
+    logLoss: roundCalibrationDecision(row.log_loss, 4),
+    accuracy: roundCalibrationDecision(row.accuracy, 2),
   };
 
   const recommendation = {
     action,
     direction,
-
-    rawAdjustment:
-      roundCalibrationDecision(
-        -calibrationGap,
-        2
-      ),
-
-    proposedAdjustment:
-      roundCalibrationDecision(
-        proposedAdjustment,
-        2
-      ),
-
-    coefficient:
-      roundCalibrationDecision(
-        coefficient,
-        4
-      ),
+    rawAdjustment: roundCalibrationDecision(-calibrationGap, 2),
+    proposedAdjustment: roundCalibrationDecision(proposedAdjustment, 2),
+    coefficient: roundCalibrationDecision(coefficient, 4),
   };
 
   return {
     recommendationKey,
-
-    type:
-      "PROBABILITY_BIAS",
-
-    scopeType:
-      "MARKET_BUCKET",
-
+    type: "PROBABILITY_BIAS",
+    scopeType: "MARKET_BUCKET",
     marketKey,
     probabilityBucket,
-
-    periodKey:
-      "ALL_TIME",
-
-    severity:
-      classification.severity,
-
-    priorityScore:
-      classification.priority,
-
-    /*
-     * Plus de PROPOSED.
-     * Le statut est choisi automatiquement.
-     */
-    status:
-      automaticStatus,
-
+    periodKey: "ALL_TIME",
+    severity: classification.severity,
+    priorityScore: classification.priority,
+    status: automaticStatus,
     title,
     explanation,
     recommendationText,
-
     action,
     direction,
-
-    rawAdjustment:
-      recommendation.rawAdjustment,
-
-    proposedAdjustment:
-      recommendation.proposedAdjustment,
-
-    coefficient:
-      recommendation.coefficient,
-
+    rawAdjustment: recommendation.rawAdjustment,
+    proposedAdjustment: recommendation.proposedAdjustment,
+    coefficient: recommendation.coefficient,
     sampleSize,
-
-    predictedAverage:
-      evidence.predictedAverage,
-
-    actualRate:
-      evidence.actualRate,
-
-    calibrationGap:
-      evidence.calibrationGap,
-
-    absoluteGap:
-      evidence.absoluteGap,
-
-    brierScore:
-      evidence.brierScore,
-
-    logLoss:
-      evidence.logLoss,
-
-    accuracy:
-      evidence.accuracy,
-
-    evidenceLevel:
-      classification.evidence.key,
-
+    predictedAverage: evidence.predictedAverage,
+    actualRate: evidence.actualRate,
+    calibrationGap: evidence.calibrationGap,
+    absoluteGap: evidence.absoluteGap,
+    brierScore: evidence.brierScore,
+    logLoss: evidence.logLoss,
+    accuracy: evidence.accuracy,
+    evidenceLevel: classification.evidence.key,
     evidence,
     recommendation,
-
-    sourceEngineVersion:
-      row.engine_version || null,
-
-    sourceModelVersion:
-      row.model_version || null,
-
-    sourceCalculatedAt:
-      row.calculated_at || null,
+    sourceEngineVersion: row.engine_version || null,
+    sourceModelVersion: row.model_version || null,
+    sourceCalculatedAt: row.calculated_at || null,
   };
 }
+
+async function insertCalibrationLifecycleEvent({
+  recommendationId,
+  recommendationKey,
+  eventType,
+  previousStatus = null,
+  newStatus = null,
+  previousAdjustment = null,
+  newAdjustment = null,
+  sampleSize = null,
+  newSamples = null,
+  baselineGap = null,
+  currentGap = null,
+  gapImprovement = null,
+  baselineBrierScore = null,
+  currentBrierScore = null,
+  brierImprovement = null,
+  effectivenessScore = null,
+  reason = null,
+  metadata = {},
+  client = pool,
+}) {
+  await client.query(
+    `
+      INSERT INTO calibration_recommendation_events (
+        recommendation_id,
+        recommendation_key,
+        event_type,
+        previous_status,
+        new_status,
+        previous_adjustment,
+        new_adjustment,
+        sample_size,
+        new_samples,
+        baseline_gap,
+        current_gap,
+        gap_improvement,
+        baseline_brier_score,
+        current_brier_score,
+        brier_improvement,
+        effectiveness_score,
+        reason,
+        metadata
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9,
+        $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb
+      )
+    `,
+    [
+      recommendationId,
+      recommendationKey,
+      eventType,
+      previousStatus,
+      newStatus,
+      previousAdjustment,
+      newAdjustment,
+      sampleSize,
+      newSamples,
+      baselineGap,
+      currentGap,
+      gapImprovement,
+      baselineBrierScore,
+      currentBrierScore,
+      brierImprovement,
+      effectivenessScore,
+      reason,
+      JSON.stringify(metadata || {}),
+    ]
+  );
+}
+
 async function generateCalibrationRecommendations({
   source = "manual",
 } = {}) {
@@ -17005,264 +16923,682 @@ async function generateCalibrationRecommendations({
       model_version,
       calculated_at
     FROM learning_calibration
-    ORDER BY
-      market_key ASC,
-      bucket_lower ASC
+    ORDER BY market_key ASC, bucket_lower ASC
   `);
 
-  const recommendations =
-    sourceResult.rows.map(
-      buildMarketCalibrationRecommendation
-    );
+  const recommendations = sourceResult.rows.map(
+    buildMarketCalibrationRecommendation
+  );
 
   let inserted = 0;
   let updated = 0;
-  let preserved = 0;
+  let activated = 0;
 
   for (const item of recommendations) {
-    /*
-     * Les décisions déjà validées ou actives ne sont jamais
-     * automatiquement remises en PROPOSED.
-     */
-   const existingResult = await pool.query(
-  `
-    SELECT
-      id,
-      status,
-      proposed_adjustment
-    FROM calibration_recommendations
-    WHERE recommendation_key = $1
-    LIMIT 1
-  `,
-  [item.recommendationKey]
-);
+    const existingResult = await pool.query(
+      `
+        SELECT
+          id,
+          status,
+          proposed_adjustment,
+          activated_sample_size,
+          baseline_gap,
+          baseline_brier_score
+        FROM calibration_recommendations
+        WHERE recommendation_key = $1
+        LIMIT 1
+      `,
+      [item.recommendationKey]
+    );
 
-    const existing =
-      existingResult.rows[0] || null;
+    const existing = existingResult.rows[0] || null;
 
-    
+    let safeProposedAdjustment = item.proposedAdjustment;
+
+    if (
+      existing &&
+      ["ACTIVE", "COOLDOWN"].includes(existing.status)
+    ) {
+      const existingAdjustment = calibrationDecisionNumber(
+        existing.proposed_adjustment
+      );
+
+      safeProposedAdjustment = clampCalibrationDecision(
+        item.proposedAdjustment,
+        existingAdjustment - CALIBRATION_MAX_ADJUSTMENT_STEP,
+        existingAdjustment + CALIBRATION_MAX_ADJUSTMENT_STEP
+      );
+    }
+
+    const safeCoefficient =
+      item.predictedAverage > 0
+        ? clampCalibrationDecision(
+            (item.predictedAverage + safeProposedAdjustment) /
+              item.predictedAverage,
+            0.75,
+            1.25
+          )
+        : 1;
+
+    const safeRecommendation = {
+      ...item.recommendation,
+      proposedAdjustment: roundCalibrationDecision(
+        safeProposedAdjustment,
+        2
+      ),
+      coefficient: roundCalibrationDecision(safeCoefficient, 4),
+    };
+
+    const desiredStatus =
+      existing?.status === "EXPIRED"
+        ? "EXPIRED"
+        : ["ACTIVE", "COOLDOWN"].includes(existing?.status)
+          ? existing.status
+          : existing?.status === "REVERTED"
+            ? "OBSERVING"
+            : item.status;
 
     const result = await pool.query(
       `
         INSERT INTO calibration_recommendations (
           recommendation_key,
-
           type,
           scope_type,
           market_key,
           probability_bucket,
           period_key,
-
           severity,
           priority_score,
           status,
-
           title,
           explanation,
           recommendation_text,
-
           action,
           direction,
           raw_adjustment,
           proposed_adjustment,
           coefficient,
-
           sample_size,
           predicted_average,
           actual_rate,
           calibration_gap,
           absolute_gap,
-
           brier_score,
           log_loss,
           accuracy,
-
           evidence_level,
           evidence,
           recommendation,
-
           source_engine_version,
           source_model_version,
           source_calculated_at,
-
           generated_at,
           updated_at
         )
         VALUES (
-          $1,
-          $2, $3, $4, $5, $6,
-          $7, $8, $9,
-          $10, $11, $12,
-          $13, $14, $15, $16, $17,
-          $18, $19, $20, $21, $22,
-          $23, $24, $25,
-          $26, $27::jsonb, $28::jsonb,
-          $29, $30, $31,
+          $1, $2, $3, $4, $5, $6, $7, $8, $9,
+          $10, $11, $12, $13, $14, $15, $16, $17,
+          $18, $19, $20, $21, $22, $23, $24, $25,
+          $26, $27::jsonb, $28::jsonb, $29, $30, $31,
           NOW(), NOW()
         )
-
         ON CONFLICT (recommendation_key)
         DO UPDATE SET
-          severity =
-            EXCLUDED.severity,
-
-          priority_score =
-            EXCLUDED.priority_score,
-
-          status =
-            CASE
-              WHEN calibration_recommendations.status IN (
-                'REJECTED',
-                'EXPIRED'
-              )
-              THEN 'PROPOSED'
-              ELSE calibration_recommendations.status
-            END,
-
-          title =
-            EXCLUDED.title,
-
-          explanation =
-            EXCLUDED.explanation,
-
-          recommendation_text =
-            EXCLUDED.recommendation_text,
-
-          action =
-            EXCLUDED.action,
-
-          direction =
-            EXCLUDED.direction,
-
-          raw_adjustment =
-            EXCLUDED.raw_adjustment,
-
-          proposed_adjustment =
-            EXCLUDED.proposed_adjustment,
-
-          coefficient =
-            EXCLUDED.coefficient,
-
-          sample_size =
-            EXCLUDED.sample_size,
-
-          predicted_average =
-            EXCLUDED.predicted_average,
-
-          actual_rate =
-            EXCLUDED.actual_rate,
-
-          calibration_gap =
-            EXCLUDED.calibration_gap,
-
-          absolute_gap =
-            EXCLUDED.absolute_gap,
-
-          brier_score =
-            EXCLUDED.brier_score,
-
-          log_loss =
-            EXCLUDED.log_loss,
-
-          accuracy =
-            EXCLUDED.accuracy,
-
-          evidence_level =
-            EXCLUDED.evidence_level,
-
-          evidence =
-            EXCLUDED.evidence,
-
-          recommendation =
-            EXCLUDED.recommendation,
-
-          source_engine_version =
-            EXCLUDED.source_engine_version,
-
-          source_model_version =
-            EXCLUDED.source_model_version,
-
-          source_calculated_at =
-            EXCLUDED.source_calculated_at,
-
-          generated_at =
-            NOW(),
-
-          updated_at =
-            NOW()
-
-        RETURNING
-          id,
-          (xmax = 0) AS inserted
+          severity = EXCLUDED.severity,
+          priority_score = EXCLUDED.priority_score,
+          previous_status = calibration_recommendations.status,
+          status = EXCLUDED.status,
+          title = EXCLUDED.title,
+          explanation = EXCLUDED.explanation,
+          recommendation_text = EXCLUDED.recommendation_text,
+          action = EXCLUDED.action,
+          direction = EXCLUDED.direction,
+          raw_adjustment = EXCLUDED.raw_adjustment,
+          proposed_adjustment = EXCLUDED.proposed_adjustment,
+          coefficient = EXCLUDED.coefficient,
+          sample_size = EXCLUDED.sample_size,
+          predicted_average = EXCLUDED.predicted_average,
+          actual_rate = EXCLUDED.actual_rate,
+          calibration_gap = EXCLUDED.calibration_gap,
+          absolute_gap = EXCLUDED.absolute_gap,
+          brier_score = EXCLUDED.brier_score,
+          log_loss = EXCLUDED.log_loss,
+          accuracy = EXCLUDED.accuracy,
+          evidence_level = EXCLUDED.evidence_level,
+          evidence = EXCLUDED.evidence,
+          recommendation = EXCLUDED.recommendation,
+          source_engine_version = EXCLUDED.source_engine_version,
+          source_model_version = EXCLUDED.source_model_version,
+          source_calculated_at = EXCLUDED.source_calculated_at,
+          generated_at = NOW(),
+          updated_at = NOW()
+        RETURNING id, status, proposed_adjustment, (xmax = 0) AS inserted
       `,
       [
         item.recommendationKey,
-
         item.type,
         item.scopeType,
         item.marketKey,
         item.probabilityBucket,
         item.periodKey,
-
         item.severity,
         item.priorityScore,
-        item.status,
-
+        desiredStatus,
         item.title,
         item.explanation,
         item.recommendationText,
-
         item.action,
         item.direction,
         item.rawAdjustment,
-        item.proposedAdjustment,
-        item.coefficient,
-
+        roundCalibrationDecision(safeProposedAdjustment, 2),
+        roundCalibrationDecision(safeCoefficient, 4),
         item.sampleSize,
         item.predictedAverage,
         item.actualRate,
         item.calibrationGap,
         item.absoluteGap,
-
         item.brierScore,
         item.logLoss,
         item.accuracy,
-
         item.evidenceLevel,
         JSON.stringify(item.evidence),
-        JSON.stringify(item.recommendation),
-
+        JSON.stringify(safeRecommendation),
         item.sourceEngineVersion,
         item.sourceModelVersion,
         item.sourceCalculatedAt,
       ]
     );
 
-    if (result.rows[0]?.inserted) {
+    const saved = result.rows[0];
+
+    if (saved?.inserted) {
       inserted += 1;
     } else {
       updated += 1;
+    }
+
+    /*
+     * Initialise le point de comparaison lors de la première activation.
+     */
+    if (
+      saved?.status === "ACTIVE" &&
+      existing?.status !== "ACTIVE"
+    ) {
+      await pool.query(
+        `
+          UPDATE calibration_recommendations
+          SET
+            activated_sample_size = COALESCE(
+              activated_sample_size,
+              sample_size
+            ),
+            last_evaluated_sample_size = COALESCE(
+              last_evaluated_sample_size,
+              sample_size
+            ),
+            baseline_gap = COALESCE(
+              baseline_gap,
+              absolute_gap
+            ),
+            baseline_brier_score = COALESCE(
+              baseline_brier_score,
+              brier_score
+            ),
+            activated_at = COALESCE(
+              activated_at,
+              NOW()
+            ),
+            updated_at = NOW()
+          WHERE id = $1
+        `,
+        [saved.id]
+      );
+
+      await insertCalibrationLifecycleEvent({
+        recommendationId: saved.id,
+        recommendationKey: item.recommendationKey,
+        eventType: "AUTO_ACTIVATION",
+        previousStatus: existing?.status || null,
+        newStatus: "ACTIVE",
+        previousAdjustment: existing?.proposed_adjustment ?? null,
+        newAdjustment: saved.proposed_adjustment,
+        sampleSize: item.sampleSize,
+        baselineGap: item.absoluteGap,
+        currentGap: item.absoluteGap,
+        baselineBrierScore: item.brierScore,
+        currentBrierScore: item.brierScore,
+        reason: "AUTOMATIC_ACTIVATION_THRESHOLDS_MET",
+        metadata: {
+          source,
+          evidenceLevel: item.evidenceLevel,
+        },
+      });
+
+      activated += 1;
     }
   }
 
   return {
     ok: true,
     source,
-
-    sourceRows:
-      sourceResult.rows.length,
-
-    generated:
-      recommendations.length,
-
+    sourceRows: sourceResult.rows.length,
+    generated: recommendations.length,
     inserted,
     updated,
-    preserved,
-
-    generatedAt:
-      new Date().toISOString(),
+    activated,
+    generatedAt: new Date().toISOString(),
   };
 }
+
+function calculateCalibrationEffectiveness({
+  gapImprovement,
+  brierImprovement,
+}) {
+  const score =
+    50 +
+    calibrationDecisionNumber(gapImprovement) * 8 +
+    calibrationDecisionNumber(brierImprovement) * 500;
+
+  return roundCalibrationDecision(
+    clampCalibrationDecision(score, 0, 100),
+    1
+  );
+}
+
+function decideCalibrationEvaluation({
+  currentStatus,
+  currentAdjustment,
+  currentGap,
+  baselineGap,
+  currentBrier,
+  baselineBrier,
+  newSamples,
+}) {
+  const gapImprovement =
+    calibrationDecisionNumber(baselineGap) -
+    calibrationDecisionNumber(currentGap);
+
+  const brierImprovement =
+    calibrationDecisionNumber(baselineBrier) -
+    calibrationDecisionNumber(currentBrier);
+
+  const effectivenessScore = calculateCalibrationEffectiveness({
+    gapImprovement,
+    brierImprovement,
+  });
+
+  if (newSamples < CALIBRATION_EVALUATION_MIN_NEW_SAMPLES) {
+    return {
+      shouldUpdate: false,
+      newStatus: currentStatus,
+      newAdjustment: currentAdjustment,
+      gapImprovement,
+      brierImprovement,
+      effectivenessScore,
+      reason: "NOT_ENOUGH_NEW_SAMPLES",
+    };
+  }
+
+  const gapDegradation =
+    gapImprovement <= -CALIBRATION_MAX_GAP_DEGRADATION;
+
+  const brierDegradation =
+    brierImprovement <= -CALIBRATION_MAX_BRIER_DEGRADATION;
+
+  if (gapDegradation || brierDegradation) {
+    return {
+      shouldUpdate: true,
+      newStatus: "REVERTED",
+      newAdjustment: 0,
+      gapImprovement,
+      brierImprovement,
+      effectivenessScore,
+      reason: gapDegradation
+        ? "CALIBRATION_GAP_WORSENED"
+        : "BRIER_SCORE_WORSENED",
+    };
+  }
+
+  if (Math.abs(calibrationDecisionNumber(currentGap)) < 3) {
+    return {
+      shouldUpdate: true,
+      newStatus: "COOLDOWN",
+      newAdjustment: roundCalibrationDecision(
+        calibrationDecisionNumber(currentAdjustment) * 0.5,
+        2
+      ),
+      gapImprovement,
+      brierImprovement,
+      effectivenessScore,
+      reason: "CALIBRATION_TARGET_REACHED",
+    };
+  }
+
+  if (
+    gapImprovement >= CALIBRATION_MIN_GAP_IMPROVEMENT &&
+    brierImprovement > -CALIBRATION_MAX_BRIER_DEGRADATION
+  ) {
+    return {
+      shouldUpdate: true,
+      newStatus: "ACTIVE",
+      newAdjustment: currentAdjustment,
+      gapImprovement,
+      brierImprovement,
+      effectivenessScore,
+      reason: "CALIBRATION_IMPROVING",
+    };
+  }
+
+  return {
+    shouldUpdate: true,
+    newStatus: "COOLDOWN",
+    newAdjustment: roundCalibrationDecision(
+      calibrationDecisionNumber(currentAdjustment) * 0.75,
+      2
+    ),
+    gapImprovement,
+    brierImprovement,
+    effectivenessScore,
+    reason: "CALIBRATION_EFFECT_UNCERTAIN",
+  };
+}
+
+async function evaluateActiveCalibrations({
+  source = "automatic",
+} = {}) {
+  if (calibrationAutoEvaluationRunning) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "CALIBRATION_EVALUATION_ALREADY_RUNNING",
+    };
+  }
+
+  calibrationAutoEvaluationRunning = true;
+
+  const summary = {
+    ok: true,
+    source,
+    startedAt: new Date().toISOString(),
+    found: 0,
+    evaluated: 0,
+    waiting: 0,
+    maintained: 0,
+    cooldown: 0,
+    reverted: 0,
+    failed: 0,
+    results: [],
+  };
+
+  try {
+    await ensureCalibrationDecisionTables();
+
+    const activeResult = await pool.query(`
+      SELECT *
+      FROM calibration_recommendations
+      WHERE status IN ('ACTIVE', 'COOLDOWN')
+      ORDER BY priority_score DESC, updated_at ASC
+    `);
+
+    summary.found = activeResult.rows.length;
+
+    for (const recommendation of activeResult.rows) {
+      const client = await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        const referenceSampleSize = calibrationDecisionNumber(
+          recommendation.last_evaluated_sample_size,
+          calibrationDecisionNumber(
+            recommendation.activated_sample_size,
+            recommendation.sample_size
+          )
+        );
+
+        const currentSampleSize = calibrationDecisionNumber(
+          recommendation.sample_size
+        );
+
+        const newSamples = Math.max(
+          0,
+          currentSampleSize - referenceSampleSize
+        );
+
+        const baselineGap =
+          recommendation.baseline_gap !== null &&
+          recommendation.baseline_gap !== undefined
+            ? calibrationDecisionNumber(recommendation.baseline_gap)
+            : calibrationDecisionNumber(recommendation.absolute_gap);
+
+        const baselineBrier =
+          recommendation.baseline_brier_score !== null &&
+          recommendation.baseline_brier_score !== undefined
+            ? calibrationDecisionNumber(
+                recommendation.baseline_brier_score
+              )
+            : calibrationDecisionNumber(recommendation.brier_score);
+
+        const evaluation = decideCalibrationEvaluation({
+          currentStatus: recommendation.status,
+          currentAdjustment: calibrationDecisionNumber(
+            recommendation.proposed_adjustment
+          ),
+          currentGap: calibrationDecisionNumber(
+            recommendation.absolute_gap
+          ),
+          baselineGap,
+          currentBrier: calibrationDecisionNumber(
+            recommendation.brier_score
+          ),
+          baselineBrier,
+          newSamples,
+        });
+
+        if (!evaluation.shouldUpdate) {
+          summary.waiting += 1;
+          summary.results.push({
+            id: recommendation.id,
+            recommendationKey: recommendation.recommendation_key,
+            status: recommendation.status,
+            newSamples,
+            result: evaluation.reason,
+          });
+
+          await client.query("ROLLBACK");
+          continue;
+        }
+
+        await insertCalibrationLifecycleEvent({
+          client,
+          recommendationId: recommendation.id,
+          recommendationKey: recommendation.recommendation_key,
+          eventType: "AUTO_EVALUATION",
+          previousStatus: recommendation.status,
+          newStatus: evaluation.newStatus,
+          previousAdjustment: recommendation.proposed_adjustment,
+          newAdjustment: evaluation.newAdjustment,
+          sampleSize: recommendation.sample_size,
+          newSamples,
+          baselineGap,
+          currentGap: recommendation.absolute_gap,
+          gapImprovement: evaluation.gapImprovement,
+          baselineBrierScore: baselineBrier,
+          currentBrierScore: recommendation.brier_score,
+          brierImprovement: evaluation.brierImprovement,
+          effectivenessScore: evaluation.effectivenessScore,
+          reason: evaluation.reason,
+          metadata: {
+            source,
+            evaluationVersion: "calibration-auto-evaluation-v1",
+            minimumNewSamples:
+              CALIBRATION_EVALUATION_MIN_NEW_SAMPLES,
+          },
+        });
+
+        await client.query(
+          `
+            UPDATE calibration_recommendations
+            SET
+              previous_status = status,
+              status = $2,
+              proposed_adjustment = $3,
+              coefficient = CASE
+                WHEN predicted_average > 0
+                THEN LEAST(
+                  1.25,
+                  GREATEST(
+                    0.75,
+                    (predicted_average + $3) / predicted_average
+                  )
+                )
+                ELSE 1
+              END,
+              effectiveness_score = $4,
+              gap_improvement = $5,
+              brier_improvement = $6,
+              last_evaluated_sample_size = sample_size,
+              last_evaluated_at = NOW(),
+              last_evaluation_reason = $7,
+              evaluation_count = COALESCE(evaluation_count, 0) + 1,
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [
+            recommendation.id,
+            evaluation.newStatus,
+            evaluation.newAdjustment,
+            evaluation.effectivenessScore,
+            evaluation.gapImprovement,
+            evaluation.brierImprovement,
+            evaluation.reason,
+          ]
+        );
+
+        await client.query("COMMIT");
+
+        summary.evaluated += 1;
+
+        if (evaluation.newStatus === "ACTIVE") {
+          summary.maintained += 1;
+        } else if (evaluation.newStatus === "COOLDOWN") {
+          summary.cooldown += 1;
+        } else if (evaluation.newStatus === "REVERTED") {
+          summary.reverted += 1;
+        }
+
+        summary.results.push({
+          id: recommendation.id,
+          recommendationKey: recommendation.recommendation_key,
+          previousStatus: recommendation.status,
+          newStatus: evaluation.newStatus,
+          previousAdjustment: calibrationDecisionNumber(
+            recommendation.proposed_adjustment
+          ),
+          newAdjustment: evaluation.newAdjustment,
+          newSamples,
+          gapImprovement: evaluation.gapImprovement,
+          brierImprovement: evaluation.brierImprovement,
+          effectivenessScore: evaluation.effectivenessScore,
+          reason: evaluation.reason,
+        });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => null);
+
+        summary.failed += 1;
+        summary.results.push({
+          id: recommendation.id,
+          recommendationKey: recommendation.recommendation_key,
+          error: error?.message || "Erreur inconnue",
+        });
+
+        console.error(
+          "ERREUR AUTO-ÉVALUATION CALIBRATION :",
+          recommendation.recommendation_key,
+          error
+        );
+      } finally {
+        client.release();
+      }
+    }
+
+    summary.finishedAt = new Date().toISOString();
+    return summary;
+  } catch (error) {
+    console.error(
+      "ERREUR MOTEUR AUTO-ÉVALUATION CALIBRATION :",
+      error
+    );
+
+    return {
+      ...summary,
+      ok: false,
+      finishedAt: new Date().toISOString(),
+      error: error?.message || "Erreur inconnue",
+    };
+  } finally {
+    calibrationAutoEvaluationRunning = false;
+  }
+}
+
+async function runAutomaticCalibrationCycle({
+  source = "scheduler",
+} = {}) {
+  if (automaticCalibrationCycleRunning) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "AUTOMATIC_CALIBRATION_CYCLE_ALREADY_RUNNING",
+    };
+  }
+
+  automaticCalibrationCycleRunning = true;
+  const startedAt = new Date().toISOString();
+
+  try {
+    const learning = await rebuildLearningEngine({
+      source: `${source}-learning`,
+      force: false,
+    });
+
+    const generation = await generateCalibrationRecommendations({
+      source: `${source}-generation`,
+    });
+
+    const evaluation = await evaluateActiveCalibrations({
+      source: `${source}-evaluation`,
+    });
+
+    return {
+      ok:
+        learning?.ok !== false &&
+        generation?.ok !== false &&
+        evaluation?.ok !== false,
+      source,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      learning,
+      generation,
+      evaluation,
+    };
+  } catch (error) {
+    console.error(
+      "ERREUR CYCLE AUTOMATIQUE CALIBRATION :",
+      error
+    );
+
+    return {
+      ok: false,
+      source,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      error: error?.message || "Erreur inconnue",
+    };
+  } finally {
+    automaticCalibrationCycleRunning = false;
+  }
+}
+
 app.post(
   "/internal/calibration/recommendations/generate",
   async (req, res) => {
@@ -17271,15 +17607,14 @@ app.post(
     }
 
     try {
-      const result =
-        await generateCalibrationRecommendations({
-          source: "admin-route",
-        });
+      const result = await generateCalibrationRecommendations({
+        source: "admin-route",
+      });
 
-      return res.json(result);
+      return res.status(result.ok ? 200 : 500).json(result);
     } catch (error) {
       console.error(
-        "ERREUR GÉNÉRATION RECOMMANDATIONS CALIBRATION :",
+        "ERREUR GÉNÉRATION CALIBRATIONS :",
         error
       );
 
@@ -17287,35 +17622,53 @@ app.post(
         ok: false,
         error:
           error?.message ||
-          "Impossible de générer les recommandations.",
+          "Impossible de générer les calibrations.",
       });
     }
   }
 );
+
+app.get(
+  "/internal/calibration/automatic-cycle",
+  async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
+
+    try {
+      const result = await runAutomaticCalibrationCycle({
+        source: "manual-test-route",
+      });
+
+      return res.status(result.ok ? 200 : 500).json(result);
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible d'exécuter le cycle automatique.",
+      });
+    }
+  }
+);
+
 app.get(
   "/public/calibration/recommendations",
   async (req, res) => {
     try {
       await ensureCalibrationDecisionTables();
 
-      const status = String(
-        req.query.status || ""
-      )
+      const status = String(req.query.status || "")
         .trim()
         .toUpperCase();
 
-      const marketKey = String(
-        req.query.marketKey || ""
-      )
+      const marketKey = String(req.query.marketKey || "")
         .trim()
         .toUpperCase();
 
       const limit = Math.min(
         500,
-        Math.max(
-          1,
-          Number(req.query.limit) || 100
-        )
+        Math.max(1, Number(req.query.limit) || 100)
       );
 
       const values = [];
@@ -17323,21 +17676,15 @@ app.get(
 
       if (
         status &&
-        CALIBRATION_RECOMMENDATION_STATUSES.has(
-          status
-        )
+        CALIBRATION_RECOMMENDATION_STATUSES.has(status)
       ) {
         values.push(status);
-        where.push(
-          `status = $${values.length}`
-        );
+        where.push(`status = $${values.length}`);
       }
 
       if (marketKey) {
         values.push(marketKey);
-        where.push(
-          `market_key = $${values.length}`
-        );
+        where.push(`market_key = $${values.length}`);
       }
 
       values.push(limit);
@@ -17346,13 +17693,11 @@ app.get(
         `
           SELECT *
           FROM calibration_recommendations
-
           ${
             where.length > 0
               ? `WHERE ${where.join(" AND ")}`
               : ""
           }
-
           ORDER BY
             CASE severity
               WHEN 'CRITICAL' THEN 5
@@ -17364,62 +17709,53 @@ app.get(
             priority_score DESC,
             absolute_gap DESC NULLS LAST,
             generated_at DESC
-
           LIMIT $${values.length}
         `,
         values
       );
 
-      const summaryResult =
-        await pool.query(`
-          SELECT
-            COUNT(*)::INTEGER AS total,
-
-            COUNT(*) FILTER (
-              WHERE status = 'PROPOSED'
-            )::INTEGER AS proposed,
-
-            COUNT(*) FILTER (
-              WHERE status = 'APPROVED'
-            )::INTEGER AS approved,
-
-            COUNT(*) FILTER (
-              WHERE status = 'ACTIVE'
-            )::INTEGER AS active,
-
-            COUNT(*) FILTER (
-              WHERE severity = 'CRITICAL'
-            )::INTEGER AS critical,
-
-            COUNT(*) FILTER (
-              WHERE severity = 'HIGH'
-            )::INTEGER AS high
-
-          FROM calibration_recommendations
-        `);
+      const summaryResult = await pool.query(`
+        SELECT
+          COUNT(*)::INTEGER AS total,
+          COUNT(*) FILTER (
+            WHERE status = 'OBSERVING'
+          )::INTEGER AS observing,
+          COUNT(*) FILTER (
+            WHERE status = 'ACTIVE'
+          )::INTEGER AS active,
+          COUNT(*) FILTER (
+            WHERE status = 'COOLDOWN'
+          )::INTEGER AS cooldown,
+          COUNT(*) FILTER (
+            WHERE status = 'REVERTED'
+          )::INTEGER AS reverted,
+          COUNT(*) FILTER (
+            WHERE severity = 'CRITICAL'
+          )::INTEGER AS critical,
+          COUNT(*) FILTER (
+            WHERE severity = 'HIGH'
+          )::INTEGER AS high
+        FROM calibration_recommendations
+      `);
 
       return res.json({
         ok: true,
-
-        count:
-          result.rows.length,
-
+        count: result.rows.length,
         summary:
           summaryResult.rows[0] || {
             total: 0,
-            proposed: 0,
-            approved: 0,
+            observing: 0,
             active: 0,
+            cooldown: 0,
+            reverted: 0,
             critical: 0,
             high: 0,
           },
-
-        recommendations:
-          result.rows,
+        recommendations: result.rows,
       });
     } catch (error) {
       console.error(
-        "ERREUR LISTE RECOMMANDATIONS CALIBRATION :",
+        "ERREUR LISTE CALIBRATIONS :",
         error
       );
 
@@ -17428,147 +17764,72 @@ app.get(
         recommendations: [],
         error:
           error?.message ||
-          "Impossible de charger les recommandations.",
+          "Impossible de charger les calibrations.",
       });
     }
   }
 );
-app.patch(
-  "/internal/calibration/recommendations/:recommendationId/status",
-  async (req, res) => {
-    if (!requireOptionalAdminKey(req, res)) {
-      return;
-    }
 
+app.get(
+  "/public/calibration/recommendation-events",
+  async (req, res) => {
     try {
       await ensureCalibrationDecisionTables();
 
       const recommendationId = Number(
-        req.params.recommendationId
+        req.query.recommendationId
       );
 
+      const limit = Math.min(
+        500,
+        Math.max(1, Number(req.query.limit) || 100)
+      );
+
+      const values = [];
+      const where = [];
+
       if (
-        !Number.isInteger(recommendationId) ||
-        recommendationId <= 0
+        Number.isInteger(recommendationId) &&
+        recommendationId > 0
       ) {
-        return res.status(400).json({
-          ok: false,
-          error:
-            "recommendationId invalide.",
-        });
+        values.push(recommendationId);
+        where.push(`recommendation_id = $${values.length}`);
       }
 
-      const status =
-        normalizeCalibrationRecommendationStatus(
-          req.body?.status,
-          ""
-        );
-
-      if (!status) {
-        return res.status(400).json({
-          ok: false,
-          error:
-            "Statut de recommandation invalide.",
-        });
-      }
-
-      const reviewedBy = String(
-        req.body?.reviewedBy ||
-        "administrator"
-      )
-        .trim()
-        .slice(0, 200);
-
-      const reviewNote = String(
-        req.body?.reviewNote || ""
-      )
-        .trim()
-        .slice(0, 2000);
+      values.push(limit);
 
       const result = await pool.query(
         `
-          UPDATE calibration_recommendations
-          SET
-            status = $2,
-
-            reviewed_at =
-              CASE
-                WHEN $2 IN (
-                  'APPROVED',
-                  'REJECTED',
-                  'ACTIVE',
-                  'PAUSED'
-                )
-                THEN NOW()
-                ELSE reviewed_at
-              END,
-
-            reviewed_by =
-              CASE
-                WHEN $2 IN (
-                  'APPROVED',
-                  'REJECTED',
-                  'ACTIVE',
-                  'PAUSED'
-                )
-                THEN $3
-                ELSE reviewed_by
-              END,
-
-            review_note = $4,
-
-            activated_at =
-              CASE
-                WHEN $2 = 'ACTIVE'
-                THEN COALESCE(
-                  activated_at,
-                  NOW()
-                )
-                ELSE activated_at
-              END,
-
-            updated_at = NOW()
-
-          WHERE id = $1
-
-          RETURNING *
+          SELECT *
+          FROM calibration_recommendation_events
+          ${
+            where.length > 0
+              ? `WHERE ${where.join(" AND ")}`
+              : ""
+          }
+          ORDER BY created_at DESC, id DESC
+          LIMIT $${values.length}
         `,
-        [
-          recommendationId,
-          status,
-          reviewedBy,
-          reviewNote,
-        ]
+        values
       );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({
-          ok: false,
-          error:
-            "Recommandation introuvable.",
-        });
-      }
 
       return res.json({
         ok: true,
-        recommendation:
-          result.rows[0],
+        count: result.rows.length,
+        events: result.rows,
       });
     } catch (error) {
-      console.error(
-        "ERREUR VALIDATION RECOMMANDATION CALIBRATION :",
-        error
-      );
-
       return res.status(500).json({
         ok: false,
+        events: [],
         error:
           error?.message ||
-          "Impossible de modifier la recommandation.",
+          "Impossible de charger l'historique des calibrations.",
       });
     }
   }
 );
+
 app.get("/public/calibration/summary", async (req, res) => {
   try {
 
@@ -18508,6 +18769,47 @@ app.put("/internal/admin/bilan/markets/:fixtureId/odd", async (req, res) => {
   }
 });
 
+const AUTOMATIC_CALIBRATION_INTERVAL_MS =
+  6 * 60 * 60 * 1000;
+
+const AUTOMATIC_CALIBRATION_FIRST_RUN_DELAY_MS =
+  10 * 60 * 1000;
+
+function startAutomaticCalibrationScheduler() {
+  if (!AUTOMATIC_SCHEDULERS_ENABLED) {
+    console.log(
+      "⏸️ Calibration automatique désactivée avec les schedulers."
+    );
+    return;
+  }
+
+  setTimeout(() => {
+    runAutomaticCalibrationCycle({
+      source: "automatic-first-run",
+    }).catch((error) => {
+      console.error(
+        "ERREUR PREMIER CYCLE AUTOMATIQUE CALIBRATION :",
+        error
+      );
+    });
+  }, AUTOMATIC_CALIBRATION_FIRST_RUN_DELAY_MS);
+
+  setInterval(() => {
+    runAutomaticCalibrationCycle({
+      source: "automatic-scheduler",
+    }).catch((error) => {
+      console.error(
+        "ERREUR SCHEDULER AUTOMATIQUE CALIBRATION :",
+        error
+      );
+    });
+  }, AUTOMATIC_CALIBRATION_INTERVAL_MS);
+
+  console.log(
+    "✅ Calibration Center automatique : toutes les 6 heures"
+  );
+}
+
 function startAutomaticSchedulers() {
   if (!AUTOMATIC_SCHEDULERS_ENABLED) {
     console.log(
@@ -18670,11 +18972,21 @@ app.listen(
         );
       });
 
+
+    ensureCalibrationDecisionTables()
+      .catch((error) => {
+        console.error(
+          "ERREUR TABLES CALIBRATION CENTER :",
+          error
+        );
+      });
+
     /*
      * Les initialisations SQL restent actives.
      * Seules les tâches consommatrices d'API
      * dépendent de l'interrupteur.
      */
+    startAutomaticCalibrationScheduler();
     startAutomaticSchedulers();
   }
 );
