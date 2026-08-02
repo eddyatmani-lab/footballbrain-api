@@ -21546,6 +21546,436 @@ function startAutomaticSchedulers() {
   );
 }
 
+
+/*
+ * ============================================================
+ * STATISTIQUES PUBLIQUES — VUE PARIEUR
+ * ============================================================
+ * Cette route expose uniquement des résultats compréhensibles
+ * par le public. Elle ne renvoie aucune donnée Learning,
+ * Calibration ou coefficient interne de l'IA.
+ */
+app.get("/public/statistics/dashboard", async (req, res) => {
+  try {
+    await ensureBilanV3Columns();
+    await ensureDailyTicketTables();
+    await refreshManualOddsProfits();
+
+    const [
+      globalResult,
+      competitionsResult,
+      marketsResult,
+      oddsBandsResult,
+      valueScannerResult,
+      ticketStatsResult,
+    ] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+          )::INTEGER AS completed_markets,
+
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) IS NOT NULL
+          )::INTEGER AS evaluated_markets,
+
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = TRUE
+          )::INTEGER AS wins,
+
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = FALSE
+          )::INTEGER AS losses,
+
+          COUNT(*) FILTER (
+            WHERE manual_market_odd IS NOT NULL
+              AND manual_profit_units IS NOT NULL
+          )::INTEGER AS settled_real_bets,
+
+          COALESCE(
+            SUM(manual_stake_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS total_stake,
+
+          COALESCE(
+            SUM(manual_profit_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS total_profit,
+
+          ROUND(
+            (
+              SUM(manual_market_odd * manual_stake_units) FILTER (
+                WHERE manual_profit_units IS NOT NULL
+                  AND manual_market_odd > 1
+                  AND manual_stake_units > 0
+              )
+              /
+              NULLIF(
+                SUM(manual_stake_units) FILTER (
+                  WHERE manual_profit_units IS NOT NULL
+                    AND manual_market_odd > 1
+                    AND manual_stake_units > 0
+                ),
+                0
+              )
+            )::NUMERIC,
+            3
+          ) AS average_odd
+        FROM predictions
+      `),
+
+      pool.query(`
+        SELECT
+          COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue') AS competition,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) IS NOT NULL
+          )::INTEGER AS evaluated,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = TRUE
+          )::INTEGER AS wins,
+          COUNT(*) FILTER (
+            WHERE manual_profit_units IS NOT NULL
+          )::INTEGER AS settled_bets,
+          COALESCE(
+            SUM(manual_stake_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS stake,
+          COALESCE(
+            SUM(manual_profit_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS profit,
+          ROUND(
+            AVG(manual_market_odd) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+                AND manual_market_odd > 1
+            )::NUMERIC,
+            2
+          ) AS average_odd
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+        GROUP BY COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue')
+        HAVING COUNT(*) FILTER (
+          WHERE COALESCE(official_market_won, won) IS NOT NULL
+        ) > 0
+        ORDER BY evaluated DESC, competition ASC
+        LIMIT 100
+      `),
+
+      pool.query(`
+        SELECT
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), ''),
+            'UNKNOWN'
+          ) AS market_key,
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché inconnu'
+          ) AS market_label,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) IS NOT NULL
+          )::INTEGER AS evaluated,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = TRUE
+          )::INTEGER AS wins,
+          COUNT(*) FILTER (
+            WHERE manual_profit_units IS NOT NULL
+          )::INTEGER AS settled_bets,
+          COALESCE(
+            SUM(manual_stake_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS stake,
+          COALESCE(
+            SUM(manual_profit_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS profit,
+          ROUND(
+            AVG(manual_market_odd) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+                AND manual_market_odd > 1
+            )::NUMERIC,
+            2
+          ) AS average_odd
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+        GROUP BY
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), ''),
+            'UNKNOWN'
+          ),
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché inconnu'
+          )
+        HAVING COUNT(*) FILTER (
+          WHERE COALESCE(official_market_won, won) IS NOT NULL
+        ) > 0
+        ORDER BY evaluated DESC, market_label ASC
+      `),
+
+      pool.query(`
+        SELECT
+          CASE
+            WHEN manual_market_odd < 1.50 THEN '1.01 - 1.49'
+            WHEN manual_market_odd < 2.00 THEN '1.50 - 1.99'
+            WHEN manual_market_odd < 3.00 THEN '2.00 - 2.99'
+            ELSE '3.00 et +'
+          END AS odd_band,
+          CASE
+            WHEN manual_market_odd < 1.50 THEN 1
+            WHEN manual_market_odd < 2.00 THEN 2
+            WHEN manual_market_odd < 3.00 THEN 3
+            ELSE 4
+          END AS sort_order,
+          COUNT(*)::INTEGER AS bets,
+          COUNT(*) FILTER (
+            WHERE official_market_won = TRUE
+          )::INTEGER AS wins,
+          COALESCE(SUM(manual_stake_units), 0)::NUMERIC AS stake,
+          COALESCE(SUM(manual_profit_units), 0)::NUMERIC AS profit,
+          ROUND(AVG(manual_market_odd)::NUMERIC, 2) AS average_odd
+        FROM predictions
+        WHERE manual_market_odd IS NOT NULL
+          AND manual_profit_units IS NOT NULL
+        GROUP BY odd_band, sort_order
+        ORDER BY sort_order ASC
+      `),
+
+      pool.query(`
+        SELECT
+          fixture_id,
+          fixture_date,
+          league_name,
+          home_team_name,
+          away_team_name,
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(manual_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), '')
+          ) AS market_key,
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché principal'
+          ) AS market_label,
+          COALESCE(
+            official_tracked_probability,
+            studio_probability
+          )::NUMERIC AS probability,
+          COALESCE(
+            official_tracked_decision_score,
+            studio_decision_score
+          )::NUMERIC AS decision_score,
+          manual_market_odd::NUMERIC AS bookmaker_odd,
+          (
+            (
+              COALESCE(
+                official_tracked_probability,
+                studio_probability
+              ) / 100.0
+            ) * manual_market_odd - 1
+          ) * 100.0 AS value_percent
+        FROM predictions
+        WHERE result_status = 'PENDING'
+          AND fixture_date > NOW()
+          AND manual_market_odd > 1
+          AND COALESCE(
+            official_tracked_probability,
+            studio_probability
+          ) > 0
+          AND COALESCE(
+            NULLIF(BTRIM(manual_market_key), ''),
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), '')
+          ) IS NOT NULL
+        ORDER BY value_percent DESC, decision_score DESC NULLS LAST
+        LIMIT 30
+      `),
+
+      pool.query(`
+        SELECT
+          ticket_type,
+          COUNT(*)::INTEGER AS tickets,
+          COUNT(*) FILTER (WHERE result_status = 'WIN')::INTEGER AS wins,
+          COUNT(*) FILTER (WHERE result_status = 'LOSS')::INTEGER AS losses,
+          COALESCE(SUM(stake_units), 0)::NUMERIC AS stake,
+          COALESCE(SUM(profit_units), 0)::NUMERIC AS profit
+        FROM (
+          SELECT
+            'SAFE'::TEXT AS ticket_type,
+            safe_result_status AS result_status,
+            CASE WHEN safe_result_status IN ('WIN', 'LOSS') THEN 1 ELSE 0 END::NUMERIC AS stake_units,
+            COALESCE(safe_profit_units, 0)::NUMERIC AS profit_units
+          FROM daily_ticket_snapshots
+
+          UNION ALL
+
+          SELECT
+            'FUN'::TEXT,
+            fun_result_status,
+            CASE WHEN fun_result_status IN ('WIN', 'LOSS') THEN 1 ELSE 0 END::NUMERIC,
+            COALESCE(fun_profit_units, 0)::NUMERIC
+          FROM daily_ticket_snapshots
+
+          UNION ALL
+
+          SELECT
+            'BEST_VALUE'::TEXT,
+            value_result_status,
+            CASE WHEN value_result_status IN ('WIN', 'LOSS') THEN 1 ELSE 0 END::NUMERIC,
+            COALESCE(value_profit_units, 0)::NUMERIC
+          FROM daily_ticket_snapshots
+        ) ticket_rows
+        WHERE result_status IN ('WIN', 'LOSS')
+        GROUP BY ticket_type
+        ORDER BY ticket_type ASC
+      `),
+    ]);
+
+    const globalRow = globalResult.rows[0] || {};
+    const evaluatedMarkets = Number(globalRow.evaluated_markets || 0);
+    const wins = Number(globalRow.wins || 0);
+    const totalStake = Number(globalRow.total_stake || 0);
+    const totalProfit = Number(globalRow.total_profit || 0);
+
+    const mapPerformanceRow = (row) => {
+      const evaluated = Number(row.evaluated || 0);
+      const rowWins = Number(row.wins || 0);
+      const stake = Number(row.stake || 0);
+      const profit = Number(row.profit || 0);
+
+      return {
+        ...row,
+        evaluated,
+        wins: rowWins,
+        accuracy: evaluated > 0
+          ? Number(((rowWins / evaluated) * 100).toFixed(1))
+          : null,
+        settledBets: Number(row.settled_bets || row.bets || 0),
+        stake: Number(stake.toFixed(2)),
+        profit: Number(profit.toFixed(2)),
+        roi: stake > 0
+          ? Number(((profit / stake) * 100).toFixed(1))
+          : null,
+        averageOdd: row.average_odd == null
+          ? null
+          : Number(row.average_odd),
+      };
+    };
+
+    const competitions = competitionsResult.rows.map((row) => ({
+      ...mapPerformanceRow(row),
+      name: row.competition,
+    }));
+
+    const markets = marketsResult.rows.map((row) => ({
+      ...mapPerformanceRow(row),
+      key: row.market_key,
+      label: row.market_label,
+    }));
+
+    const oddsBands = oddsBandsResult.rows.map((row) => ({
+      ...mapPerformanceRow(row),
+      band: row.odd_band,
+    }));
+
+    const valueScanner = valueScannerResult.rows.map((row) => ({
+      fixtureId: Number(row.fixture_id),
+      kickoff: row.fixture_date,
+      competition: row.league_name || null,
+      homeTeam: row.home_team_name,
+      awayTeam: row.away_team_name,
+      marketKey: row.market_key,
+      marketLabel: row.market_label,
+      probability: Number(row.probability || 0),
+      decisionScore: Number(row.decision_score || 0),
+      bookmakerOdd: Number(row.bookmaker_odd || 0),
+      valuePercent: Number(Number(row.value_percent || 0).toFixed(1)),
+    }));
+
+    const ticketStats = ticketStatsResult.rows.map((row) => {
+      const tickets = Number(row.tickets || 0);
+      const rowWins = Number(row.wins || 0);
+      const stake = Number(row.stake || 0);
+      const profit = Number(row.profit || 0);
+
+      return {
+        type: row.ticket_type,
+        tickets,
+        wins: rowWins,
+        losses: Number(row.losses || 0),
+        accuracy: tickets > 0
+          ? Number(((rowWins / tickets) * 100).toFixed(1))
+          : null,
+        stake: Number(stake.toFixed(2)),
+        profit: Number(profit.toFixed(2)),
+        roi: stake > 0
+          ? Number(((profit / stake) * 100).toFixed(1))
+          : null,
+      };
+    });
+
+    return res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      global: {
+        completedMarkets: Number(globalRow.completed_markets || 0),
+        evaluatedMarkets,
+        wins,
+        losses: Number(globalRow.losses || 0),
+        accuracy: evaluatedMarkets > 0
+          ? Number(((wins / evaluatedMarkets) * 100).toFixed(1))
+          : null,
+        settledRealBets: Number(globalRow.settled_real_bets || 0),
+        totalStake: Number(totalStake.toFixed(2)),
+        totalProfit: Number(totalProfit.toFixed(2)),
+        roi: totalStake > 0
+          ? Number(((totalProfit / totalStake) * 100).toFixed(1))
+          : null,
+        averageOdd: globalRow.average_odd == null
+          ? null
+          : Number(globalRow.average_odd),
+      },
+      competitions,
+      markets,
+      oddsBands,
+      valueScanner,
+      ticketStats,
+    });
+  } catch (error) {
+    console.error("ERREUR /public/statistics/dashboard :", error);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Impossible de charger les statistiques publiques.",
+    });
+  }
+});
+
 app.listen(
   PORT,
   "0.0.0.0",
