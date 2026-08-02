@@ -20225,6 +20225,1181 @@ app.post(
   }
 );
 
+
+/* ==========================================================================\n * DAILY TICKET V2 — SAFE / FUN / MEILLEURE VALUE + ÉDITIONS 12H / 18H / 21H\n * ========================================================================== */
+const DAILY_TICKET_SLOTS = Object.freeze({
+  "12H": 12,
+  "18H": 18,
+  "21H": 21,
+});
+
+const DAILY_TICKET_TARGET_FUN_ODDS = 1.9;
+const DAILY_TICKET_MAX_FUN_SELECTIONS = 3;
+const DAILY_TICKET_MIN_FUN_DECISION_SCORE = 50;
+const DAILY_TICKET_SCHEDULER_INTERVAL_MS = 60 * 1000;
+const DAILY_TICKET_SLOT_GRACE_MINUTES = 20;
+
+let dailyTicketSchedulerRunning = false;
+let dailyTicketSettlementRunning = false;
+
+async function ensureDailyTicketTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_ticket_snapshots (
+      id BIGSERIAL PRIMARY KEY,
+      ticket_date DATE NOT NULL,
+      slot TEXT NOT NULL,
+      generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+      safe_ticket JSONB NOT NULL DEFAULT '{}'::jsonb,
+      fun_ticket JSONB NOT NULL DEFAULT '{}'::jsonb,
+      best_value_ticket JSONB NOT NULL DEFAULT '{}'::jsonb,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+      safe_result_status TEXT NOT NULL DEFAULT 'PENDING',
+      fun_result_status TEXT NOT NULL DEFAULT 'PENDING',
+      value_result_status TEXT NOT NULL DEFAULT 'PENDING',
+
+      safe_profit_units NUMERIC,
+      fun_profit_units NUMERIC,
+      value_profit_units NUMERIC,
+
+      total_stake_units NUMERIC NOT NULL DEFAULT 0,
+      total_profit_units NUMERIC,
+      roi_percent NUMERIC,
+
+      settled_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+      CONSTRAINT daily_ticket_snapshots_slot_check
+        CHECK (slot IN ('12H', '18H', '21H', 'ON_DEMAND')),
+
+      CONSTRAINT daily_ticket_snapshots_unique_date_slot
+        UNIQUE (ticket_date, slot)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_daily_ticket_snapshots_date
+    ON daily_ticket_snapshots(ticket_date DESC, generated_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_daily_ticket_snapshots_unsettled
+    ON daily_ticket_snapshots(settled_at)
+    WHERE settled_at IS NULL;
+  `);
+}
+
+function parseDailyTicketJson(value, fallback = {}) {
+  if (value && typeof value === "object") return value;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+function normalizeDailyTicketDate(value) {
+  const text = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+}
+
+function getParisDateTimeParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("fr-FR", {
+    timeZone: "Europe/Paris",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  );
+
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+  };
+}
+
+function normalizeDailyTicketSlot(value) {
+  const slot = String(value || "").trim().toUpperCase();
+  if (Object.prototype.hasOwnProperty.call(DAILY_TICKET_SLOTS, slot)) {
+    return slot;
+  }
+  if (slot === "ON_DEMAND") return slot;
+  return null;
+}
+
+function dailyTicketNumber(value, fallback = null) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function roundDailyTicket(value, decimals = 2) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  const factor = 10 ** decimals;
+  return Math.round(number * factor) / factor;
+}
+
+function getDailyTicketMarketDecisionScore(market = {}, prediction = {}) {
+  return dailyTicketNumber(
+    market?.decision?.score ??
+      market?.marketDecision?.score ??
+      market?.decisionScore ??
+      market?.score ??
+      prediction.studio_decision_score,
+    0
+  );
+}
+
+function getDailyTicketMarketProbability(market = {}, prediction = {}) {
+  return dailyTicketNumber(
+    market?.fairOdds?.calibratedProbability ??
+      market?.calibratedProbability ??
+      market?.probability ??
+      prediction.studio_probability,
+    0
+  );
+}
+
+function getDailyTicketMarketOdd(market = {}, prediction = {}) {
+  const marketKey = normalizeManualOddsMarketKey(
+    market?.key || market?.marketKey || ""
+  );
+  const manualKey = normalizeManualOddsMarketKey(
+    prediction.manual_market_key || ""
+  );
+  const manualOdd = dailyTicketNumber(prediction.manual_market_odd, null);
+
+  if (
+    marketKey &&
+    manualKey &&
+    marketKey === manualKey &&
+    manualOdd !== null &&
+    manualOdd > 1
+  ) {
+    return {
+      odd: manualOdd,
+      source: "MANUAL_ADMIN",
+      bookmaker:
+        prediction.manual_odd_source ||
+        prediction.manual_odd_entered_by ||
+        "Admin Football AI Pro",
+      isManual: true,
+    };
+  }
+
+  const odd = dailyTicketNumber(
+    market?.fairOdds?.bookmakerOdds ??
+      market?.bookmakerOdds ??
+      market?.odds?.marketOdd ??
+      market?.marketOdd,
+    null
+  );
+
+  return {
+    odd: odd !== null && odd > 1 ? odd : null,
+    source:
+      market?.fairOdds?.bookmakerSource ||
+      market?.bookmakerSource ||
+      market?.oddsSource ||
+      null,
+    bookmaker:
+      market?.fairOdds?.bookmaker ||
+      market?.bookmaker ||
+      null,
+    isManual: false,
+  };
+}
+
+function isSupportedDailyTicketMarketKey(value) {
+  return [
+    "HOME",
+    "DRAW",
+    "AWAY",
+    "OVER25",
+    "UNDER25",
+    "BTTS_YES",
+    "BTTS_NO",
+  ].includes(normalizeManualOddsMarketKey(value));
+}
+
+function extractDailyTicketMarkets(prediction = {}) {
+  const snapshot = parseDailyTicketJson(prediction.studio_snapshot, {});
+  const snapshotMarkets = Array.isArray(snapshot?.markets)
+    ? snapshot.markets
+    : Array.isArray(snapshot?.studio?.markets)
+      ? snapshot.studio.markets
+      : [];
+
+  const fallbackMarket =
+    snapshot?.primaryMarket ||
+    snapshot?.bestDecision ||
+    (prediction.studio_market_key
+      ? {
+          key: prediction.studio_market_key,
+          label: prediction.studio_market_label,
+          probability: prediction.studio_probability,
+          decisionScore: prediction.studio_decision_score,
+        }
+      : null);
+
+  const markets = snapshotMarkets.length > 0
+    ? snapshotMarkets
+    : fallbackMarket
+      ? [fallbackMarket]
+      : [];
+
+  const unique = new Map();
+
+  for (const market of markets) {
+    const normalizedKey = normalizeManualOddsMarketKey(
+      market?.key || market?.marketKey || ""
+    );
+
+    if (!normalizedKey || !isSupportedDailyTicketMarketKey(normalizedKey)) {
+      continue;
+    }
+
+    const decisionScore = getDailyTicketMarketDecisionScore(market, prediction);
+    const probability = getDailyTicketMarketProbability(market, prediction);
+    const oddData = getDailyTicketMarketOdd(market, prediction);
+    const fairOdds = dailyTicketNumber(
+      market?.fairOdds?.fairOdds ??
+        market?.fairOddsValue ??
+        market?.rawFairOdds,
+      probability > 0 ? 100 / probability : null
+    );
+
+    const valuePercent =
+      oddData.odd !== null && probability > 0
+        ? roundDailyTicket((probability / 100) * oddData.odd * 100 - 100, 2)
+        : null;
+
+    const candidate = {
+      id: `${prediction.fixture_id}-${normalizedKey}`,
+      fixtureId: Number(prediction.fixture_id),
+      matchId: Number(prediction.fixture_id),
+      match: {
+        home: prediction.home_team_name || "Domicile",
+        away: prediction.away_team_name || "Extérieur",
+        competition: prediction.league_name || "Compétition inconnue",
+        kickoff: prediction.fixture_date || null,
+        date: prediction.fixture_date
+          ? String(prediction.fixture_date).slice(0, 10)
+          : null,
+      },
+      market: {
+        key: normalizedKey,
+        label:
+          market?.label ||
+          market?.marketLabel ||
+          prediction.studio_market_label ||
+          normalizedKey,
+        family: market?.family || null,
+      },
+      decisionScore: roundDailyTicket(decisionScore, 1) || 0,
+      probability: roundDailyTicket(probability, 1) || 0,
+      confidence: roundDailyTicket(
+        market?.decision?.confidence ?? prediction.confidence,
+        1
+      ),
+      risk: roundDailyTicket(
+        market?.decision?.risk ?? prediction.risk,
+        1
+      ),
+      consensus: roundDailyTicket(
+        market?.decision?.marketConsensus?.score ??
+          market?.consensusScore ??
+          prediction.studio_decision_score,
+        1
+      ),
+      bookmakerOdds: oddData.odd,
+      bookmaker: oddData.bookmaker,
+      oddsSource: oddData.source,
+      manualOdds: oddData.isManual,
+      fairOdds: roundDailyTicket(fairOdds, 2),
+      valueEdge: valuePercent,
+      expectedValuePercent: valuePercent,
+      resultStatus: "PENDING",
+    };
+
+    const previous = unique.get(normalizedKey);
+    if (!previous || candidate.decisionScore > previous.decisionScore) {
+      unique.set(normalizedKey, candidate);
+    }
+  }
+
+  return Array.from(unique.values());
+}
+
+function selectDailySafeTicket(candidates = []) {
+  const selection = [...candidates].sort(
+    (a, b) =>
+      b.decisionScore - a.decisionScore ||
+      b.probability - a.probability
+  )[0] || null;
+
+  return {
+    available: Boolean(selection),
+    title: "SAFE",
+    selection,
+    selections: selection ? [selection] : [],
+    selectionCount: selection ? 1 : 0,
+    totalOdds: selection?.bookmakerOdds ?? null,
+    combinedOdds: selection?.bookmakerOdds ?? null,
+    resultStatus: "PENDING",
+    profitUnits: null,
+    message: selection
+      ? "Marché possédant le meilleur Decision Score global au moment de cette édition."
+      : "Aucun marché Brain Studio exploitable pour cette édition.",
+  };
+}
+
+function compareFunCombination(first, second) {
+  if (!second) return -1;
+
+  const firstReached = first.combinedOdds >= DAILY_TICKET_TARGET_FUN_ODDS;
+  const secondReached = second.combinedOdds >= DAILY_TICKET_TARGET_FUN_ODDS;
+
+  if (firstReached !== secondReached) return firstReached ? -1 : 1;
+
+  if (firstReached && secondReached) {
+    const firstDistance = first.combinedOdds - DAILY_TICKET_TARGET_FUN_ODDS;
+    const secondDistance = second.combinedOdds - DAILY_TICKET_TARGET_FUN_ODDS;
+    if (firstDistance !== secondDistance) return firstDistance - secondDistance;
+  } else if (first.combinedOdds !== second.combinedOdds) {
+    return second.combinedOdds - first.combinedOdds;
+  }
+
+  if (first.averageDecisionScore !== second.averageDecisionScore) {
+    return second.averageDecisionScore - first.averageDecisionScore;
+  }
+
+  return first.selections.length - second.selections.length;
+}
+
+function selectDailyFunTicket(candidates = [], safeSelection = null) {
+  const safeFixtureId = safeSelection?.fixtureId || null;
+  const oddsCandidates = candidates
+    .filter((candidate) => candidate.bookmakerOdds > 1)
+    .filter((candidate) => candidate.decisionScore >= DAILY_TICKET_MIN_FUN_DECISION_SCORE)
+    .filter((candidate) => candidate.fixtureId !== safeFixtureId)
+    .sort(
+      (a, b) =>
+        b.decisionScore - a.decisionScore ||
+        b.probability - a.probability
+    )
+    .slice(0, 30);
+
+  const combinations = [];
+
+  function pushCombination(selections) {
+    const fixtureIds = new Set(selections.map((selection) => selection.fixtureId));
+    if (fixtureIds.size !== selections.length) return;
+
+    const combinedOdds = roundDailyTicket(
+      selections.reduce(
+        (product, selection) => product * Number(selection.bookmakerOdds),
+        1
+      ),
+      2
+    );
+
+    const combinedProbability = roundDailyTicket(
+      selections.reduce(
+        (product, selection) => product * (Number(selection.probability) / 100),
+        1
+      ) * 100,
+      1
+    );
+
+    const averageDecisionScore = roundDailyTicket(
+      selections.reduce((sum, selection) => sum + selection.decisionScore, 0) /
+        selections.length,
+      1
+    );
+
+    combinations.push({
+      selections,
+      combinedOdds,
+      combinedProbability,
+      averageDecisionScore,
+    });
+  }
+
+  for (let i = 0; i < oddsCandidates.length; i += 1) {
+    pushCombination([oddsCandidates[i]]);
+
+    for (let j = i + 1; j < oddsCandidates.length; j += 1) {
+      pushCombination([oddsCandidates[i], oddsCandidates[j]]);
+
+      for (let k = j + 1; k < oddsCandidates.length; k += 1) {
+        pushCombination([
+          oddsCandidates[i],
+          oddsCandidates[j],
+          oddsCandidates[k],
+        ]);
+      }
+    }
+  }
+
+  combinations.sort(compareFunCombination);
+  const best = combinations[0] || null;
+
+  return {
+    available: Boolean(best),
+    title: "FUN",
+    selections: best?.selections || [],
+    selectionCount: best?.selections?.length || 0,
+    combinedOdds: best?.combinedOdds ?? null,
+    totalOdds: best?.combinedOdds ?? null,
+    combinedProbability: best?.combinedProbability ?? null,
+    averageDecisionScore: best?.averageDecisionScore ?? null,
+    targetOdds: DAILY_TICKET_TARGET_FUN_ODDS,
+    targetReached:
+      Boolean(best) && best.combinedOdds >= DAILY_TICKET_TARGET_FUN_ODDS,
+    resultStatus: "PENDING",
+    profitUnits: null,
+    message: !best
+      ? "Aucune combinaison avec cote disponible n'a pu être construite."
+      : best.combinedOdds >= DAILY_TICKET_TARGET_FUN_ODDS
+        ? `Combiné optimisé pour atteindre au moins ${DAILY_TICKET_TARGET_FUN_ODDS.toFixed(2)}.`
+        : `Meilleure combinaison disponible, mais la cible ${DAILY_TICKET_TARGET_FUN_ODDS.toFixed(2)} n'est pas atteinte.`,
+  };
+}
+
+function selectDailyBestValueTicket(candidates = []) {
+  const selection = candidates
+    .filter((candidate) => candidate.manualOdds === true)
+    .filter((candidate) => candidate.bookmakerOdds > 1)
+    .filter((candidate) => candidate.valueEdge !== null)
+    .filter((candidate) => candidate.valueEdge > 0)
+    .sort(
+      (a, b) =>
+        b.valueEdge - a.valueEdge ||
+        b.decisionScore - a.decisionScore
+    )[0] || null;
+
+  return {
+    available: Boolean(selection),
+    title: "MEILLEURE VALUE",
+    selection,
+    selections: selection ? [selection] : [],
+    selectionCount: selection ? 1 : 0,
+    totalOdds: selection?.bookmakerOdds ?? null,
+    valuePercent: selection?.valueEdge ?? null,
+    resultStatus: "PENDING",
+    profitUnits: null,
+    message: selection
+      ? "Meilleure Value positive calculée avec une cote officielle saisie dans l'Admin."
+      : "Aucune Value positive avec cote Admin n'est disponible pour cette édition.",
+  };
+}
+
+async function loadDailyTicketCandidates(ticketDate, generatedAt = new Date()) {
+  const result = await pool.query(
+    `
+      SELECT
+        fixture_id,
+        fixture_date,
+        league_name,
+        home_team_name,
+        away_team_name,
+        confidence,
+        risk,
+
+        studio_market_key,
+        studio_market_label,
+        studio_probability,
+        studio_decision_score,
+        studio_snapshot,
+
+        manual_market_odd,
+        manual_market_key,
+        manual_odd_source,
+        manual_odd_entered_by
+
+      FROM predictions
+      WHERE (fixture_date AT TIME ZONE 'Europe/Paris')::date = $1::date
+        AND fixture_date > $2::timestamptz
+        AND NULLIF(BTRIM(COALESCE(studio_market_key, '')), '') IS NOT NULL
+      ORDER BY fixture_date ASC, fixture_id ASC
+    `,
+    [ticketDate, generatedAt.toISOString()]
+  );
+
+  const candidates = [];
+  const matches = [];
+
+  for (const prediction of result.rows) {
+    const markets = extractDailyTicketMarkets(prediction);
+    candidates.push(...markets);
+    matches.push({
+      fixtureId: Number(prediction.fixture_id),
+      home: prediction.home_team_name,
+      away: prediction.away_team_name,
+      kickoff: prediction.fixture_date,
+      marketCount: markets.length,
+      hasManualOdd: Number(prediction.manual_market_odd) > 1,
+    });
+  }
+
+  return {
+    candidates,
+    matches,
+    sourceRows: result.rows.length,
+  };
+}
+
+async function generateDailyTicketSnapshot({
+  ticketDate,
+  slot,
+  force = false,
+  source = "scheduler",
+  generatedAt = new Date(),
+} = {}) {
+  await ensureDailyTicketTables();
+  await ensureBilanV3Columns();
+
+  const normalizedDate = normalizeDailyTicketDate(ticketDate);
+  const normalizedSlot = normalizeDailyTicketSlot(slot);
+
+  if (!normalizedDate) {
+    throw new Error("Date de ticket invalide (format attendu : YYYY-MM-DD). ");
+  }
+
+  if (!normalizedSlot) {
+    throw new Error("Créneau de ticket invalide.");
+  }
+
+  if (!force) {
+    const existing = await pool.query(
+      `
+        SELECT *
+        FROM daily_ticket_snapshots
+        WHERE ticket_date = $1::date
+          AND slot = $2
+        LIMIT 1
+      `,
+      [normalizedDate, normalizedSlot]
+    );
+
+    if (existing.rows[0]) {
+      return {
+        created: false,
+        snapshot: serializeDailyTicketSnapshot(existing.rows[0]),
+      };
+    }
+  }
+
+  const loaded = await loadDailyTicketCandidates(normalizedDate, generatedAt);
+  const safeTicket = selectDailySafeTicket(loaded.candidates);
+  const funTicket = selectDailyFunTicket(
+    loaded.candidates,
+    safeTicket.selection
+  );
+  const bestValueTicket = selectDailyBestValueTicket(loaded.candidates);
+
+  const metadata = {
+    source,
+    generatedAt: generatedAt.toISOString(),
+    engineVersion: "DailyTicketBackend 2.0.0",
+    sourceMatches: loaded.sourceRows,
+    analyzedMatches: loaded.matches.length,
+    analyzedMarkets: loaded.candidates.length,
+    marketsWithOdds: loaded.candidates.filter(
+      (candidate) => candidate.bookmakerOdds > 1
+    ).length,
+    marketsWithManualOdds: loaded.candidates.filter(
+      (candidate) => candidate.manualOdds === true
+    ).length,
+    targetFunOdds: DAILY_TICKET_TARGET_FUN_ODDS,
+    matches: loaded.matches,
+  };
+
+  const query = force
+    ? `
+        INSERT INTO daily_ticket_snapshots (
+          ticket_date, slot, generated_at,
+          safe_ticket, fun_ticket, best_value_ticket, metadata,
+          safe_result_status, fun_result_status, value_result_status,
+          safe_profit_units, fun_profit_units, value_profit_units,
+          total_stake_units, total_profit_units, roi_percent,
+          settled_at, updated_at
+        )
+        VALUES (
+          $1::date, $2, $3::timestamptz,
+          $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb,
+          'PENDING', 'PENDING', 'PENDING',
+          NULL, NULL, NULL,
+          0, NULL, NULL,
+          NULL, NOW()
+        )
+        ON CONFLICT (ticket_date, slot)
+        DO UPDATE SET
+          generated_at = EXCLUDED.generated_at,
+          safe_ticket = EXCLUDED.safe_ticket,
+          fun_ticket = EXCLUDED.fun_ticket,
+          best_value_ticket = EXCLUDED.best_value_ticket,
+          metadata = EXCLUDED.metadata,
+          safe_result_status = 'PENDING',
+          fun_result_status = 'PENDING',
+          value_result_status = 'PENDING',
+          safe_profit_units = NULL,
+          fun_profit_units = NULL,
+          value_profit_units = NULL,
+          total_stake_units = 0,
+          total_profit_units = NULL,
+          roi_percent = NULL,
+          settled_at = NULL,
+          updated_at = NOW()
+        RETURNING *
+      `
+    : `
+        INSERT INTO daily_ticket_snapshots (
+          ticket_date, slot, generated_at,
+          safe_ticket, fun_ticket, best_value_ticket, metadata
+        )
+        VALUES (
+          $1::date, $2, $3::timestamptz,
+          $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb
+        )
+        ON CONFLICT (ticket_date, slot) DO NOTHING
+        RETURNING *
+      `;
+
+  const inserted = await pool.query(query, [
+    normalizedDate,
+    normalizedSlot,
+    generatedAt.toISOString(),
+    JSON.stringify(safeTicket),
+    JSON.stringify(funTicket),
+    JSON.stringify(bestValueTicket),
+    JSON.stringify(metadata),
+  ]);
+
+  if (!inserted.rows[0]) {
+    const existing = await pool.query(
+      `
+        SELECT *
+        FROM daily_ticket_snapshots
+        WHERE ticket_date = $1::date AND slot = $2
+        LIMIT 1
+      `,
+      [normalizedDate, normalizedSlot]
+    );
+
+    return {
+      created: false,
+      snapshot: serializeDailyTicketSnapshot(existing.rows[0]),
+    };
+  }
+
+  return {
+    created: true,
+    snapshot: serializeDailyTicketSnapshot(inserted.rows[0]),
+  };
+}
+
+function evaluateDailyTicketSelection(selection, resultByFixtureId) {
+  if (!selection?.fixtureId) return "UNAVAILABLE";
+  const result = resultByFixtureId.get(Number(selection.fixtureId));
+  if (!result) return "PENDING";
+
+  const won = evaluateManualOddsMarketResult({
+    marketKey: selection?.market?.key,
+    homeGoals: result.home_goals,
+    awayGoals: result.away_goals,
+  });
+
+  if (typeof won !== "boolean") return "UNAVAILABLE";
+  return won ? "WIN" : "LOSS";
+}
+
+function settleSingleDailyTicket(ticket, type, resultByFixtureId) {
+  const parsed = parseDailyTicketJson(ticket, {});
+  if (!parsed.available) {
+    return {
+      ticket: { ...parsed, resultStatus: "UNAVAILABLE", profitUnits: null },
+      status: "UNAVAILABLE",
+      profit: null,
+      stake: 0,
+    };
+  }
+
+  const selections = Array.isArray(parsed.selections)
+    ? parsed.selections
+    : parsed.selection
+      ? [parsed.selection]
+      : [];
+
+  if (selections.length === 0) {
+    return {
+      ticket: { ...parsed, resultStatus: "UNAVAILABLE", profitUnits: null },
+      status: "UNAVAILABLE",
+      profit: null,
+      stake: 0,
+    };
+  }
+
+  const statuses = selections.map((selection) =>
+    evaluateDailyTicketSelection(selection, resultByFixtureId)
+  );
+
+  let status = "PENDING";
+  if (statuses.includes("LOSS")) status = "LOSS";
+  else if (statuses.every((value) => value === "WIN")) status = "WIN";
+  else if (statuses.every((value) => value === "UNAVAILABLE")) {
+    status = "UNAVAILABLE";
+  }
+
+  const odd =
+    type === "FUN"
+      ? dailyTicketNumber(parsed.combinedOdds ?? parsed.totalOdds, null)
+      : dailyTicketNumber(
+          parsed.totalOdds ??
+            parsed.selection?.bookmakerOdds ??
+            selections[0]?.bookmakerOdds,
+          null
+        );
+
+  let profit = null;
+  let stake = 0;
+  if ((status === "WIN" || status === "LOSS") && odd !== null && odd > 1) {
+    stake = 1;
+    profit = status === "WIN" ? roundDailyTicket(odd - 1, 2) : -1;
+  }
+
+  return {
+    ticket: {
+      ...parsed,
+      selections: selections.map((selection, index) => ({
+        ...selection,
+        resultStatus: statuses[index],
+      })),
+      selection:
+        parsed.selection && selections[0]
+          ? { ...selections[0], resultStatus: statuses[0] }
+          : parsed.selection || null,
+      resultStatus: status,
+      profitUnits: profit,
+    },
+    status,
+    profit,
+    stake,
+  };
+}
+
+async function settleDailyTicketSnapshots({ ticketDate = null } = {}) {
+  if (dailyTicketSettlementRunning) {
+    return { ok: true, skipped: true, reason: "ALREADY_RUNNING" };
+  }
+
+  dailyTicketSettlementRunning = true;
+
+  try {
+    await ensureDailyTicketTables();
+
+    const values = [];
+    const where = ["(settled_at IS NULL OR updated_at < NOW() - INTERVAL '15 minutes')"];
+
+    if (ticketDate) {
+      const normalizedDate = normalizeDailyTicketDate(ticketDate);
+      if (!normalizedDate) throw new Error("Date de règlement invalide.");
+      values.push(normalizedDate);
+      where.push(`ticket_date = $${values.length}::date`);
+    } else {
+      where.push("ticket_date <= (NOW() AT TIME ZONE 'Europe/Paris')::date");
+    }
+
+    const snapshotsResult = await pool.query(
+      `
+        SELECT *
+        FROM daily_ticket_snapshots
+        WHERE ${where.join(" AND ")}
+        ORDER BY ticket_date ASC, generated_at ASC
+      `,
+      values
+    );
+
+    let updated = 0;
+
+    for (const row of snapshotsResult.rows) {
+      const tickets = [
+        parseDailyTicketJson(row.safe_ticket, {}),
+        parseDailyTicketJson(row.fun_ticket, {}),
+        parseDailyTicketJson(row.best_value_ticket, {}),
+      ];
+
+      const fixtureIds = [
+        ...new Set(
+          tickets
+            .flatMap((ticket) =>
+              Array.isArray(ticket.selections)
+                ? ticket.selections
+                : ticket.selection
+                  ? [ticket.selection]
+                  : []
+            )
+            .map((selection) => Number(selection.fixtureId))
+            .filter((fixtureId) => Number.isInteger(fixtureId) && fixtureId > 0)
+        ),
+      ];
+
+      const results = fixtureIds.length > 0
+        ? await pool.query(
+            `
+              SELECT fixture_id, result_status, home_goals, away_goals
+              FROM predictions
+              WHERE fixture_id = ANY($1::bigint[])
+                AND result_status = 'COMPLETED'
+                AND home_goals IS NOT NULL
+                AND away_goals IS NOT NULL
+            `,
+            [fixtureIds]
+          )
+        : { rows: [] };
+
+      const resultByFixtureId = new Map(
+        results.rows.map((result) => [Number(result.fixture_id), result])
+      );
+
+      const safe = settleSingleDailyTicket(row.safe_ticket, "SAFE", resultByFixtureId);
+      const fun = settleSingleDailyTicket(row.fun_ticket, "FUN", resultByFixtureId);
+      const value = settleSingleDailyTicket(
+        row.best_value_ticket,
+        "VALUE",
+        resultByFixtureId
+      );
+
+      const settledTickets = [safe, fun, value].filter(
+        (ticket) => ticket.status === "WIN" || ticket.status === "LOSS"
+      );
+      const totalStake = settledTickets.reduce(
+        (sum, ticket) => sum + ticket.stake,
+        0
+      );
+      const profits = settledTickets
+        .map((ticket) => ticket.profit)
+        .filter((profit) => profit !== null);
+      const totalProfit = profits.length > 0
+        ? roundDailyTicket(profits.reduce((sum, profit) => sum + profit, 0), 2)
+        : null;
+      const roi = totalStake > 0 && totalProfit !== null
+        ? roundDailyTicket((totalProfit / totalStake) * 100, 2)
+        : null;
+
+      const allFinal = [safe.status, fun.status, value.status].every((status) =>
+        ["WIN", "LOSS", "UNAVAILABLE"].includes(status)
+      );
+
+      await pool.query(
+        `
+          UPDATE daily_ticket_snapshots
+          SET
+            safe_ticket = $2::jsonb,
+            fun_ticket = $3::jsonb,
+            best_value_ticket = $4::jsonb,
+            safe_result_status = $5,
+            fun_result_status = $6,
+            value_result_status = $7,
+            safe_profit_units = $8,
+            fun_profit_units = $9,
+            value_profit_units = $10,
+            total_stake_units = $11,
+            total_profit_units = $12,
+            roi_percent = $13,
+            settled_at = CASE WHEN $14::boolean THEN NOW() ELSE NULL END,
+            updated_at = NOW()
+          WHERE id = $1
+        `,
+        [
+          row.id,
+          JSON.stringify(safe.ticket),
+          JSON.stringify(fun.ticket),
+          JSON.stringify(value.ticket),
+          safe.status,
+          fun.status,
+          value.status,
+          safe.profit,
+          fun.profit,
+          value.profit,
+          totalStake,
+          totalProfit,
+          roi,
+          allFinal,
+        ]
+      );
+
+      updated += 1;
+    }
+
+    return {
+      ok: true,
+      checked: snapshotsResult.rows.length,
+      updated,
+    };
+  } finally {
+    dailyTicketSettlementRunning = false;
+  }
+}
+
+function serializeDailyTicketSnapshot(row = {}) {
+  return {
+    id: row.id == null ? null : Number(row.id),
+    date: row.ticket_date ? String(row.ticket_date).slice(0, 10) : null,
+    slot: row.slot || null,
+    generatedAt: row.generated_at || null,
+    safeTicket: parseDailyTicketJson(row.safe_ticket, {}),
+    funTicket: parseDailyTicketJson(row.fun_ticket, {}),
+    bestValueTicket: parseDailyTicketJson(row.best_value_ticket, {}),
+    metadata: parseDailyTicketJson(row.metadata, {}),
+    results: {
+      safe: row.safe_result_status || "PENDING",
+      fun: row.fun_result_status || "PENDING",
+      value: row.value_result_status || "PENDING",
+    },
+    profits: {
+      safe:
+        row.safe_profit_units == null ? null : Number(row.safe_profit_units),
+      fun:
+        row.fun_profit_units == null ? null : Number(row.fun_profit_units),
+      value:
+        row.value_profit_units == null ? null : Number(row.value_profit_units),
+      total:
+        row.total_profit_units == null ? null : Number(row.total_profit_units),
+    },
+    totalStake:
+      row.total_stake_units == null ? 0 : Number(row.total_stake_units),
+    roi: row.roi_percent == null ? null : Number(row.roi_percent),
+    settledAt: row.settled_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+app.get("/public/daily-tickets", async (req, res) => {
+  try {
+    await ensureDailyTicketTables();
+    const paris = getParisDateTimeParts();
+    const ticketDate = normalizeDailyTicketDate(req.query.date) || paris.date;
+
+    await settleDailyTicketSnapshots({ ticketDate });
+
+    const result = await pool.query(
+      `
+        SELECT *
+        FROM daily_ticket_snapshots
+        WHERE ticket_date = $1::date
+        ORDER BY CASE slot
+          WHEN '12H' THEN 1
+          WHEN '18H' THEN 2
+          WHEN '21H' THEN 3
+          ELSE 4
+        END ASC
+      `,
+      [ticketDate]
+    );
+
+    return res.json({
+      ok: true,
+      date: ticketDate,
+      count: result.rows.length,
+      editions: result.rows.map(serializeDailyTicketSnapshot),
+    });
+  } catch (error) {
+    console.error("ERREUR LECTURE DAILY TICKETS :", error);
+    return res.status(500).json({
+      ok: false,
+      editions: [],
+      error: error?.message || "Impossible de charger les tickets du jour.",
+    });
+  }
+});
+
+app.get("/public/daily-tickets/history", async (req, res) => {
+  try {
+    await ensureDailyTicketTables();
+    await settleDailyTicketSnapshots();
+
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 30));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    const result = await pool.query(
+      `
+        SELECT *
+        FROM daily_ticket_snapshots
+        ORDER BY ticket_date DESC, generated_at DESC
+        LIMIT $1 OFFSET $2
+      `,
+      [limit, offset]
+    );
+
+    const statsResult = await pool.query(`
+      SELECT
+        COUNT(*)::int AS editions,
+        COUNT(*) FILTER (WHERE safe_result_status = 'WIN')::int AS safe_wins,
+        COUNT(*) FILTER (WHERE safe_result_status = 'LOSS')::int AS safe_losses,
+        COUNT(*) FILTER (WHERE fun_result_status = 'WIN')::int AS fun_wins,
+        COUNT(*) FILTER (WHERE fun_result_status = 'LOSS')::int AS fun_losses,
+        COUNT(*) FILTER (WHERE value_result_status = 'WIN')::int AS value_wins,
+        COUNT(*) FILTER (WHERE value_result_status = 'LOSS')::int AS value_losses,
+        COALESCE(SUM(total_stake_units), 0)::numeric AS total_stake,
+        COALESCE(SUM(total_profit_units), 0)::numeric AS total_profit
+      FROM daily_ticket_snapshots
+    `);
+
+    const stats = statsResult.rows[0] || {};
+    const totalStake = Number(stats.total_stake || 0);
+    const totalProfit = Number(stats.total_profit || 0);
+
+    return res.json({
+      ok: true,
+      count: result.rows.length,
+      limit,
+      offset,
+      history: result.rows.map(serializeDailyTicketSnapshot),
+      stats: {
+        editions: Number(stats.editions || 0),
+        safeWins: Number(stats.safe_wins || 0),
+        safeLosses: Number(stats.safe_losses || 0),
+        funWins: Number(stats.fun_wins || 0),
+        funLosses: Number(stats.fun_losses || 0),
+        valueWins: Number(stats.value_wins || 0),
+        valueLosses: Number(stats.value_losses || 0),
+        totalStake,
+        totalProfit,
+        roi:
+          totalStake > 0
+            ? roundDailyTicket((totalProfit / totalStake) * 100, 2)
+            : null,
+      },
+    });
+  } catch (error) {
+    console.error("ERREUR HISTORIQUE DAILY TICKETS :", error);
+    return res.status(500).json({
+      ok: false,
+      history: [],
+      error: error?.message || "Impossible de charger l'historique des tickets.",
+    });
+  }
+});
+
+app.post("/internal/daily-tickets/generate", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+
+  try {
+    const paris = getParisDateTimeParts();
+    const ticketDate = normalizeDailyTicketDate(req.body?.date) || paris.date;
+    const slot = normalizeDailyTicketSlot(req.body?.slot || "ON_DEMAND");
+
+    if (!slot) {
+      return res.status(400).json({ ok: false, error: "Créneau invalide." });
+    }
+
+    const result = await generateDailyTicketSnapshot({
+      ticketDate,
+      slot,
+      force: req.body?.force === true,
+      source: "admin-manual",
+    });
+
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    console.error("ERREUR GÉNÉRATION DAILY TICKET :", error);
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || "Impossible de générer le ticket.",
+    });
+  }
+});
+
+app.post("/internal/daily-tickets/settle", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+
+  try {
+    const result = await settleDailyTicketSnapshots({
+      ticketDate: req.body?.date || null,
+    });
+    return res.json(result);
+  } catch (error) {
+    console.error("ERREUR RÈGLEMENT DAILY TICKETS :", error);
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || "Impossible de régler les tickets.",
+    });
+  }
+});
+
+async function checkDailyTicketSchedule() {
+  if (dailyTicketSchedulerRunning) return;
+  dailyTicketSchedulerRunning = true;
+
+  try {
+    const paris = getParisDateTimeParts();
+
+    for (const [slot, hour] of Object.entries(DAILY_TICKET_SLOTS)) {
+      const minutesSinceSlot = (paris.hour - hour) * 60 + paris.minute;
+
+      if (
+        minutesSinceSlot < 0 ||
+        minutesSinceSlot > DAILY_TICKET_SLOT_GRACE_MINUTES
+      ) {
+        continue;
+      }
+
+      const result = await generateDailyTicketSnapshot({
+        ticketDate: paris.date,
+        slot,
+        force: false,
+        source: "automatic-scheduler",
+      });
+
+      if (result.created) {
+        console.log(`✅ Daily Ticket ${slot} créé pour ${paris.date}`);
+      }
+    }
+
+    await settleDailyTicketSnapshots();
+  } catch (error) {
+    console.error("ERREUR SCHEDULER DAILY TICKET :", error);
+  } finally {
+    dailyTicketSchedulerRunning = false;
+  }
+}
+
+function startDailyTicketScheduler() {
+  if (!AUTOMATIC_SCHEDULERS_ENABLED) {
+    console.log("⏸️ Daily Ticket Scheduler désactivé avec les schedulers.");
+    return;
+  }
+
+  checkDailyTicketSchedule().catch((error) => {
+    console.error("ERREUR PREMIÈRE VÉRIFICATION DAILY TICKET :", error);
+  });
+
+  setInterval(() => {
+    checkDailyTicketSchedule().catch((error) => {
+      console.error("ERREUR INTERVAL DAILY TICKET :", error);
+    });
+  }, DAILY_TICKET_SCHEDULER_INTERVAL_MS);
+
+  console.log("✅ Daily Ticket Scheduler : 12h, 18h et 21h (Europe/Paris)");
+}
+
+
 const AUTOMATIC_CALIBRATION_INTERVAL_MS =
   6 * 60 * 60 * 1000;
 
@@ -20437,12 +21612,21 @@ app.listen(
         );
       });
 
+    ensureDailyTicketTables()
+      .catch((error) => {
+        console.error(
+          "ERREUR TABLE DAILY TICKETS :",
+          error
+        );
+      });
+
     /*
      * Les initialisations SQL restent actives.
      * Seules les tâches consommatrices d'API
      * dépendent de l'interrupteur.
      */
     startAutomaticCalibrationScheduler();
+    startDailyTicketScheduler();
     startAutomaticSchedulers();
   }
 );
