@@ -12113,6 +12113,12 @@ async function runAutomaticResultSync() {
     const summary =
       await synchronizeFinishedPredictionsByDate();
 
+    const manualOddsRefresh =
+      await refreshManualOddsProfits();
+
+    summary.manualOddsRefresh =
+      manualOddsRefresh;
+
     console.log(
       "RESULT SYNC TERMINÉ :",
       {
@@ -18041,9 +18047,19 @@ async function ensureBilanV3Columns() {
   await pool.query(`
     ALTER TABLE predictions
       ADD COLUMN IF NOT EXISTS manual_market_odd NUMERIC,
+      ADD COLUMN IF NOT EXISTS manual_stake_units NUMERIC NOT NULL DEFAULT 1,
       ADD COLUMN IF NOT EXISTS manual_odd_source TEXT,
       ADD COLUMN IF NOT EXISTS manual_odd_entered_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS manual_odd_entered_by TEXT;
+      ADD COLUMN IF NOT EXISTS manual_odd_updated_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS manual_odd_entered_by TEXT,
+      ADD COLUMN IF NOT EXISTS manual_profit_units NUMERIC,
+      ADD COLUMN IF NOT EXISTS manual_roi_percent NUMERIC;
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_predictions_manual_market_odd
+    ON predictions(manual_market_odd);
   `);
 }
 
@@ -18685,89 +18701,734 @@ adminStudioRebuildRunning = true;
 }
 });
 
+
+function normalizeManualOddsMarketKey(value = "") {
+  const key = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replaceAll("-", "_")
+    .replaceAll(" ", "_");
+
+  if (["HOME", "HOME_WIN", "1", "DOMICILE"].includes(key)) return "HOME";
+  if (["DRAW", "X", "N", "NUL"].includes(key)) return "DRAW";
+  if (["AWAY", "AWAY_WIN", "2", "EXTERIEUR", "EXTÉRIEUR"].includes(key)) {
+    return "AWAY";
+  }
+  if (["OVER25", "OVER_25", "OVER_2_5"].includes(key)) return "OVER25";
+  if (["UNDER25", "UNDER_25", "UNDER_2_5"].includes(key)) return "UNDER25";
+  if (["BTTS", "BTTS_YES", "BOTH_TEAMS_SCORE", "YES_BTTS"].includes(key)) {
+    return "BTTS_YES";
+  }
+  if (["BTTS_NO", "NO_BTTS"].includes(key)) return "BTTS_NO";
+
+  return key;
+}
+
+function evaluateManualOddsMarketResult({
+  marketKey,
+  homeGoals,
+  awayGoals,
+} = {}) {
+  if (
+    homeGoals === null ||
+    homeGoals === undefined ||
+    awayGoals === null ||
+    awayGoals === undefined
+  ) {
+    return null;
+  }
+
+  const home = Number(homeGoals);
+  const away = Number(awayGoals);
+
+  if (!Number.isFinite(home) || !Number.isFinite(away)) {
+    return null;
+  }
+
+  const key = normalizeManualOddsMarketKey(marketKey);
+
+  if (key === "HOME") return home > away;
+  if (key === "DRAW") return home === away;
+  if (key === "AWAY") return away > home;
+  if (key === "OVER25") return home + away >= 3;
+  if (key === "UNDER25") return home + away <= 2;
+  if (key === "BTTS_YES") return home > 0 && away > 0;
+  if (key === "BTTS_NO") return home === 0 || away === 0;
+
+  return null;
+}
+
+function calculateManualBetPerformance({
+  odd,
+  stake = 1,
+  predictionCorrect,
+} = {}) {
+  const normalizedOdd = Number(odd);
+  const normalizedStake = Number(stake);
+
+  if (
+    !Number.isFinite(normalizedOdd) ||
+    normalizedOdd <= 1 ||
+    !Number.isFinite(normalizedStake) ||
+    normalizedStake <= 0 ||
+    typeof predictionCorrect !== "boolean"
+  ) {
+    return {
+      profitUnits: null,
+      roiPercent: null,
+    };
+  }
+
+  const profitUnits = predictionCorrect
+    ? normalizedStake * (normalizedOdd - 1)
+    : -normalizedStake;
+
+  const roiPercent =
+    normalizedStake > 0
+      ? (profitUnits / normalizedStake) * 100
+      : null;
+
+  return {
+    profitUnits: Number(profitUnits.toFixed(2)),
+    roiPercent:
+      roiPercent === null
+        ? null
+        : Number(roiPercent.toFixed(2)),
+  };
+}
+
+async function refreshManualOddsProfits() {
+  await ensureBilanV3Columns();
+
+  const result = await pool.query(`
+    SELECT
+      fixture_id,
+      result_status,
+      home_goals,
+      away_goals,
+      studio_market_key,
+      manual_market_odd,
+      manual_stake_units,
+      manual_profit_units,
+      manual_roi_percent
+    FROM predictions
+    WHERE manual_market_odd IS NOT NULL
+      AND studio_market_key IS NOT NULL
+      AND result_status = 'COMPLETED'
+      AND home_goals IS NOT NULL
+      AND away_goals IS NOT NULL
+  `);
+
+  let updated = 0;
+  let unchanged = 0;
+  let unsupported = 0;
+
+  for (const prediction of result.rows) {
+    const predictionCorrect =
+      evaluateManualOddsMarketResult({
+        marketKey: prediction.studio_market_key,
+        homeGoals: prediction.home_goals,
+        awayGoals: prediction.away_goals,
+      });
+
+    if (typeof predictionCorrect !== "boolean") {
+      unsupported += 1;
+      continue;
+    }
+
+    const performance =
+      calculateManualBetPerformance({
+        odd: prediction.manual_market_odd,
+        stake: prediction.manual_stake_units,
+        predictionCorrect,
+      });
+
+    const currentProfit =
+      prediction.manual_profit_units === null
+        ? null
+        : Number(prediction.manual_profit_units);
+
+    const currentRoi =
+      prediction.manual_roi_percent === null
+        ? null
+        : Number(prediction.manual_roi_percent);
+
+    if (
+      currentProfit === performance.profitUnits &&
+      currentRoi === performance.roiPercent
+    ) {
+      unchanged += 1;
+      continue;
+    }
+
+    await pool.query(
+      `
+        UPDATE predictions
+        SET
+          manual_profit_units = $2,
+          manual_roi_percent = $3,
+          updated_at = NOW()
+        WHERE fixture_id = $1
+      `,
+      [
+        prediction.fixture_id,
+        performance.profitUnits,
+        performance.roiPercent,
+      ]
+    );
+
+    updated += 1;
+  }
+
+  return {
+    ok: true,
+    scanned: result.rows.length,
+    updated,
+    unchanged,
+    unsupported,
+  };
+}
+
+
+/*
+ * Route historique conservée pour compatibilité avec le panneau Admin actuel.
+ * Elle liste les matchs terminés et accepte toujours le filtre missingOdd=1.
+ */
 app.get("/internal/admin/bilan/markets", async (req, res) => {
   if (!requireOptionalAdminKey(req, res)) return;
 
   try {
     await ensureBilanV3Columns();
+
     const onlyMissing = String(req.query.missingOdd || "") === "1";
-    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
     const offset = Math.max(Number(req.query.offset) || 0, 0);
 
-    const { rows } = await pool.query(`
-      SELECT
-        fixture_id,
-        fixture_date,
-        league_name,
-        home_team_name,
-        away_team_name,
-        home_goals,
-        away_goals,
-        studio_market_key,
-        studio_market_label,
-        studio_decision_type,
-        studio_decision_score,
-        result_status,
-        won,
-        market_odd,
-        manual_market_odd,
-        manual_odd_source,
-        manual_odd_entered_at,
-        manual_odd_entered_by
-      FROM predictions
-      WHERE result_status = 'COMPLETED'
-        AND ($1::boolean = FALSE OR manual_market_odd IS NULL)
-      ORDER BY fixture_date DESC NULLS LAST, updated_at DESC NULLS LAST
-      LIMIT $2 OFFSET $3
-    `, [onlyMissing, limit, offset]);
+    const { rows } = await pool.query(
+      `
+        SELECT
+          fixture_id,
+          fixture_date,
+          league_id,
+          league_name,
+          home_team_name,
+          away_team_name,
+          home_goals,
+          away_goals,
+          studio_market_key,
+          studio_market_label,
+          studio_probability,
+          studio_decision_type,
+          studio_decision_score,
+          result_status,
+          won,
+          market_odd,
+          manual_market_odd,
+          manual_stake_units,
+          manual_profit_units,
+          manual_roi_percent,
+          manual_odd_source,
+          manual_odd_entered_at,
+          manual_odd_updated_at,
+          manual_odd_entered_by
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+          AND NULLIF(BTRIM(studio_market_key), '') IS NOT NULL
+          AND ($1::boolean = FALSE OR manual_market_odd IS NULL)
+        ORDER BY fixture_date DESC NULLS LAST, updated_at DESC NULLS LAST
+        LIMIT $2 OFFSET $3
+      `,
+      [onlyMissing, limit, offset]
+    );
 
-    return res.json({ ok: true, count: rows.length, limit, offset, markets: rows });
+    return res.json({
+      ok: true,
+      count: rows.length,
+      limit,
+      offset,
+      markets: rows,
+    });
   } catch (error) {
     console.error("ERREUR /internal/admin/bilan/markets :", error);
-    return res.status(500).json({ ok: false, error: error.message });
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
   }
 });
 
-app.put("/internal/admin/bilan/markets/:fixtureId/odd", async (req, res) => {
+/*
+ * Nouvelle route principale : tous les matchs Brain Studio dont le marché
+ * principal est connu. Par défaut, seules les ligues actives du League Manager
+ * sont affichées. Les cotes déjà saisies restent modifiables.
+ *
+ * status = ALL | MISSING | FILLED | SETTLED | PENDING
+ */
+app.get("/internal/admin/manual-odds", async (req, res) => {
   if (!requireOptionalAdminKey(req, res)) return;
 
   try {
     await ensureBilanV3Columns();
-    const fixtureId = Number(req.params.fixtureId);
-    const odd = Number(req.body?.odd);
-    const source = String(req.body?.source || "Saisie manuelle").trim();
-    const enteredBy = String(req.body?.enteredBy || "admin").trim();
+    await ensureLeagueManagerTables();
+    await refreshManualOddsProfits();
 
-    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
-      return res.status(400).json({ ok: false, error: "fixtureId invalide." });
+    const status = String(req.query.status || "ALL")
+      .trim()
+      .toUpperCase();
+
+    const activeOnly =
+      String(req.query.activeOnly ?? "1").trim() !== "0";
+
+    const limit = Math.min(
+      500,
+      Math.max(1, Number(req.query.limit) || 100)
+    );
+
+    const offset = Math.max(
+      0,
+      Number(req.query.offset) || 0
+    );
+
+    const search = String(req.query.search || "")
+      .trim()
+      .toLowerCase();
+
+    const values = [];
+    const where = [
+      "NULLIF(BTRIM(p.studio_market_key), '') IS NOT NULL",
+    ];
+
+    if (activeOnly) {
+      where.push("ls.enabled = TRUE");
     }
-    if (!Number.isFinite(odd) || odd <= 1 || odd > 1000) {
-      return res.status(400).json({ ok: false, error: "La cote doit être supérieure à 1." });
+
+    if (status === "MISSING") {
+      where.push("p.manual_market_odd IS NULL");
+    } else if (status === "FILLED") {
+      where.push("p.manual_market_odd IS NOT NULL");
+    } else if (status === "SETTLED") {
+      where.push(
+        "p.manual_market_odd IS NOT NULL",
+        "p.manual_profit_units IS NOT NULL"
+      );
+    } else if (status === "PENDING") {
+      where.push(
+        "p.manual_market_odd IS NOT NULL",
+        "p.manual_profit_units IS NULL"
+      );
     }
 
-    const { rows } = await pool.query(`
-      UPDATE predictions
-      SET
-        manual_market_odd = $1,
-        manual_odd_source = $2,
-        manual_odd_entered_by = $3,
-        manual_odd_entered_at = NOW(),
-        updated_at = NOW()
-      WHERE fixture_id = $4
-      RETURNING fixture_id, manual_market_odd, manual_odd_source,
-                manual_odd_entered_at, manual_odd_entered_by
-    `, [odd, source, enteredBy, fixtureId]);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ ok: false, error: "Prédiction introuvable." });
+    if (search) {
+      values.push(`%${search}%`);
+      where.push(
+        `(LOWER(COALESCE(p.home_team_name, '')) LIKE $${values.length}
+          OR LOWER(COALESCE(p.away_team_name, '')) LIKE $${values.length}
+          OR LOWER(COALESCE(p.league_name, '')) LIKE $${values.length}
+          OR CAST(p.fixture_id AS TEXT) LIKE $${values.length})`
+      );
     }
 
-    return res.json({ ok: true, market: rows[0] });
+    values.push(limit);
+    const limitParameter = `$${values.length}`;
+
+    values.push(offset);
+    const offsetParameter = `$${values.length}`;
+
+    const result = await pool.query(
+      `
+        SELECT
+          p.id,
+          p.fixture_id,
+          p.fixture_date,
+          p.league_id,
+          p.league_name,
+          COALESCE(ls.enabled, FALSE) AS league_enabled,
+          COALESCE(ls.priority, 'NORMAL') AS league_priority,
+
+          p.home_team_name,
+          p.away_team_name,
+          p.home_goals,
+          p.away_goals,
+          p.result_status,
+
+          p.studio_market_key,
+          p.studio_market_label,
+          p.studio_probability,
+          p.studio_decision_score,
+          p.studio_decision_type,
+          p.studio_decision_grade,
+
+          p.market_odd AS api_market_odd,
+
+          p.manual_market_odd,
+          p.manual_stake_units,
+          p.manual_profit_units,
+          p.manual_roi_percent,
+          p.manual_odd_source,
+          p.manual_odd_entered_at,
+          p.manual_odd_updated_at,
+          p.manual_odd_entered_by,
+
+          p.updated_at
+        FROM predictions p
+        LEFT JOIN league_settings ls
+          ON ls.league_id = p.league_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY
+          CASE WHEN p.manual_market_odd IS NULL THEN 0 ELSE 1 END ASC,
+          p.fixture_date DESC NULLS LAST,
+          p.fixture_id DESC
+        LIMIT ${limitParameter}
+        OFFSET ${offsetParameter}
+      `,
+      values
+    );
+
+    const summaryResult = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (
+          WHERE NULLIF(BTRIM(p.studio_market_key), '') IS NOT NULL
+            AND ls.enabled = TRUE
+        )::INTEGER AS total,
+
+        COUNT(*) FILTER (
+          WHERE NULLIF(BTRIM(p.studio_market_key), '') IS NOT NULL
+            AND ls.enabled = TRUE
+            AND p.manual_market_odd IS NULL
+        )::INTEGER AS missing,
+
+        COUNT(*) FILTER (
+          WHERE NULLIF(BTRIM(p.studio_market_key), '') IS NOT NULL
+            AND ls.enabled = TRUE
+            AND p.manual_market_odd IS NOT NULL
+        )::INTEGER AS filled,
+
+        COUNT(*) FILTER (
+          WHERE NULLIF(BTRIM(p.studio_market_key), '') IS NOT NULL
+            AND ls.enabled = TRUE
+            AND p.manual_market_odd IS NOT NULL
+            AND p.manual_profit_units IS NOT NULL
+        )::INTEGER AS settled,
+
+        COUNT(*) FILTER (
+          WHERE NULLIF(BTRIM(p.studio_market_key), '') IS NOT NULL
+            AND ls.enabled = TRUE
+            AND p.manual_market_odd IS NOT NULL
+            AND p.manual_profit_units IS NULL
+        )::INTEGER AS pending,
+
+        COALESCE(
+          SUM(p.manual_stake_units) FILTER (
+            WHERE ls.enabled = TRUE
+              AND p.manual_profit_units IS NOT NULL
+          ),
+          0
+        )::NUMERIC AS total_stake,
+
+        COALESCE(
+          SUM(p.manual_profit_units) FILTER (
+            WHERE ls.enabled = TRUE
+              AND p.manual_profit_units IS NOT NULL
+          ),
+          0
+        )::NUMERIC AS total_profit
+
+      FROM predictions p
+      LEFT JOIN league_settings ls
+        ON ls.league_id = p.league_id
+    `);
+
+    const summary = summaryResult.rows[0] || {};
+    const totalStake = Number(summary.total_stake || 0);
+    const totalProfit = Number(summary.total_profit || 0);
+
+    return res.json({
+      ok: true,
+      summary: {
+        total: Number(summary.total || 0),
+        missing: Number(summary.missing || 0),
+        filled: Number(summary.filled || 0),
+        settled: Number(summary.settled || 0),
+        pending: Number(summary.pending || 0),
+        totalStake: Number(totalStake.toFixed(2)),
+        totalProfit: Number(totalProfit.toFixed(2)),
+        roi:
+          totalStake > 0
+            ? Number(((totalProfit / totalStake) * 100).toFixed(2))
+            : null,
+      },
+      rows: result.rows,
+      pagination: {
+        limit,
+        offset,
+      },
+      filters: {
+        status,
+        activeOnly,
+        search,
+      },
+    });
   } catch (error) {
-    console.error("ERREUR PUT cote manuelle :", error);
-    return res.status(500).json({ ok: false, error: error.message });
+    console.error("ERREUR LISTE COTES MANUELLES :", error);
+
+    return res.status(500).json({
+      ok: false,
+      rows: [],
+      error:
+        error?.message ||
+        "Impossible de charger les cotes manuelles.",
+    });
   }
 });
+
+async function saveOrUpdateManualOdd(req, res) {
+  if (!requireOptionalAdminKey(req, res)) return;
+
+  try {
+    await ensureBilanV3Columns();
+
+    const fixtureId = Number(req.params.fixtureId);
+    const manualOdd = Number(
+      req.body?.manualOdd ??
+      req.body?.odd
+    );
+    const stakeUnits = Number(
+      req.body?.stakeUnits ?? 1
+    );
+
+    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "fixtureId invalide.",
+      });
+    }
+
+    if (
+      !Number.isFinite(manualOdd) ||
+      manualOdd <= 1 ||
+      manualOdd > 1000
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "La cote doit être supérieure à 1.",
+      });
+    }
+
+    if (
+      !Number.isFinite(stakeUnits) ||
+      stakeUnits <= 0 ||
+      stakeUnits > 10000
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "La mise doit être supérieure à 0.",
+      });
+    }
+
+    const predictionResult = await pool.query(
+      `
+        SELECT
+          fixture_id,
+          result_status,
+          home_goals,
+          away_goals,
+          studio_market_key,
+          manual_market_odd
+        FROM predictions
+        WHERE fixture_id = $1
+        LIMIT 1
+      `,
+      [fixtureId]
+    );
+
+    const prediction = predictionResult.rows[0];
+
+    if (!prediction) {
+      return res.status(404).json({
+        ok: false,
+        error: "Analyse introuvable.",
+      });
+    }
+
+    if (!String(prediction.studio_market_key || "").trim()) {
+      return res.status(409).json({
+        ok: false,
+        error: "Le marché principal Brain Studio est absent.",
+      });
+    }
+
+    const predictionCorrect =
+      prediction.result_status === "COMPLETED"
+        ? evaluateManualOddsMarketResult({
+            marketKey: prediction.studio_market_key,
+            homeGoals: prediction.home_goals,
+            awayGoals: prediction.away_goals,
+          })
+        : null;
+
+    const performance =
+      calculateManualBetPerformance({
+        odd: manualOdd,
+        stake: stakeUnits,
+        predictionCorrect,
+      });
+
+    const editor = String(
+      req.body?.enteredBy || "administrator"
+    )
+      .trim()
+      .slice(0, 200);
+
+    const source = String(
+      req.body?.source || "Saisie manuelle"
+    )
+      .trim()
+      .slice(0, 200);
+
+    const result = await pool.query(
+      `
+        UPDATE predictions
+        SET
+          manual_market_odd = $2,
+          manual_stake_units = $3,
+          manual_profit_units = $4,
+          manual_roi_percent = $5,
+          manual_odd_source = $6,
+          manual_odd_entered_at =
+            COALESCE(manual_odd_entered_at, NOW()),
+          manual_odd_updated_at = NOW(),
+          manual_odd_entered_by = $7,
+          updated_at = NOW()
+        WHERE fixture_id = $1
+        RETURNING *
+      `,
+      [
+        fixtureId,
+        manualOdd,
+        stakeUnits,
+        performance.profitUnits,
+        performance.roiPercent,
+        source,
+        editor,
+      ]
+    );
+
+    return res.json({
+      ok: true,
+      created:
+        prediction.manual_market_odd === null ||
+        prediction.manual_market_odd === undefined,
+      updated:
+        prediction.manual_market_odd !== null &&
+        prediction.manual_market_odd !== undefined,
+      prediction: result.rows[0],
+    });
+  } catch (error) {
+    console.error("ERREUR ENREGISTREMENT COTE MANUELLE :", error);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Impossible d’enregistrer la cote.",
+    });
+  }
+}
+
+/*
+ * Nouvelle route PATCH et ancienne route PUT :
+ * elles utilisent exactement la même logique et permettent la modification.
+ */
+app.patch(
+  "/internal/admin/manual-odds/:fixtureId",
+  saveOrUpdateManualOdd
+);
+
+app.put(
+  "/internal/admin/bilan/markets/:fixtureId/odd",
+  saveOrUpdateManualOdd
+);
+
+app.delete(
+  "/internal/admin/manual-odds/:fixtureId",
+  async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) return;
+
+    try {
+      await ensureBilanV3Columns();
+
+      const fixtureId = Number(req.params.fixtureId);
+
+      if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "fixtureId invalide.",
+        });
+      }
+
+      const result = await pool.query(
+        `
+          UPDATE predictions
+          SET
+            manual_market_odd = NULL,
+            manual_stake_units = 1,
+            manual_profit_units = NULL,
+            manual_roi_percent = NULL,
+            manual_odd_source = NULL,
+            manual_odd_entered_at = NULL,
+            manual_odd_updated_at = NOW(),
+            manual_odd_entered_by = NULL,
+            updated_at = NOW()
+          WHERE fixture_id = $1
+          RETURNING fixture_id
+        `,
+        [fixtureId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: "Analyse introuvable.",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        fixtureId,
+      });
+    } catch (error) {
+      console.error("ERREUR SUPPRESSION COTE MANUELLE :", error);
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de supprimer la cote.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/internal/admin/manual-odds/refresh-profits",
+  async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) return;
+
+    try {
+      const result = await refreshManualOddsProfits();
+      return res.json(result);
+    } catch (error) {
+      console.error("ERREUR RECALCUL PROFITS MANUELS :", error);
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de recalculer les profits.",
+      });
+    }
+  }
+);
 
 const AUTOMATIC_CALIBRATION_INTERVAL_MS =
   6 * 60 * 60 * 1000;
