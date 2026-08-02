@@ -59,8 +59,19 @@ const app = express();
 app.use(
   cors({
     origin: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    methods: [
+      "GET",
+      "POST",
+      "PUT",
+      "PATCH",
+      "DELETE",
+      "OPTIONS",
+    ],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Admin-Key",
+    ],
   })
 );
 // Les snapshots Brain Studio contiennent tous les marchés et peuvent
