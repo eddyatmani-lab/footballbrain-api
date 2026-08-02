@@ -21675,24 +21675,72 @@ app.get("/public/statistics/dashboard", async (req, res) => {
       `),
 
       pool.query(`
+        WITH normalized_markets AS (
+          SELECT
+            CASE
+              WHEN UPPER(REGEXP_REPLACE(COALESCE(
+                NULLIF(BTRIM(official_tracked_market_key), ''),
+                NULLIF(BTRIM(studio_market_key), ''),
+                'UNKNOWN'
+              ), '[^A-Z0-9]', '', 'g')) IN ('HOME', 'HOMEWIN', '1')
+                THEN 'HOME_WIN'
+              WHEN UPPER(REGEXP_REPLACE(COALESCE(
+                NULLIF(BTRIM(official_tracked_market_key), ''),
+                NULLIF(BTRIM(studio_market_key), ''),
+                'UNKNOWN'
+              ), '[^A-Z0-9]', '', 'g')) IN ('AWAY', 'AWAYWIN', '2')
+                THEN 'AWAY_WIN'
+              WHEN UPPER(REGEXP_REPLACE(COALESCE(
+                NULLIF(BTRIM(official_tracked_market_key), ''),
+                NULLIF(BTRIM(studio_market_key), ''),
+                'UNKNOWN'
+              ), '[^A-Z0-9]', '', 'g')) IN ('DRAW', 'X', 'N')
+                THEN 'DRAW'
+              WHEN UPPER(REGEXP_REPLACE(COALESCE(
+                NULLIF(BTRIM(official_tracked_market_key), ''),
+                NULLIF(BTRIM(studio_market_key), ''),
+                'UNKNOWN'
+              ), '[^A-Z0-9]', '', 'g')) IN ('BTTS', 'BTTSYES', 'GG')
+                THEN 'BTTS'
+              WHEN UPPER(REGEXP_REPLACE(COALESCE(
+                NULLIF(BTRIM(official_tracked_market_key), ''),
+                NULLIF(BTRIM(studio_market_key), ''),
+                'UNKNOWN'
+              ), '[^A-Z0-9]', '', 'g')) IN ('NOBTTS', 'BTTSNO', 'NG')
+                THEN 'NO_BTTS'
+              WHEN UPPER(REGEXP_REPLACE(COALESCE(
+                NULLIF(BTRIM(official_tracked_market_key), ''),
+                NULLIF(BTRIM(studio_market_key), ''),
+                'UNKNOWN'
+              ), '[^A-Z0-9]', '', 'g')) IN ('OVER25', 'OVER250', 'PLUS25')
+                THEN 'OVER25'
+              WHEN UPPER(REGEXP_REPLACE(COALESCE(
+                NULLIF(BTRIM(official_tracked_market_key), ''),
+                NULLIF(BTRIM(studio_market_key), ''),
+                'UNKNOWN'
+              ), '[^A-Z0-9]', '', 'g')) IN ('UNDER25', 'UNDER250', 'MOINS25')
+                THEN 'UNDER25'
+              ELSE UPPER(REGEXP_REPLACE(COALESCE(
+                NULLIF(BTRIM(official_tracked_market_key), ''),
+                NULLIF(BTRIM(studio_market_key), ''),
+                'UNKNOWN'
+              ), '[^A-Z0-9]', '', 'g'))
+            END AS market_key,
+            result_status,
+            COALESCE(official_market_won, won) AS market_won,
+            manual_stake_units,
+            manual_profit_units,
+            manual_market_odd
+          FROM predictions
+          WHERE result_status = 'COMPLETED'
+        )
         SELECT
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_key), ''),
-            NULLIF(BTRIM(studio_market_key), ''),
-            'UNKNOWN'
-          ) AS market_key,
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_label), ''),
-            NULLIF(BTRIM(studio_market_label), ''),
-            'Marché inconnu'
-          ) AS market_label,
+          market_key,
           COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) IS NOT NULL
+            WHERE market_won IS NOT NULL
           )::INTEGER AS evaluated,
           COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) = TRUE
+            WHERE market_won = TRUE
           )::INTEGER AS wins,
           COUNT(*) FILTER (
             WHERE manual_profit_units IS NOT NULL
@@ -21710,29 +21758,30 @@ app.get("/public/statistics/dashboard", async (req, res) => {
             0
           )::NUMERIC AS profit,
           ROUND(
-            AVG(manual_market_odd) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-                AND manual_market_odd > 1
+            (
+              SUM(manual_market_odd * manual_stake_units) FILTER (
+                WHERE manual_profit_units IS NOT NULL
+                  AND manual_market_odd > 1
+                  AND manual_stake_units > 0
+              )
+              /
+              NULLIF(
+                SUM(manual_stake_units) FILTER (
+                  WHERE manual_profit_units IS NOT NULL
+                    AND manual_market_odd > 1
+                    AND manual_stake_units > 0
+                ),
+                0
+              )
             )::NUMERIC,
             2
           ) AS average_odd
-        FROM predictions
-        WHERE result_status = 'COMPLETED'
-        GROUP BY
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_key), ''),
-            NULLIF(BTRIM(studio_market_key), ''),
-            'UNKNOWN'
-          ),
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_label), ''),
-            NULLIF(BTRIM(studio_market_label), ''),
-            'Marché inconnu'
-          )
+        FROM normalized_markets
+        GROUP BY market_key
         HAVING COUNT(*) FILTER (
-          WHERE COALESCE(official_market_won, won) IS NOT NULL
+          WHERE market_won IS NOT NULL
         ) > 0
-        ORDER BY evaluated DESC, market_label ASC
+        ORDER BY evaluated DESC, market_key ASC
       `),
 
       pool.query(`
@@ -21890,11 +21939,23 @@ app.get("/public/statistics/dashboard", async (req, res) => {
       name: row.competition,
     }));
 
-    const markets = marketsResult.rows.map((row) => ({
-      ...mapPerformanceRow(row),
-      key: row.market_key,
-      label: row.market_label,
-    }));
+    const publicMarketLabels = {
+      HOME_WIN: "Victoire domicile",
+      AWAY_WIN: "Victoire extérieur",
+      DRAW: "Match nul",
+      BTTS: "Les deux équipes marquent",
+      NO_BTTS: "Les deux équipes ne marquent pas",
+      UNDER25: "Moins de 2,5 buts",
+      OVER25: "Plus de 2,5 buts",
+    };
+
+    const markets = marketsResult.rows
+      .filter((row) => publicMarketLabels[row.market_key])
+      .map((row) => ({
+        ...mapPerformanceRow(row),
+        key: row.market_key,
+        label: publicMarketLabels[row.market_key],
+      }));
 
     const oddsBands = oddsBandsResult.rows.map((row) => ({
       ...mapPerformanceRow(row),
