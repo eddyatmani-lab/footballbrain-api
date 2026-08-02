@@ -88,6 +88,39 @@ app.use(
     limit: "10mb",
   })
 );
+
+/*
+ * Garantit que les colonnes Bilan V3 existent avant toute requête.
+ * La promesse est mutualisée : la migration n'est exécutée qu'une fois
+ * par démarrage, même si plusieurs appels arrivent simultanément.
+ */
+let bilanV3InitializationPromise = null;
+
+app.use(async (req, res, next) => {
+  try {
+    if (!bilanV3InitializationPromise) {
+      bilanV3InitializationPromise =
+        ensureBilanV3Columns();
+    }
+
+    await bilanV3InitializationPromise;
+    return next();
+  } catch (error) {
+    bilanV3InitializationPromise = null;
+
+    console.error(
+      "ERREUR INITIALISATION BILAN V3 :",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Impossible d'initialiser les colonnes Bilan V3.",
+    });
+  }
+});
 const analysisCache = new Map();
 const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
 const FINISHED_FIXTURE_STATUSES = new Set([
@@ -9237,23 +9270,9 @@ function buildStoredPredictionExplainability(
         studioPrimaryMarket?.rawFairOdds ??
         prediction.fair_odd,
       marketOdd:
-        (
-          normalizeStudioMarketKey(
-            prediction.manual_market_key
-          ) ===
-            normalizeStudioMarketKey(
-              studioMarketKey
-            ) &&
-          Number(
-            prediction.manual_market_odd
-          ) > 1
-        )
-          ? Number(
-              prediction.manual_market_odd
-            )
-          : studioPrimaryMarket?.fairOdds?.bookmakerOdds ??
-            studioPrimaryMarket?.bookmakerOdds ??
-            prediction.market_odd,
+        studioPrimaryMarket?.fairOdds?.bookmakerOdds ??
+        studioPrimaryMarket?.bookmakerOdds ??
+        prediction.market_odd,
       value:
         studioPrimaryMarket?.fairOdds?.valueEdge ??
         studioPrimaryMarket?.valueEdge ??
@@ -9506,11 +9525,6 @@ app.get(
             studio_snapshot,
             studio_saved_at,
 
-            manual_market_odd,
-            manual_market_key,
-            manual_odd_source,
-            manual_odd_updated_at,
-
             updated_at
           FROM predictions
           WHERE fixture_id = $1
@@ -9618,42 +9632,11 @@ if (
               : null,
 
           marketOdd:
-            (
-              normalizeStudioMarketKey(
-                prediction.manual_market_key
-              ) ===
-                normalizeStudioMarketKey(
-                  prediction.studio_market_key
-                ) &&
-              Number(
-                prediction.manual_market_odd
-              ) > 1
-            )
+            prediction.market_odd !== null
               ? Number(
-                  prediction.manual_market_odd
+                  prediction.market_odd
                 )
-              : prediction.market_odd !== null
-                ? Number(
-                    prediction.market_odd
-                  )
-                : null,
-
-          marketOddSource:
-            (
-              normalizeStudioMarketKey(
-                prediction.manual_market_key
-              ) ===
-                normalizeStudioMarketKey(
-                  prediction.studio_market_key
-                ) &&
-              Number(
-                prediction.manual_market_odd
-              ) > 1
-            )
-              ? "MANUAL_ADMIN"
-              : prediction.market_odd !== null
-                ? "API_BOOKMAKER"
-                : null,
+              : null,
 
           value:
             prediction.value_percentage !==
@@ -13144,116 +13127,92 @@ app.post(
     }
   }
 );
-function normalizeStudioMarketKey(value = "") {
-  return String(value || "")
-    .trim()
-    .toUpperCase();
-}
+function applyManualOddToStudioSnapshot(prediction = {}) {
+  const snapshot =
+    prediction.studio_snapshot &&
+    typeof prediction.studio_snapshot === "object"
+      ? JSON.parse(JSON.stringify(prediction.studio_snapshot))
+      : prediction.studio_snapshot || null;
 
-function applyManualOddToStudioSnapshot(
-  snapshot,
-  prediction = {}
-) {
-  if (
-    !snapshot ||
-    typeof snapshot !== "object"
-  ) {
-    return snapshot;
-  }
+  if (!snapshot) return snapshot;
 
-  const manualOdd =
-    Number(
-      prediction.manual_market_odd
-    );
+  const currentMarketKey = String(
+    prediction.studio_market_key ||
+      snapshot?.primaryMarket?.key ||
+      snapshot?.bestDecision?.key ||
+      ""
+  ).trim().toUpperCase();
 
-  const manualMarketKey =
-    normalizeStudioMarketKey(
-      prediction.manual_market_key
-    );
+  const manualMarketKey = String(
+    prediction.manual_market_key || ""
+  ).trim().toUpperCase();
 
-  if (
-    !Number.isFinite(manualOdd) ||
-    manualOdd <= 1 ||
-    !manualMarketKey
-  ) {
-    return snapshot;
-  }
+  const manualOdd = Number(prediction.manual_market_odd);
+  const manualOddAvailable =
+    Boolean(currentMarketKey) &&
+    currentMarketKey === manualMarketKey &&
+    Number.isFinite(manualOdd) &&
+    manualOdd > 1;
+
+  if (!manualOddAvailable) return snapshot;
 
   const source =
     prediction.manual_odd_source ||
     "Saisie administrateur";
 
   const updateMarket = (market) => {
-    if (
-      !market ||
-      typeof market !== "object"
-    ) {
+    if (!market || typeof market !== "object") {
       return market;
     }
 
-    const marketKey =
-      normalizeStudioMarketKey(
-        market.key ||
-        market.marketKey
-      );
+    const marketKey = String(
+      market.key || market.marketKey || ""
+    ).trim().toUpperCase();
 
-    if (
-      !marketKey ||
-      marketKey !== manualMarketKey
-    ) {
+    if (marketKey && marketKey !== currentMarketKey) {
       return market;
     }
-
-    const bookmakerMetadata = {
-      bookmaker: source,
-      bookmakerSource:
-        "MANUAL_ADMIN",
-      manualOddMatchesMarket: true,
-      bookmakerOddUpdatedAt:
-        prediction.manual_odd_updated_at ||
-        null,
-    };
 
     return {
       ...market,
       bookmakerOdds: manualOdd,
-      oddsAvailable: true,
-      ...bookmakerMetadata,
-
+      bookmaker: source,
+      bookmakerSource: "MANUAL_ADMIN",
+      manualMarketOdd: manualOdd,
+      manualOddSource: source,
+      manualOddMatchesMarket: true,
       fairOdds: {
         ...(market.fairOdds || {}),
         bookmakerOdds: manualOdd,
+        bookmaker: source,
+        bookmakerSource: "MANUAL_ADMIN",
+        manualOddMatchesMarket: true,
+        bookmakerOddUpdatedAt:
+          prediction.manual_odd_updated_at || null,
         oddsAvailable: true,
-        ...bookmakerMetadata,
       },
     };
   };
 
-  return {
-    ...snapshot,
-    markets:
-      Array.isArray(snapshot.markets)
-        ? snapshot.markets.map(
-            updateMarket
-          )
-        : snapshot.markets,
+  if (snapshot.primaryMarket) {
+    snapshot.primaryMarket = updateMarket(snapshot.primaryMarket);
+  }
+  if (snapshot.bestDecision) {
+    snapshot.bestDecision = updateMarket(snapshot.bestDecision);
+  }
+  if (Array.isArray(snapshot.markets)) {
+    snapshot.markets = snapshot.markets.map(updateMarket);
+  }
 
-    primaryMarket:
-      updateMarket(
-        snapshot.primaryMarket
-      ),
-
-    bestDecision:
-      updateMarket(
-        snapshot.bestDecision
-      ),
-  };
+  return snapshot;
 }
 
 app.get(
   "/public/studio-snapshot/:fixtureId",
   async (req, res) => {
     try {
+      await ensureBilanV3Columns();
+
       const fixtureId = Number(
         req.params.fixtureId
       );
@@ -13346,6 +13305,24 @@ app.get(
             .studio_snapshot
         );
 
+      const studioSnapshot =
+        applyManualOddToStudioSnapshot(prediction);
+
+      const currentMarketKey = String(
+        prediction.studio_market_key || ""
+      ).trim().toUpperCase();
+
+      const manualMarketKey = String(
+        prediction.manual_market_key || ""
+      ).trim().toUpperCase();
+
+      const manualOdd = Number(prediction.manual_market_odd);
+      const manualOddAvailable =
+        Boolean(currentMarketKey) &&
+        currentMarketKey === manualMarketKey &&
+        Number.isFinite(manualOdd) &&
+        manualOdd > 1;
+
       return res.json({
         ok: true,
 
@@ -13430,13 +13407,33 @@ app.get(
               .studio_saved_at ||
             null,
 
-          snapshot:
-            applyManualOddToStudioSnapshot(
-              prediction
-                .studio_snapshot ||
-              null,
-              prediction
-            ),
+          snapshot: studioSnapshot || null,
+
+          bookmakerOdd:
+            manualOddAvailable ? manualOdd : null,
+
+          bookmakerOddSource:
+            manualOddAvailable
+              ? "MANUAL_ADMIN"
+              : null,
+
+          bookmaker:
+            manualOddAvailable
+              ? prediction.manual_odd_source ||
+                "Saisie administrateur"
+              : null,
+
+          bookmakerOddUpdatedAt:
+            manualOddAvailable
+              ? prediction.manual_odd_updated_at || null
+              : null,
+
+          bookmakerOddMarketKey:
+            manualOddAvailable ? manualMarketKey : null,
+
+          bookmakerOddMismatch:
+            prediction.manual_market_odd != null &&
+            !manualOddAvailable,
         },
 
         updatedAt:
@@ -13682,8 +13679,10 @@ function buildAutomaticStudioMarket({
   const isRecommended =
     isSelectedOutcome &&
     (
-      normalizedBetStatus === "BET" ||
-      normalizedBetStatus === "VALUE_BET"
+      normalizedBetStatus ===
+        "BET" ||
+      normalizedBetStatus ===
+        "VALUE_BET"
     );
 
   const decisionScore =
@@ -13700,52 +13699,48 @@ function buildAutomaticStudioMarket({
       normalizedProbability
     );
 
-  const currentMarketKey =
-    String(key || "")
-      .trim()
-      .toUpperCase();
+const currentMarketKey =
+  String(key || "")
+    .trim()
+    .toUpperCase();
 
-  const manualMarketKey =
-    String(
-      prediction.manual_market_key || ""
-    )
-      .trim()
-      .toUpperCase();
+const manualMarketKey =
+  String(
+    prediction.manual_market_key || ""
+  )
+    .trim()
+    .toUpperCase();
 
-  const manualOddMatchesMarket =
-    Boolean(currentMarketKey) &&
-    currentMarketKey === manualMarketKey;
+const manualOddMatchesMarket =
+  Boolean(currentMarketKey) &&
+  currentMarketKey === manualMarketKey;
 
-  const manualMarketOdd =
-    Number(
-      prediction.manual_market_odd
-    );
+const manualMarketOdd =
+  Number(
+    prediction.manual_market_odd
+  );
 
-  const manualOddAvailable =
-    isSelectedOutcome &&
-    manualOddMatchesMarket &&
-    Number.isFinite(manualMarketOdd) &&
-    manualMarketOdd > 1;
+const manualOddAvailable =
+  manualOddMatchesMarket &&
+  Number.isFinite(manualMarketOdd) &&
+  manualMarketOdd > 1;
 
-  const apiMarketOdd =
-    isSelectedOutcome
-      ? prediction.market_odd ??
+const marketOdd =
+  isSelectedOutcome
+    ? manualOddAvailable
+      ? manualMarketOdd
+      : prediction.market_odd ??
         prediction.marketOdd ??
         null
+    : null;
+
+const bookmakerSource =
+  manualOddAvailable
+    ? prediction.manual_odd_source ||
+      "Saisie administrateur"
+    : marketOdd != null
+      ? "API bookmaker"
       : null;
-
-  const marketOdd =
-    manualOddAvailable
-      ? manualMarketOdd
-      : apiMarketOdd;
-
-  const bookmakerSource =
-    manualOddAvailable
-      ? prediction.manual_odd_source ||
-        "Saisie administrateur"
-      : marketOdd != null
-        ? "API bookmaker"
-        : null;
 
   const value =
     isSelectedOutcome
@@ -13763,26 +13758,6 @@ function buildAutomaticStudioMarket({
     getStudioDecisionGrade(
       decisionScore
     );
-
-  const bookmakerMetadata = {
-    bookmaker:
-      bookmakerSource,
-
-    bookmakerSource:
-      manualOddAvailable
-        ? "MANUAL_ADMIN"
-        : marketOdd != null
-          ? "API_BOOKMAKER"
-          : null,
-
-    manualOddMatchesMarket,
-
-    bookmakerOddUpdatedAt:
-      manualOddAvailable
-        ? prediction.manual_odd_updated_at ||
-          null
-        : null,
-  };
 
   return {
     key,
@@ -13806,8 +13781,23 @@ function buildAutomaticStudioMarket({
 
     bookmakerOdds:
       marketOdd,
+    bookmaker:
+  bookmakerSource,
 
-    ...bookmakerMetadata,
+bookmakerSource:
+  manualOddAvailable
+    ? "MANUAL_ADMIN"
+    : marketOdd != null
+      ? "API_BOOKMAKER"
+      : null,
+
+manualOddMatchesMarket,
+
+bookmakerOddUpdatedAt:
+  manualOddAvailable
+    ? prediction.manual_odd_updated_at ||
+      null
+    : null,
 
     valueEdge:
       value,
@@ -13819,7 +13809,8 @@ function buildAutomaticStudioMarket({
       value,
 
     isValueBet:
-      decisionType === "VALUE_BET",
+      decisionType ===
+      "VALUE_BET",
 
     oddsAvailable:
       marketOdd != null,
@@ -13840,8 +13831,6 @@ function buildAutomaticStudioMarket({
       bookmakerOdds:
         marketOdd,
 
-      ...bookmakerMetadata,
-
       valueEdge:
         value,
 
@@ -13852,7 +13841,8 @@ function buildAutomaticStudioMarket({
         value,
 
       isValueBet:
-        decisionType === "VALUE_BET",
+        decisionType ===
+        "VALUE_BET",
 
       oddsAvailable:
         marketOdd != null,
@@ -13931,7 +13921,9 @@ function buildAutomaticStudioMarket({
 
       warnings:
         decisionType === "NO_BET"
-          ? ["Décision finale : NO_BET"]
+          ? [
+              "Décision finale : NO_BET",
+            ]
           : [],
 
       marketConsensus: {
@@ -14008,6 +14000,7 @@ function buildAutomaticStudioMarket({
     },
   };
 }
+
 
 
 /*
@@ -14601,11 +14594,6 @@ async function rebuildAutomaticStudioSnapshot(
           analysis_context,
 
           result_status,
-
-          manual_market_odd,
-          manual_market_key,
-          manual_odd_source,
-          manual_odd_updated_at,
 
           studio_saved_at,
           created_at,
@@ -18295,17 +18283,21 @@ async function ensureBilanV3Columns() {
   `);
 
   await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_predictions_manual_market_odd
+    ON predictions(manual_market_odd);
+  `);
+
+  /*
+   * Rattache les cotes déjà saisies avant l'ajout de manual_market_key
+   * au marché principal Brain Studio actuellement enregistré.
+   */
+  await pool.query(`
     UPDATE predictions
     SET manual_market_key = studio_market_key
     WHERE manual_market_odd IS NOT NULL
       AND manual_market_key IS NULL
       AND NULLIF(BTRIM(studio_market_key), '') IS NOT NULL;
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_predictions_manual_market_odd
-    ON predictions(manual_market_odd);
   `);
 }
 
@@ -19933,6 +19925,19 @@ app.listen(
           : "⏸️ désactivés"
       }`
     );
+
+    ensureBilanV3Columns()
+      .then(() => {
+        console.log(
+          "✅ Colonnes Bilan V3 et cotes manuelles vérifiées"
+        );
+      })
+      .catch((error) => {
+        console.error(
+          "ERREUR COLONNES BILAN V3 :",
+          error
+        );
+      });
 
     ensureStudioPredictionColumns()
       .catch((error) => {
