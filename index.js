@@ -88,39 +88,6 @@ app.use(
     limit: "10mb",
   })
 );
-
-/*
- * Garantit que les colonnes Bilan V3 existent avant toute requête.
- * La promesse est mutualisée : la migration n'est exécutée qu'une fois
- * par démarrage, même si plusieurs appels arrivent simultanément.
- */
-let bilanV3InitializationPromise = null;
-
-app.use(async (req, res, next) => {
-  try {
-    if (!bilanV3InitializationPromise) {
-      bilanV3InitializationPromise =
-        ensureBilanV3Columns();
-    }
-
-    await bilanV3InitializationPromise;
-    return next();
-  } catch (error) {
-    bilanV3InitializationPromise = null;
-
-    console.error(
-      "ERREUR INITIALISATION BILAN V3 :",
-      error
-    );
-
-    return res.status(500).json({
-      ok: false,
-      error:
-        error?.message ||
-        "Impossible d'initialiser les colonnes Bilan V3.",
-    });
-  }
-});
 const analysisCache = new Map();
 const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
 const FINISHED_FIXTURE_STATUSES = new Set([
@@ -13127,90 +13094,14 @@ app.post(
     }
   }
 );
-function applyManualOddToStudioSnapshot(prediction = {}) {
-  const snapshot =
-    prediction.studio_snapshot &&
-    typeof prediction.studio_snapshot === "object"
-      ? JSON.parse(JSON.stringify(prediction.studio_snapshot))
-      : prediction.studio_snapshot || null;
-
-  if (!snapshot) return snapshot;
-
-  const currentMarketKey = String(
-    prediction.studio_market_key ||
-      snapshot?.primaryMarket?.key ||
-      snapshot?.bestDecision?.key ||
-      ""
-  ).trim().toUpperCase();
-
-  const manualMarketKey = String(
-    prediction.manual_market_key || ""
-  ).trim().toUpperCase();
-
-  const manualOdd = Number(prediction.manual_market_odd);
-  const manualOddAvailable =
-    Boolean(currentMarketKey) &&
-    currentMarketKey === manualMarketKey &&
-    Number.isFinite(manualOdd) &&
-    manualOdd > 1;
-
-  if (!manualOddAvailable) return snapshot;
-
-  const source =
-    prediction.manual_odd_source ||
-    "Saisie administrateur";
-
-  const updateMarket = (market) => {
-    if (!market || typeof market !== "object") {
-      return market;
-    }
-
-    const marketKey = String(
-      market.key || market.marketKey || ""
-    ).trim().toUpperCase();
-
-    if (marketKey && marketKey !== currentMarketKey) {
-      return market;
-    }
-
-    return {
-      ...market,
-      bookmakerOdds: manualOdd,
-      bookmaker: source,
-      bookmakerSource: "MANUAL_ADMIN",
-      manualMarketOdd: manualOdd,
-      manualOddSource: source,
-      manualOddMatchesMarket: true,
-      fairOdds: {
-        ...(market.fairOdds || {}),
-        bookmakerOdds: manualOdd,
-        bookmaker: source,
-        bookmakerSource: "MANUAL_ADMIN",
-        manualOddMatchesMarket: true,
-        bookmakerOddUpdatedAt:
-          prediction.manual_odd_updated_at || null,
-        oddsAvailable: true,
-      },
-    };
-  };
-
-  if (snapshot.primaryMarket) {
-    snapshot.primaryMarket = updateMarket(snapshot.primaryMarket);
-  }
-  if (snapshot.bestDecision) {
-    snapshot.bestDecision = updateMarket(snapshot.bestDecision);
-  }
-  if (Array.isArray(snapshot.markets)) {
-    snapshot.markets = snapshot.markets.map(updateMarket);
-  }
-
-  return snapshot;
-}
-
 app.get(
   "/public/studio-snapshot/:fixtureId",
   async (req, res) => {
     try {
+      /*
+       * Garantit que les colonnes des cotes manuelles
+       * existent avant la requête SQL.
+       */
       await ensureBilanV3Columns();
 
       const fixtureId = Number(
@@ -13256,8 +13147,11 @@ app.get(
               manual_odd_updated_at,
 
               updated_at
+
             FROM predictions
+
             WHERE fixture_id = $1
+
             LIMIT 1
           `,
           [fixtureId]
@@ -13295,33 +13189,146 @@ app.get(
             Date.now()
           : false;
 
+      /*
+       * Copie du snapshot afin de ne pas modifier
+       * directement l’objet PostgreSQL.
+       */
+      const snapshot =
+        prediction.studio_snapshot &&
+        typeof prediction.studio_snapshot ===
+          "object"
+          ? JSON.parse(
+              JSON.stringify(
+                prediction.studio_snapshot
+              )
+            )
+          : null;
+
+      const currentMarketKey =
+        String(
+          prediction.studio_market_key ||
+            snapshot?.primaryMarket?.key ||
+            snapshot?.bestDecision?.key ||
+            ""
+        )
+          .trim()
+          .toUpperCase();
+
+      const manualMarketKey =
+        String(
+          prediction.manual_market_key ||
+            ""
+        )
+          .trim()
+          .toUpperCase();
+
+      const manualOdd =
+        Number(
+          prediction.manual_market_odd
+        );
+
+      const manualOddMatchesMarket =
+        Boolean(currentMarketKey) &&
+        Boolean(manualMarketKey) &&
+        currentMarketKey ===
+          manualMarketKey;
+
+      const manualOddAvailable =
+        manualOddMatchesMarket &&
+        Number.isFinite(manualOdd) &&
+        manualOdd > 1;
+
+      /*
+       * Le snapshot peut utiliser primaryMarket
+       * ou bestDecision selon sa version.
+       */
+      const primaryMarket =
+        snapshot?.primaryMarket ||
+        snapshot?.bestDecision ||
+        null;
+
+      if (
+        primaryMarket &&
+        manualOddAvailable
+      ) {
+        primaryMarket.fairOdds = {
+          ...(primaryMarket.fairOdds ||
+            {}),
+
+          bookmakerOdds:
+            manualOdd,
+
+          bookmaker:
+            prediction.manual_odd_source ||
+            "Saisie administrateur",
+
+          bookmakerSource:
+            "MANUAL_ADMIN",
+
+          manualOddMatchesMarket:
+            true,
+
+          bookmakerOddUpdatedAt:
+            prediction.manual_odd_updated_at ||
+            null,
+        };
+
+        primaryMarket.bookmakerOdds =
+          manualOdd;
+
+        primaryMarket.manualMarketOdd =
+          manualOdd;
+
+        primaryMarket.manual_market_odd =
+          manualOdd;
+      }
+
+      /*
+       * Sécurité supplémentaire :
+       * si primaryMarket et bestDecision sont
+       * deux objets différents, on enrichit les deux.
+       */
+      if (
+        snapshot?.bestDecision &&
+        snapshot.bestDecision !==
+          primaryMarket &&
+        manualOddAvailable
+      ) {
+        snapshot.bestDecision.fairOdds = {
+          ...(snapshot.bestDecision
+            .fairOdds || {}),
+
+          bookmakerOdds:
+            manualOdd,
+
+          bookmaker:
+            prediction.manual_odd_source ||
+            "Saisie administrateur",
+
+          bookmakerSource:
+            "MANUAL_ADMIN",
+
+          manualOddMatchesMarket:
+            true,
+
+          bookmakerOddUpdatedAt:
+            prediction.manual_odd_updated_at ||
+            null,
+        };
+
+        snapshot.bestDecision
+          .bookmakerOdds =
+          manualOdd;
+      }
+
       const hasStudioSnapshot =
         Boolean(
           prediction
             .studio_market_key ||
           prediction
             .studio_market_label ||
-          prediction
-            .studio_snapshot
+          snapshot
         );
-
-      const studioSnapshot =
-        applyManualOddToStudioSnapshot(prediction);
-
-      const currentMarketKey = String(
-        prediction.studio_market_key || ""
-      ).trim().toUpperCase();
-
-      const manualMarketKey = String(
-        prediction.manual_market_key || ""
-      ).trim().toUpperCase();
-
-      const manualOdd = Number(prediction.manual_market_odd);
-      const manualOddAvailable =
-        Boolean(currentMarketKey) &&
-        currentMarketKey === manualMarketKey &&
-        Number.isFinite(manualOdd) &&
-        manualOdd > 1;
 
       return res.json({
         ok: true,
@@ -13370,7 +13377,8 @@ app.get(
 
           probability:
             prediction
-              .studio_probability != null
+              .studio_probability !=
+            null
               ? Number(
                   prediction
                     .studio_probability
@@ -13407,10 +13415,15 @@ app.get(
               .studio_saved_at ||
             null,
 
-          snapshot: studioSnapshot || null,
+          snapshot,
 
+          /*
+           * Valeurs directes de secours pour le frontend.
+           */
           bookmakerOdd:
-            manualOddAvailable ? manualOdd : null,
+            manualOddAvailable
+              ? manualOdd
+              : null,
 
           bookmakerOddSource:
             manualOddAvailable
@@ -13419,21 +13432,26 @@ app.get(
 
           bookmaker:
             manualOddAvailable
-              ? prediction.manual_odd_source ||
+              ? prediction
+                  .manual_odd_source ||
                 "Saisie administrateur"
               : null,
 
           bookmakerOddUpdatedAt:
             manualOddAvailable
-              ? prediction.manual_odd_updated_at || null
+              ? prediction
+                  .manual_odd_updated_at ||
+                null
               : null,
 
-          bookmakerOddMarketKey:
-            manualOddAvailable ? manualMarketKey : null,
+          manualOddMatchesMarket,
 
           bookmakerOddMismatch:
-            prediction.manual_market_odd != null &&
-            !manualOddAvailable,
+            Number.isFinite(
+              manualOdd
+            ) &&
+            manualOdd > 1 &&
+            !manualOddMatchesMarket,
         },
 
         updatedAt:
@@ -18287,18 +18305,6 @@ async function ensureBilanV3Columns() {
       idx_predictions_manual_market_odd
     ON predictions(manual_market_odd);
   `);
-
-  /*
-   * Rattache les cotes déjà saisies avant l'ajout de manual_market_key
-   * au marché principal Brain Studio actuellement enregistré.
-   */
-  await pool.query(`
-    UPDATE predictions
-    SET manual_market_key = studio_market_key
-    WHERE manual_market_odd IS NOT NULL
-      AND manual_market_key IS NULL
-      AND NULLIF(BTRIM(studio_market_key), '') IS NOT NULL;
-  `);
 }
 
 function requireOptionalAdminKey(req, res) {
@@ -19925,19 +19931,6 @@ app.listen(
           : "⏸️ désactivés"
       }`
     );
-
-    ensureBilanV3Columns()
-      .then(() => {
-        console.log(
-          "✅ Colonnes Bilan V3 et cotes manuelles vérifiées"
-        );
-      })
-      .catch((error) => {
-        console.error(
-          "ERREUR COLONNES BILAN V3 :",
-          error
-        );
-      });
 
     ensureStudioPredictionColumns()
       .catch((error) => {
