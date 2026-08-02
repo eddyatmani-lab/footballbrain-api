@@ -19181,6 +19181,88 @@ app.get("/internal/admin/manual-odds", async (req, res) => {
   }
 });
 
+
+
+/*
+ * Performance financière publique en lecture seule.
+ * Le suivi officiel commence le 02/08/2026 et utilise uniquement :
+ * - le marché principal Brain Studio ;
+ * - une cote saisie manuellement par l'administrateur ;
+ * - un match joué à partir du 02/08/2026 ;
+ * - un résultat financier déjà calculé.
+ *
+ * Cette route ne permet aucune modification et n'expose pas les outils Admin.
+ */
+const REAL_PERFORMANCE_TRACKING_START_DATE = "2026-08-02";
+
+app.get("/public/bilan/real-performance", async (req, res) => {
+  try {
+    await ensureBilanV3Columns();
+    await refreshManualOddsProfits();
+
+    const result = await pool.query(
+      `
+        SELECT
+          COUNT(DISTINCT p.fixture_id)::INTEGER AS settled_matches,
+
+          COALESCE(
+            SUM(p.manual_stake_units) FILTER (
+              WHERE p.manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS total_stake,
+
+          COALESCE(
+            SUM(p.manual_profit_units) FILTER (
+              WHERE p.manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS total_profit
+
+        FROM predictions p
+
+        WHERE p.fixture_date::date >= $1::date
+          AND NULLIF(BTRIM(p.studio_market_key), '') IS NOT NULL
+          AND p.manual_market_odd IS NOT NULL
+          AND p.manual_profit_units IS NOT NULL
+      `,
+      [REAL_PERFORMANCE_TRACKING_START_DATE]
+    );
+
+    const row = result.rows[0] || {};
+    const settledMatches = Number(row.settled_matches || 0);
+    const totalStake = Number(row.total_stake || 0);
+    const totalProfit = Number(row.total_profit || 0);
+    const roi =
+      totalStake > 0
+        ? Number(((totalProfit / totalStake) * 100).toFixed(2))
+        : null;
+
+    return res.json({
+      ok: true,
+      trackingStartDate: REAL_PERFORMANCE_TRACKING_START_DATE,
+      settledMatches,
+      totalStake: Number(totalStake.toFixed(2)),
+      totalProfit: Number(totalProfit.toFixed(2)),
+      roi,
+    });
+  } catch (error) {
+    console.error("ERREUR PERFORMANCE FINANCIÈRE RÉELLE :", error);
+
+    return res.status(500).json({
+      ok: false,
+      trackingStartDate: REAL_PERFORMANCE_TRACKING_START_DATE,
+      settledMatches: 0,
+      totalStake: 0,
+      totalProfit: 0,
+      roi: null,
+      error:
+        error?.message ||
+        "Impossible de charger la performance financière réelle.",
+    });
+  }
+});
+
 async function saveOrUpdateManualOdd(req, res) {
   if (!requireOptionalAdminKey(req, res)) return;
 
