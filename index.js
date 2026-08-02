@@ -21634,6 +21634,7 @@ app.get("/public/statistics/dashboard", async (req, res) => {
       pool.query(`
         SELECT
           COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue') AS competition,
+          COUNT(*)::INTEGER AS volume,
           COUNT(*) FILTER (
             WHERE result_status = 'COMPLETED'
               AND COALESCE(official_market_won, won) IS NOT NULL
@@ -21641,106 +21642,6 @@ app.get("/public/statistics/dashboard", async (req, res) => {
           COUNT(*) FILTER (
             WHERE result_status = 'COMPLETED'
               AND COALESCE(official_market_won, won) = TRUE
-          )::INTEGER AS wins,
-          COUNT(*) FILTER (
-            WHERE manual_profit_units IS NOT NULL
-          )::INTEGER AS settled_bets,
-          COALESCE(
-            SUM(manual_stake_units) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-            ),
-            0
-          )::NUMERIC AS stake,
-          COALESCE(
-            SUM(manual_profit_units) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-            ),
-            0
-          )::NUMERIC AS profit,
-          ROUND(
-            AVG(manual_market_odd) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-                AND manual_market_odd > 1
-            )::NUMERIC,
-            2
-          ) AS average_odd
-        FROM predictions
-        WHERE result_status = 'COMPLETED'
-        GROUP BY COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue')
-        HAVING COUNT(*) FILTER (
-          WHERE COALESCE(official_market_won, won) IS NOT NULL
-        ) > 0
-        ORDER BY evaluated DESC, competition ASC
-        LIMIT 100
-      `),
-
-      pool.query(`
-        WITH normalized_markets AS (
-          SELECT
-            CASE
-              WHEN UPPER(REGEXP_REPLACE(COALESCE(
-                NULLIF(BTRIM(official_tracked_market_key), ''),
-                NULLIF(BTRIM(studio_market_key), ''),
-                'UNKNOWN'
-              ), '[^A-Z0-9]', '', 'g')) IN ('HOME', 'HOMEWIN', '1')
-                THEN 'HOME_WIN'
-              WHEN UPPER(REGEXP_REPLACE(COALESCE(
-                NULLIF(BTRIM(official_tracked_market_key), ''),
-                NULLIF(BTRIM(studio_market_key), ''),
-                'UNKNOWN'
-              ), '[^A-Z0-9]', '', 'g')) IN ('AWAY', 'AWAYWIN', '2')
-                THEN 'AWAY_WIN'
-              WHEN UPPER(REGEXP_REPLACE(COALESCE(
-                NULLIF(BTRIM(official_tracked_market_key), ''),
-                NULLIF(BTRIM(studio_market_key), ''),
-                'UNKNOWN'
-              ), '[^A-Z0-9]', '', 'g')) IN ('DRAW', 'X', 'N')
-                THEN 'DRAW'
-              WHEN UPPER(REGEXP_REPLACE(COALESCE(
-                NULLIF(BTRIM(official_tracked_market_key), ''),
-                NULLIF(BTRIM(studio_market_key), ''),
-                'UNKNOWN'
-              ), '[^A-Z0-9]', '', 'g')) IN ('BTTS', 'BTTSYES', 'GG')
-                THEN 'BTTS'
-              WHEN UPPER(REGEXP_REPLACE(COALESCE(
-                NULLIF(BTRIM(official_tracked_market_key), ''),
-                NULLIF(BTRIM(studio_market_key), ''),
-                'UNKNOWN'
-              ), '[^A-Z0-9]', '', 'g')) IN ('NOBTTS', 'BTTSNO', 'NG')
-                THEN 'NO_BTTS'
-              WHEN UPPER(REGEXP_REPLACE(COALESCE(
-                NULLIF(BTRIM(official_tracked_market_key), ''),
-                NULLIF(BTRIM(studio_market_key), ''),
-                'UNKNOWN'
-              ), '[^A-Z0-9]', '', 'g')) IN ('OVER25', 'OVER250', 'PLUS25')
-                THEN 'OVER25'
-              WHEN UPPER(REGEXP_REPLACE(COALESCE(
-                NULLIF(BTRIM(official_tracked_market_key), ''),
-                NULLIF(BTRIM(studio_market_key), ''),
-                'UNKNOWN'
-              ), '[^A-Z0-9]', '', 'g')) IN ('UNDER25', 'UNDER250', 'MOINS25')
-                THEN 'UNDER25'
-              ELSE UPPER(REGEXP_REPLACE(COALESCE(
-                NULLIF(BTRIM(official_tracked_market_key), ''),
-                NULLIF(BTRIM(studio_market_key), ''),
-                'UNKNOWN'
-              ), '[^A-Z0-9]', '', 'g'))
-            END AS market_key,
-            result_status,
-            COALESCE(official_market_won, won) AS market_won,
-            manual_stake_units,
-            manual_profit_units,
-            manual_market_odd
-          FROM predictions
-          WHERE result_status = 'COMPLETED'
-        )
-        SELECT
-          market_key,
-          COUNT(*) FILTER (
-            WHERE market_won IS NOT NULL
-          )::INTEGER AS evaluated,
-          COUNT(*) FILTER (
-            WHERE market_won = TRUE
           )::INTEGER AS wins,
           COUNT(*) FILTER (
             WHERE manual_profit_units IS NOT NULL
@@ -21775,13 +21676,77 @@ app.get("/public/statistics/dashboard", async (req, res) => {
               )
             )::NUMERIC,
             2
-          ) AS average_odd
-        FROM normalized_markets
-        GROUP BY market_key
+          ) AS average_odd,
+          MAX(fixture_date) AS last_match
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+        GROUP BY COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue')
         HAVING COUNT(*) FILTER (
-          WHERE market_won IS NOT NULL
+          WHERE COALESCE(official_market_won, won) IS NOT NULL
         ) > 0
-        ORDER BY evaluated DESC, market_key ASC
+        ORDER BY volume DESC, competition ASC
+        LIMIT 100
+      `),
+
+      pool.query(`
+        SELECT
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), ''),
+            'UNKNOWN'
+          ) AS market_key,
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché inconnu'
+          ) AS market_label,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) IS NOT NULL
+          )::INTEGER AS evaluated,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = TRUE
+          )::INTEGER AS wins,
+          COUNT(*) FILTER (
+            WHERE manual_profit_units IS NOT NULL
+          )::INTEGER AS settled_bets,
+          COALESCE(
+            SUM(manual_stake_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS stake,
+          COALESCE(
+            SUM(manual_profit_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS profit,
+          ROUND(
+            AVG(manual_market_odd) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+                AND manual_market_odd > 1
+            )::NUMERIC,
+            2
+          ) AS average_odd
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+        GROUP BY
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), ''),
+            'UNKNOWN'
+          ),
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché inconnu'
+          )
+        HAVING COUNT(*) FILTER (
+          WHERE COALESCE(official_market_won, won) IS NOT NULL
+        ) > 0
+        ORDER BY evaluated DESC, market_label ASC
       `),
 
       pool.query(`
@@ -21917,6 +21882,7 @@ app.get("/public/statistics/dashboard", async (req, res) => {
 
       return {
         ...row,
+        volume: Number(row.volume || evaluated || 0),
         evaluated,
         wins: rowWins,
         accuracy: evaluated > 0
@@ -21934,28 +21900,30 @@ app.get("/public/statistics/dashboard", async (req, res) => {
       };
     };
 
-    const competitions = competitionsResult.rows.map((row) => ({
+    const competitions = competitionsResult.rows.map((row) => {
+      const mapped = mapPerformanceRow(row);
+      const settledBets = Number(mapped.settledBets || 0);
+
+      return {
+        ...mapped,
+        name: row.competition,
+        lastMatch: row.last_match || null,
+        sampleQuality:
+          settledBets >= 100
+            ? "excellent"
+            : settledBets >= 50
+              ? "bon"
+              : settledBets >= 20
+                ? "moyen"
+                : "faible",
+      };
+    });
+
+    const markets = marketsResult.rows.map((row) => ({
       ...mapPerformanceRow(row),
-      name: row.competition,
+      key: row.market_key,
+      label: row.market_label,
     }));
-
-    const publicMarketLabels = {
-      HOME_WIN: "Victoire domicile",
-      AWAY_WIN: "Victoire extérieur",
-      DRAW: "Match nul",
-      BTTS: "Les deux équipes marquent",
-      NO_BTTS: "Les deux équipes ne marquent pas",
-      UNDER25: "Moins de 2,5 buts",
-      OVER25: "Plus de 2,5 buts",
-    };
-
-    const markets = marketsResult.rows
-      .filter((row) => publicMarketLabels[row.market_key])
-      .map((row) => ({
-        ...mapPerformanceRow(row),
-        key: row.market_key,
-        label: publicMarketLabels[row.market_key],
-      }));
 
     const oddsBands = oddsBandsResult.rows.map((row) => ({
       ...mapPerformanceRow(row),
