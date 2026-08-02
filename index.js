@@ -13320,7 +13320,68 @@ app.get(
           .bookmakerOdds =
           manualOdd;
       }
+if (
+  Array.isArray(snapshot?.markets) &&
+  manualOddAvailable
+) {
+  snapshot.markets =
+    snapshot.markets.map(
+      (market) => {
+        const marketKey =
+          String(
+            market?.key ||
+              market?.marketKey ||
+              ""
+          )
+            .trim()
+            .toUpperCase();
 
+        if (
+          marketKey !==
+          currentMarketKey
+        ) {
+          return market;
+        }
+
+        return {
+          ...market,
+
+          bookmakerOdds:
+            manualOdd,
+
+          manualMarketOdd:
+            manualOdd,
+
+          manual_market_odd:
+            manualOdd,
+
+          fairOdds: {
+            ...(market.fairOdds ||
+              {}),
+
+            bookmakerOdds:
+              manualOdd,
+
+            bookmaker:
+              prediction
+                .manual_odd_source ||
+              "Saisie administrateur",
+
+            bookmakerSource:
+              "MANUAL_ADMIN",
+
+            manualOddMatchesMarket:
+              true,
+
+            bookmakerOddUpdatedAt:
+              prediction
+                .manual_odd_updated_at ||
+              null,
+          },
+        };
+      }
+    );
+}
       const hasStudioSnapshot =
         Boolean(
           prediction
