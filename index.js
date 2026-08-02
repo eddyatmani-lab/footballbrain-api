@@ -11824,6 +11824,9 @@ app.get(
   "/public/bilan/reports",
   async (req, res) => {
     try {
+      await ensureBilanV3Columns();
+      await refreshManualOddsProfits();
+
       const requestedLimit = Number(
         req.query.limit
       );
@@ -11893,6 +11896,28 @@ app.get(
             studio_decision_type,
             studio_decision_grade,
             studio_analysis_version,
+
+            manual_market_odd,
+            manual_stake_units,
+            manual_profit_units,
+            manual_roi_percent,
+
+            official_tracked_market_key,
+            official_tracked_market_label,
+            official_tracked_probability,
+            official_tracked_decision_score,
+            official_tracked_at,
+            official_market_won,
+
+            prematch_final_market_key,
+            prematch_final_market_label,
+            prematch_final_probability,
+            prematch_final_decision_score,
+            prematch_final_captured_at,
+            prematch_final_market_won,
+
+            market_changed,
+            market_change_outcome,
 
             updated_at
           FROM predictions
@@ -12851,6 +12876,8 @@ app.post(
   "/public/studio-snapshot/:fixtureId",
   async (req, res) => {
     try {
+      await ensureBilanV3Columns();
+
       const fixtureId = Number(
         req.params.fixtureId
       );
@@ -13049,6 +13076,36 @@ app.post(
               false,
           },
         });
+
+      /*
+       * Le dernier marché principal avant le coup d'envoi reste dynamique.
+       * Chaque snapshot accepté remplace le précédent. Dès le coup d'envoi,
+       * la route est verrouillée et ces valeurs deviennent définitives.
+       */
+      await pool.query(
+        `
+          UPDATE predictions
+          SET
+            prematch_final_market_key = $2,
+            prematch_final_market_label = $3,
+            prematch_final_probability = $4,
+            prematch_final_decision_score = $5,
+            prematch_final_captured_at = NOW(),
+            updated_at = NOW()
+          WHERE fixture_id = $1
+        `,
+        [
+          fixtureId,
+          primaryMarket.key || null,
+          primaryMarket.label || null,
+          primaryMarket?.fairOdds?.calibratedProbability ??
+            primaryMarket?.probability ??
+            null,
+          primaryMarket?.decision?.score ??
+            primaryMarket?.score ??
+            null,
+        ]
+      );
 
       return res.json({
         ok: true,
@@ -18358,13 +18415,100 @@ async function ensureBilanV3Columns() {
       ADD COLUMN IF NOT EXISTS manual_odd_updated_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS manual_odd_entered_by TEXT,
       ADD COLUMN IF NOT EXISTS manual_profit_units NUMERIC,
-      ADD COLUMN IF NOT EXISTS manual_roi_percent NUMERIC;
+      ADD COLUMN IF NOT EXISTS manual_roi_percent NUMERIC,
+
+      ADD COLUMN IF NOT EXISTS official_tracked_market_key TEXT,
+      ADD COLUMN IF NOT EXISTS official_tracked_market_label TEXT,
+      ADD COLUMN IF NOT EXISTS official_tracked_probability NUMERIC,
+      ADD COLUMN IF NOT EXISTS official_tracked_decision_score NUMERIC,
+      ADD COLUMN IF NOT EXISTS official_tracked_at TIMESTAMPTZ,
+
+      ADD COLUMN IF NOT EXISTS prematch_final_market_key TEXT,
+      ADD COLUMN IF NOT EXISTS prematch_final_market_label TEXT,
+      ADD COLUMN IF NOT EXISTS prematch_final_probability NUMERIC,
+      ADD COLUMN IF NOT EXISTS prematch_final_decision_score NUMERIC,
+      ADD COLUMN IF NOT EXISTS prematch_final_captured_at TIMESTAMPTZ,
+
+      ADD COLUMN IF NOT EXISTS official_market_won BOOLEAN,
+      ADD COLUMN IF NOT EXISTS prematch_final_market_won BOOLEAN,
+      ADD COLUMN IF NOT EXISTS market_changed BOOLEAN,
+      ADD COLUMN IF NOT EXISTS market_change_outcome TEXT;
   `);
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS
       idx_predictions_manual_market_odd
     ON predictions(manual_market_odd);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_predictions_official_tracked_market
+    ON predictions(official_tracked_market_key);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_predictions_prematch_final_market
+    ON predictions(prematch_final_market_key);
+  `);
+
+  /*
+   * Migration douce des cotes déjà saisies avant la création
+   * du double suivi. Le marché officiel est celui auquel la cote
+   * manuelle était déjà rattachée. Le dernier marché avant match
+   * part du dernier snapshot connu et continuera ensuite à évoluer.
+   */
+  await pool.query(`
+    UPDATE predictions
+    SET
+      official_tracked_market_key = COALESCE(
+        official_tracked_market_key,
+        manual_market_key,
+        studio_market_key
+      ),
+      official_tracked_market_label = COALESCE(
+        official_tracked_market_label,
+        CASE
+          WHEN COALESCE(manual_market_key, studio_market_key) = studio_market_key
+          THEN studio_market_label
+          ELSE manual_market_key
+        END
+      ),
+      official_tracked_probability = COALESCE(
+        official_tracked_probability,
+        studio_probability
+      ),
+      official_tracked_decision_score = COALESCE(
+        official_tracked_decision_score,
+        studio_decision_score
+      ),
+      official_tracked_at = COALESCE(
+        official_tracked_at,
+        manual_odd_entered_at,
+        manual_odd_updated_at
+      ),
+      prematch_final_market_key = COALESCE(
+        prematch_final_market_key,
+        studio_market_key
+      ),
+      prematch_final_market_label = COALESCE(
+        prematch_final_market_label,
+        studio_market_label
+      ),
+      prematch_final_probability = COALESCE(
+        prematch_final_probability,
+        studio_probability
+      ),
+      prematch_final_decision_score = COALESCE(
+        prematch_final_decision_score,
+        studio_decision_score
+      ),
+      prematch_final_captured_at = COALESCE(
+        prematch_final_captured_at,
+        studio_saved_at
+      )
+    WHERE manual_market_odd IS NOT NULL;
   `);
 }
 
@@ -19115,14 +19259,22 @@ async function refreshManualOddsProfits() {
       result_status,
       home_goals,
       away_goals,
-      studio_market_key,
+
       manual_market_odd,
       manual_stake_units,
       manual_profit_units,
-      manual_roi_percent
+      manual_roi_percent,
+
+      official_tracked_market_key,
+      prematch_final_market_key,
+
+      official_market_won,
+      prematch_final_market_won,
+      market_changed,
+      market_change_outcome
     FROM predictions
     WHERE manual_market_odd IS NOT NULL
-      AND studio_market_key IS NOT NULL
+      AND official_tracked_market_key IS NOT NULL
       AND result_status = 'COMPLETED'
       AND home_goals IS NOT NULL
       AND away_goals IS NOT NULL
@@ -19133,23 +19285,68 @@ async function refreshManualOddsProfits() {
   let unsupported = 0;
 
   for (const prediction of result.rows) {
-    const predictionCorrect =
+    const officialWon =
       evaluateManualOddsMarketResult({
-        marketKey: prediction.studio_market_key,
+        marketKey:
+          prediction.official_tracked_market_key,
         homeGoals: prediction.home_goals,
         awayGoals: prediction.away_goals,
       });
 
-    if (typeof predictionCorrect !== "boolean") {
+    const prematchMarketKey =
+      prediction.prematch_final_market_key ||
+      prediction.official_tracked_market_key;
+
+    const prematchWon =
+      evaluateManualOddsMarketResult({
+        marketKey: prematchMarketKey,
+        homeGoals: prediction.home_goals,
+        awayGoals: prediction.away_goals,
+      });
+
+    if (typeof officialWon !== "boolean") {
       unsupported += 1;
       continue;
+    }
+
+    const normalizedOfficialKey =
+      normalizeManualOddsMarketKey(
+        prediction.official_tracked_market_key
+      );
+
+    const normalizedPrematchKey =
+      normalizeManualOddsMarketKey(
+        prematchMarketKey
+      );
+
+    const marketChanged =
+      Boolean(normalizedOfficialKey) &&
+      Boolean(normalizedPrematchKey) &&
+      normalizedOfficialKey !== normalizedPrematchKey;
+
+    let marketChangeOutcome = "INCOMPLETE";
+
+    if (typeof prematchWon === "boolean") {
+      if (!marketChanged) {
+        marketChangeOutcome = officialWon
+          ? "STABLE_WON"
+          : "STABLE_LOST";
+      } else if (!officialWon && prematchWon) {
+        marketChangeOutcome = "BENEFICIAL";
+      } else if (officialWon && !prematchWon) {
+        marketChangeOutcome = "HARMFUL";
+      } else if (officialWon && prematchWon) {
+        marketChangeOutcome = "BOTH_WON";
+      } else {
+        marketChangeOutcome = "BOTH_LOST";
+      }
     }
 
     const performance =
       calculateManualBetPerformance({
         odd: prediction.manual_market_odd,
         stake: prediction.manual_stake_units,
-        predictionCorrect,
+        predictionCorrect: officialWon,
       });
 
     const currentProfit =
@@ -19162,10 +19359,15 @@ async function refreshManualOddsProfits() {
         ? null
         : Number(prediction.manual_roi_percent);
 
-    if (
+    const noChange =
       currentProfit === performance.profitUnits &&
-      currentRoi === performance.roiPercent
-    ) {
+      currentRoi === performance.roiPercent &&
+      prediction.official_market_won === officialWon &&
+      prediction.prematch_final_market_won === prematchWon &&
+      prediction.market_changed === marketChanged &&
+      prediction.market_change_outcome === marketChangeOutcome;
+
+    if (noChange) {
       unchanged += 1;
       continue;
     }
@@ -19176,6 +19378,10 @@ async function refreshManualOddsProfits() {
         SET
           manual_profit_units = $2,
           manual_roi_percent = $3,
+          official_market_won = $4,
+          prematch_final_market_won = $5,
+          market_changed = $6,
+          market_change_outcome = $7,
           updated_at = NOW()
         WHERE fixture_id = $1
       `,
@@ -19183,6 +19389,12 @@ async function refreshManualOddsProfits() {
         prediction.fixture_id,
         performance.profitUnits,
         performance.roiPercent,
+        officialWon,
+        typeof prematchWon === "boolean"
+          ? prematchWon
+          : null,
+        marketChanged,
+        marketChangeOutcome,
       ]
     );
 
@@ -19377,6 +19589,23 @@ app.get("/internal/admin/manual-odds", async (req, res) => {
           p.manual_odd_entered_at,
           p.manual_odd_updated_at,
           p.manual_odd_entered_by,
+
+          p.official_tracked_market_key,
+          p.official_tracked_market_label,
+          p.official_tracked_probability,
+          p.official_tracked_decision_score,
+          p.official_tracked_at,
+          p.official_market_won,
+
+          p.prematch_final_market_key,
+          p.prematch_final_market_label,
+          p.prematch_final_probability,
+          p.prematch_final_decision_score,
+          p.prematch_final_captured_at,
+          p.prematch_final_market_won,
+
+          p.market_changed,
+          p.market_change_outcome,
 
           p.updated_at
         FROM predictions p
@@ -19624,6 +19853,9 @@ async function saveOrUpdateManualOdd(req, res) {
           home_goals,
           away_goals,
           studio_market_key,
+          studio_market_label,
+          studio_probability,
+          studio_decision_score,
           manual_market_odd
         FROM predictions
         WHERE fixture_id = $1
@@ -19681,7 +19913,7 @@ async function saveOrUpdateManualOdd(req, res) {
         UPDATE predictions
         SET
           manual_market_odd = $2,
-        manual_market_key = studio_market_key,
+          manual_market_key = studio_market_key,
           manual_stake_units = $3,
           manual_profit_units = $4,
           manual_roi_percent = $5,
@@ -19690,6 +19922,44 @@ async function saveOrUpdateManualOdd(req, res) {
             COALESCE(manual_odd_entered_at, NOW()),
           manual_odd_updated_at = NOW(),
           manual_odd_entered_by = $7,
+
+          /*
+           * La saisie Admin fige le pari officiel suivi financièrement.
+           * Une nouvelle sauvegarde explicite avant match permet à
+           * l'administrateur de remplacer volontairement ce pari officiel.
+           */
+          official_tracked_market_key = studio_market_key,
+          official_tracked_market_label = studio_market_label,
+          official_tracked_probability = studio_probability,
+          official_tracked_decision_score = studio_decision_score,
+          official_tracked_at = NOW(),
+
+          /* Point de départ du dernier marché avant match. */
+          prematch_final_market_key = COALESCE(
+            prematch_final_market_key,
+            studio_market_key
+          ),
+          prematch_final_market_label = COALESCE(
+            prematch_final_market_label,
+            studio_market_label
+          ),
+          prematch_final_probability = COALESCE(
+            prematch_final_probability,
+            studio_probability
+          ),
+          prematch_final_decision_score = COALESCE(
+            prematch_final_decision_score,
+            studio_decision_score
+          ),
+          prematch_final_captured_at = COALESCE(
+            prematch_final_captured_at,
+            NOW()
+          ),
+
+          official_market_won = NULL,
+          prematch_final_market_won = NULL,
+          market_changed = NULL,
+          market_change_outcome = NULL,
           updated_at = NOW()
         WHERE fixture_id = $1
         RETURNING *
@@ -19771,6 +20041,15 @@ app.delete(
             manual_odd_entered_at = NULL,
             manual_odd_updated_at = NOW(),
             manual_odd_entered_by = NULL,
+            official_tracked_market_key = NULL,
+            official_tracked_market_label = NULL,
+            official_tracked_probability = NULL,
+            official_tracked_decision_score = NULL,
+            official_tracked_at = NULL,
+            official_market_won = NULL,
+            prematch_final_market_won = NULL,
+            market_changed = NULL,
+            market_change_outcome = NULL,
             updated_at = NOW()
           WHERE fixture_id = $1
           RETURNING fixture_id
