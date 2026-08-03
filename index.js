@@ -1745,6 +1745,17 @@ const advancedXGModel =
       away: 1.1,
     },
 
+    /*
+     * Le Poisson reste un baseline unique.
+     * Il n'est plus recopié dans season et venue.
+     */
+    baselineExpectedGoals: {
+      home:
+        poissonModel.expectedGoals.home,
+      away:
+        poissonModel.expectedGoals.away,
+    },
+
     home: {
       recent: {
         goalsFor:
@@ -1753,18 +1764,20 @@ const advancedXGModel =
           homeGoalsData.goalsAgainst,
       },
 
+      /*
+       * À remplacer plus tard par de vraies statistiques saison.
+       */
       season: {
-        goalsForPerMatch:
-          poissonModel.expectedGoals.home,
-        goalsAgainstPerMatch:
-          poissonModel.expectedGoals.away,
+        goalsForPerMatch: null,
+        goalsAgainstPerMatch: null,
       },
 
+      /*
+       * À remplacer plus tard par de vraies statistiques à domicile.
+       */
       venue: {
-        goalsForPerMatch:
-          poissonModel.expectedGoals.home,
-        goalsAgainstPerMatch:
-          poissonModel.expectedGoals.away,
+        goalsForPerMatch: null,
+        goalsAgainstPerMatch: null,
       },
 
       injuryImpact: 0,
@@ -1781,18 +1794,20 @@ const advancedXGModel =
           awayGoalsData.goalsAgainst,
       },
 
+      /*
+       * À remplacer plus tard par de vraies statistiques saison.
+       */
       season: {
-        goalsForPerMatch:
-          poissonModel.expectedGoals.away,
-        goalsAgainstPerMatch:
-          poissonModel.expectedGoals.home,
+        goalsForPerMatch: null,
+        goalsAgainstPerMatch: null,
       },
 
+      /*
+       * À remplacer plus tard par de vraies statistiques à l'extérieur.
+       */
       venue: {
-        goalsForPerMatch:
-          poissonModel.expectedGoals.away,
-        goalsAgainstPerMatch:
-          poissonModel.expectedGoals.home,
+        goalsForPerMatch: null,
+        goalsAgainstPerMatch: null,
       },
 
       injuryImpact: 0,
@@ -1810,7 +1825,6 @@ const advancedXGModel =
         Array.isArray(injuries),
     },
   });
-
 const xgConfidence =
   computeXgConfidence({
     homeRecentForm,
