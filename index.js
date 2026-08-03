@@ -41,6 +41,7 @@ const {
 const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
+const { createOddsSyncService } = require("./src/services/OddsSyncService");
 const cors = require("cors");
 const {
   FootballMonteCarlo,
@@ -292,6 +293,15 @@ async function callApiFootball(
 
   return response;
 }
+const oddsSyncService = createOddsSyncService({
+  app,
+  pool,
+  callApiFootball,
+  schedulersEnabled: AUTOMATIC_SCHEDULERS_ENABLED,
+});
+
+oddsSyncService.registerRoutes();
+
 function isExcludedFixture(
   fixture = {}
 ) {
@@ -23427,8 +23437,17 @@ async function loadDailyPortfolio(date = null) {
     [portfolioDate]
   );
   const candidates = [];
+  const automaticOddsMap = await oddsSyncService.getCurrentOddsMap(
+    result.rows.map((prediction) => prediction.fixture_id)
+  );
+
   for (const prediction of result.rows) {
-    for (const market of portfolioSnapshotMarkets(prediction)) {
+    for (const rawMarket of portfolioSnapshotMarkets(prediction)) {
+      const market = oddsSyncService.applyOddsToMarket(
+        prediction.fixture_id,
+        rawMarket,
+        automaticOddsMap
+      );
       const candidate = portfolioCandidateFromMarket(prediction, market);
       if (candidate) candidates.push(candidate);
     }
@@ -23759,11 +23778,21 @@ app.listen(
         );
       });
 
+    oddsSyncService
+      .ensureTables()
+      .catch((error) => {
+        console.error(
+          "ERREUR TABLES ODDS SYNC :",
+          error
+        );
+      });
+
     /*
      * Les initialisations SQL restent actives.
      * Seules les tâches consommatrices d'API
      * dépendent de l'interrupteur.
      */
+    oddsSyncService.startScheduler();
     startAutomaticCalibrationScheduler();
     startDailyTicketScheduler();
     startAutomaticSchedulers();
