@@ -13280,16 +13280,33 @@ app.get(
           prediction.manual_market_odd
         );
 
-      const manualOddMatchesMarket =
-        Boolean(currentMarketKey) &&
-        Boolean(manualMarketKey) &&
-        currentMarketKey ===
-          manualMarketKey;
+      const normalizedCurrentMarketKey =
+  normalizeManualOddsMarketKey(
+    currentMarketKey
+  );
 
-      const manualOddAvailable =
-        manualOddMatchesMarket &&
-        Number.isFinite(manualOdd) &&
-        manualOdd > 1;
+const normalizedManualMarketKey =
+  normalizeManualOddsMarketKey(
+    manualMarketKey
+  );
+
+const manualOddIsValid =
+  Number.isFinite(manualOdd) &&
+  manualOdd > 1;
+
+const manualOddMatchesMarket =
+  Boolean(
+    normalizedCurrentMarketKey
+  ) &&
+  Boolean(
+    normalizedManualMarketKey
+  ) &&
+  normalizedCurrentMarketKey ===
+    normalizedManualMarketKey;
+
+const manualOddAvailable =
+  manualOddIsValid &&
+  manualOddMatchesMarket;
 
       /*
        * Le snapshot peut utiliser primaryMarket
@@ -13375,11 +13392,97 @@ app.get(
       }
 if (
   Array.isArray(snapshot?.markets) &&
-  manualOddAvailable
+  manualOddIsValid &&
+  normalizedManualMarketKey
 ) {
   snapshot.markets =
     snapshot.markets.map(
       (market) => {
+        const normalizedSnapshotMarketKey =
+          normalizeManualOddsMarketKey(
+            market?.key ||
+            market?.marketKey ||
+            ""
+          );
+
+        const matchesManualMarket =
+          Boolean(
+            normalizedSnapshotMarketKey
+          ) &&
+          normalizedSnapshotMarketKey ===
+            normalizedManualMarketKey;
+
+        if (!matchesManualMarket) {
+          return market;
+        }
+
+        return {
+          ...market,
+
+          bookmakerOdds:
+            manualOdd,
+
+          manualMarketOdd:
+            manualOdd,
+
+          manual_market_odd:
+            manualOdd,
+
+          bookmaker:
+            prediction
+              .manual_odd_source ||
+            "Saisie administrateur",
+
+          bookmakerSource:
+            "MANUAL_ADMIN",
+
+          manualMarketKey:
+            normalizedManualMarketKey,
+
+          manual_market_key:
+            normalizedManualMarketKey,
+
+          manualOddMatchesMarket:
+            true,
+
+          bookmakerOddUpdatedAt:
+            prediction
+              .manual_odd_updated_at ||
+            null,
+
+          fairOdds: {
+            ...(market?.fairOdds ||
+              {}),
+
+            bookmakerOdds:
+              manualOdd,
+
+            manualMarketOdd:
+              manualOdd,
+
+            bookmaker:
+              prediction
+                .manual_odd_source ||
+              "Saisie administrateur",
+
+            bookmakerSource:
+              "MANUAL_ADMIN",
+
+            manualMarketKey:
+              normalizedManualMarketKey,
+
+            manualOddMatchesMarket:
+              true,
+
+            bookmakerOddUpdatedAt:
+              prediction
+                .manual_odd_updated_at ||
+              null,
+          },
+        };
+      }
+    );
+}
         const marketKey =
           normalizeManualOddsMarketKey(
             market?.key ||
