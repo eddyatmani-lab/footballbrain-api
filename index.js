@@ -22859,6 +22859,376 @@ app.post('/internal/bet-qualification/calibration/configs/:configId/rollback', a
 });
 
 
+/* ========================================================================== */
+/* BILAN SÉPARÉ — IA COMPLET + RECOMMANDATIONS OFFICIELLES                    */
+/* ========================================================================== */
+
+function bilanPublicNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function bilanPublicRound(value, decimals = 2) {
+  const factor = 10 ** decimals;
+  return Math.round(bilanPublicNumber(value) * factor) / factor;
+}
+
+function getBilanSnapshotMarkets(snapshotValue) {
+  const snapshot = parseBilanSnapshot(snapshotValue);
+
+  if (Array.isArray(snapshot?.markets)) {
+    return snapshot.markets;
+  }
+
+  if (Array.isArray(snapshot?.studio?.markets)) {
+    return snapshot.studio.markets;
+  }
+
+  const fallbackMarket =
+    snapshot?.primaryMarket ||
+    snapshot?.bestDecision ||
+    null;
+
+  return fallbackMarket ? [fallbackMarket] : [];
+}
+
+function getBilanMarketKey(market = {}) {
+  return normalizeManualOddsMarketKey(
+    market?.key ||
+      market?.marketKey ||
+      market?.market_key ||
+      ""
+  );
+}
+
+function getBilanMarketLabel(market = {}, key = "") {
+  return (
+    market?.label ||
+    market?.marketLabel ||
+    market?.market_label ||
+    ({
+      HOME: "Victoire domicile",
+      DRAW: "Match nul",
+      AWAY: "Victoire extérieur",
+      OVER25: "Plus de 2,5 buts",
+      UNDER25: "Moins de 2,5 buts",
+      BTTS_YES: "Les deux équipes marquent",
+      BTTS_NO: "Les deux équipes ne marquent pas",
+    }[key] || key || "Marché inconnu")
+  );
+}
+
+app.get("/public/bilan/ia", async (req, res) => {
+  try {
+    await ensureStudioPredictionColumns();
+
+    const result = await pool.query(`
+      SELECT
+        fixture_id,
+        home_goals,
+        away_goals,
+        studio_snapshot
+      FROM predictions
+      WHERE result_status = 'COMPLETED'
+        AND studio_snapshot IS NOT NULL
+      ORDER BY fixture_date DESC NULLS LAST
+    `);
+
+    const byMarketMap = new Map();
+    let matches = 0;
+    let marketsAnalyzed = 0;
+    let wins = 0;
+    let losses = 0;
+
+    for (const prediction of result.rows) {
+      const markets = getBilanSnapshotMarkets(
+        prediction.studio_snapshot
+      );
+
+      let evaluatedForMatch = 0;
+
+      for (const market of markets) {
+        const marketKey = getBilanMarketKey(market);
+        if (!marketKey) continue;
+
+        const won = evaluateManualOddsMarketResult({
+          marketKey,
+          homeGoals: prediction.home_goals,
+          awayGoals: prediction.away_goals,
+        });
+
+        if (typeof won !== "boolean") continue;
+
+        evaluatedForMatch += 1;
+        marketsAnalyzed += 1;
+
+        if (won) wins += 1;
+        else losses += 1;
+
+        if (!byMarketMap.has(marketKey)) {
+          byMarketMap.set(marketKey, {
+            marketKey,
+            marketLabel: getBilanMarketLabel(market, marketKey),
+            evaluated: 0,
+            wins: 0,
+            losses: 0,
+          });
+        }
+
+        const stats = byMarketMap.get(marketKey);
+        stats.evaluated += 1;
+        if (won) stats.wins += 1;
+        else stats.losses += 1;
+      }
+
+      if (evaluatedForMatch > 0) {
+        matches += 1;
+      }
+    }
+
+    const byMarket = Array.from(byMarketMap.values()).map(
+      (stats) => ({
+        ...stats,
+        accuracy:
+          stats.evaluated > 0
+            ? bilanPublicRound(
+                (stats.wins / stats.evaluated) * 100,
+                2
+              )
+            : 0,
+      })
+    );
+
+    return res.json({
+      ok: true,
+      matches,
+      marketsAnalyzed,
+      wins,
+      losses,
+      accuracy:
+        marketsAnalyzed > 0
+          ? bilanPublicRound(
+              (wins / marketsAnalyzed) * 100,
+              2
+            )
+          : 0,
+      byMarket,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("ERREUR /public/bilan/ia :", error);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Impossible de charger /public/bilan/ia.",
+    });
+  }
+});
+
+function formatQualifiedBetForPublic(row = {}) {
+  const snapshot =
+    row.qualification_snapshot &&
+    typeof row.qualification_snapshot === "object"
+      ? row.qualification_snapshot
+      : {};
+
+  return {
+    id: row.id,
+    fixtureId: Number(row.fixture_id),
+    homeTeam:
+      row.home_team_name ||
+      snapshot?.match?.homeTeam ||
+      snapshot?.match?.home ||
+      "Domicile",
+    awayTeam:
+      row.away_team_name ||
+      snapshot?.match?.awayTeam ||
+      snapshot?.match?.away ||
+      "Extérieur",
+    competition:
+      row.league_name ||
+      snapshot?.match?.competition ||
+      snapshot?.match?.league ||
+      "Compétition inconnue",
+    kickoff: row.kickoff || row.fixture_date || null,
+    marketKey: row.market_key,
+    marketLabel: row.market_label || row.market_key,
+    category: String(row.category || "OPPORTUNITY").toUpperCase(),
+    betScore:
+      row.bet_score === null ? null : Number(row.bet_score),
+    decisionScore:
+      row.decision_score === null
+        ? null
+        : Number(row.decision_score),
+    probability:
+      row.probability === null ? null : Number(row.probability),
+    confidence:
+      row.confidence === null ? null : Number(row.confidence),
+    consensus:
+      row.consensus === null ? null : Number(row.consensus),
+    reliability:
+      row.reliability === null ? null : Number(row.reliability),
+    risk: row.risk === null ? null : Number(row.risk),
+    valuePercent:
+      row.value_percent === null
+        ? null
+        : Number(row.value_percent),
+    bookmakerOdd:
+      row.bookmaker_odd === null
+        ? null
+        : Number(row.bookmaker_odd),
+    resultStatus: row.result_status,
+    won:
+      row.won === null || row.won === undefined
+        ? null
+        : row.won === true,
+    profitUnits:
+      row.profit_units === null
+        ? null
+        : Number(row.profit_units),
+    roiPercent:
+      row.roi_percent === null
+        ? null
+        : Number(row.roi_percent),
+    frozenAt: row.frozen_at,
+    settledAt: row.settled_at,
+    qualificationVersion: row.qualification_version || null,
+  };
+}
+
+function summarizeQualifiedBetRows(rows = []) {
+  const volume = rows.length;
+  const settledRows = rows.filter((row) =>
+    ["WIN", "LOSS", "VOID"].includes(
+      String(row.result_status || "").toUpperCase()
+    )
+  );
+  const decisiveRows = settledRows.filter((row) =>
+    ["WIN", "LOSS"].includes(
+      String(row.result_status || "").toUpperCase()
+    )
+  );
+  const pricedRows = decisiveRows.filter(
+    (row) =>
+      Number(row.bookmaker_odd) > 1 &&
+      Number.isFinite(Number(row.profit_units))
+  );
+
+  const wins = decisiveRows.filter(
+    (row) => String(row.result_status).toUpperCase() === "WIN"
+  ).length;
+  const losses = decisiveRows.filter(
+    (row) => String(row.result_status).toUpperCase() === "LOSS"
+  ).length;
+  const voids = settledRows.filter(
+    (row) => String(row.result_status).toUpperCase() === "VOID"
+  ).length;
+  const profit = pricedRows.reduce(
+    (sum, row) => sum + bilanPublicNumber(row.profit_units),
+    0
+  );
+  const averageOdd =
+    pricedRows.length > 0
+      ? pricedRows.reduce(
+          (sum, row) => sum + bilanPublicNumber(row.bookmaker_odd),
+          0
+        ) / pricedRows.length
+      : null;
+
+  return {
+    volume,
+    settled: settledRows.length,
+    pending: Math.max(0, volume - settledRows.length),
+    wins,
+    losses,
+    voids,
+    priced: pricedRows.length,
+    accuracy:
+      decisiveRows.length > 0
+        ? bilanPublicRound((wins / decisiveRows.length) * 100, 2)
+        : 0,
+    profit: bilanPublicRound(profit, 2),
+    roi:
+      pricedRows.length > 0
+        ? bilanPublicRound((profit / pricedRows.length) * 100, 2)
+        : null,
+    averageOdd:
+      averageOdd === null
+        ? null
+        : bilanPublicRound(averageOdd, 2),
+  };
+}
+
+app.get("/public/bilan/paris", async (req, res) => {
+  try {
+    await ensureBetQualificationCalibrationTables();
+
+    const result = await pool.query(`
+      SELECT
+        qb.*,
+        p.fixture_date,
+        p.home_team_name,
+        p.away_team_name,
+        p.league_name
+      FROM qualified_bets qb
+      LEFT JOIN predictions p
+        ON p.fixture_id = qb.fixture_id
+      ORDER BY qb.frozen_at DESC, qb.id DESC
+      LIMIT 1000
+    `);
+
+    const rows = result.rows;
+    const categories = {};
+
+    for (const category of ["SAFE", "VALUE", "OPPORTUNITY"]) {
+      categories[category] = summarizeQualifiedBetRows(
+        rows.filter(
+          (row) =>
+            String(row.category || "").toUpperCase() === category
+        )
+      );
+    }
+
+    const trackingStartedAt =
+      rows.length > 0
+        ? rows.reduce((oldest, row) => {
+            const current = row.frozen_at
+              ? new Date(row.frozen_at)
+              : null;
+            if (!current || Number.isNaN(current.getTime())) {
+              return oldest;
+            }
+            if (!oldest || current < oldest) return current;
+            return oldest;
+          }, null)?.toISOString() || null
+        : null;
+
+    return res.json({
+      ok: true,
+      overall: summarizeQualifiedBetRows(rows),
+      categories,
+      recent: rows.slice(0, 250).map(formatQualifiedBetForPublic),
+      trackingStartedAt,
+      freezeRule: {
+        normalFreezeMinutesBeforeKickoff: 30,
+        latestFreezeMinutesBeforeKickoff: 10,
+      },
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("ERREUR /public/bilan/paris :", error);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Impossible de charger /public/bilan/paris.",
+    });
+  }
+});
+
 app.listen(
   PORT,
   "0.0.0.0",
