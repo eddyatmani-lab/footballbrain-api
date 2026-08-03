@@ -13262,22 +13262,18 @@ app.get(
           : null;
 
       const currentMarketKey =
-        String(
+        normalizeManualOddsMarketKey(
           prediction.studio_market_key ||
             snapshot?.primaryMarket?.key ||
             snapshot?.bestDecision?.key ||
             ""
-        )
-          .trim()
-          .toUpperCase();
+        );
 
       const manualMarketKey =
-        String(
+        normalizeManualOddsMarketKey(
           prediction.manual_market_key ||
             ""
-        )
-          .trim()
-          .toUpperCase();
+        );
 
       const manualOdd =
         Number(
@@ -13385,13 +13381,11 @@ if (
     snapshot.markets.map(
       (market) => {
         const marketKey =
-          String(
+          normalizeManualOddsMarketKey(
             market?.key ||
               market?.marketKey ||
               ""
-          )
-            .trim()
-            .toUpperCase();
+          );
 
         if (
           marketKey !==
@@ -13836,16 +13830,14 @@ function buildAutomaticStudioMarket({
     );
 
 const currentMarketKey =
-  String(key || "")
-    .trim()
-    .toUpperCase();
+  normalizeManualOddsMarketKey(
+    key || ""
+  );
 
 const manualMarketKey =
-  String(
+  normalizeManualOddsMarketKey(
     prediction.manual_market_key || ""
-  )
-    .trim()
-    .toUpperCase();
+  );
 
 const manualOddMatchesMarket =
   Boolean(currentMarketKey) &&
@@ -21688,325 +21680,66 @@ app.get("/public/statistics/dashboard", async (req, res) => {
         LIMIT 100
       `),
 
-pool.query(`
-  WITH normalized_markets AS (
-    SELECT
-      CASE
-        WHEN UPPER(
-          REGEXP_REPLACE(
-            COALESCE(
-              NULLIF(
-                BTRIM(
-                  official_tracked_market_key
-                ),
-                ''
-              ),
-              NULLIF(
-                BTRIM(
-                  studio_market_key
-                ),
-                ''
-              ),
-              'UNKNOWN'
+      pool.query(`
+        SELECT
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), ''),
+            'UNKNOWN'
+          ) AS market_key,
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché inconnu'
+          ) AS market_label,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) IS NOT NULL
+          )::INTEGER AS evaluated,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = TRUE
+          )::INTEGER AS wins,
+          COUNT(*) FILTER (
+            WHERE manual_profit_units IS NOT NULL
+          )::INTEGER AS settled_bets,
+          COALESCE(
+            SUM(manual_stake_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
             ),
-            '[^A-Z0-9]',
-            '',
-            'g'
-          )
-        ) IN (
-          'HOME',
-          'HOMEWIN',
-          'HOMEVICTORY',
-          '1'
-        )
-          THEN 'HOME_WIN'
-
-        WHEN UPPER(
-          REGEXP_REPLACE(
-            COALESCE(
-              NULLIF(
-                BTRIM(
-                  official_tracked_market_key
-                ),
-                ''
-              ),
-              NULLIF(
-                BTRIM(
-                  studio_market_key
-                ),
-                ''
-              ),
-              'UNKNOWN'
+            0
+          )::NUMERIC AS stake,
+          COALESCE(
+            SUM(manual_profit_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
             ),
-            '[^A-Z0-9]',
-            '',
-            'g'
-          )
-        ) IN (
-          'AWAY',
-          'AWAYWIN',
-          'AWAYVICTORY',
-          '2'
-        )
-          THEN 'AWAY_WIN'
-
-        WHEN UPPER(
-          REGEXP_REPLACE(
-            COALESCE(
-              NULLIF(
-                BTRIM(
-                  official_tracked_market_key
-                ),
-                ''
-              ),
-              NULLIF(
-                BTRIM(
-                  studio_market_key
-                ),
-                ''
-              ),
-              'UNKNOWN'
-            ),
-            '[^A-Z0-9]',
-            '',
-            'g'
-          )
-        ) IN (
-          'DRAW',
-          'X',
-          'N',
-          'TIE'
-        )
-          THEN 'DRAW'
-
-        WHEN UPPER(
-          REGEXP_REPLACE(
-            COALESCE(
-              NULLIF(
-                BTRIM(
-                  official_tracked_market_key
-                ),
-                ''
-              ),
-              NULLIF(
-                BTRIM(
-                  studio_market_key
-                ),
-                ''
-              ),
-              'UNKNOWN'
-            ),
-            '[^A-Z0-9]',
-            '',
-            'g'
-          )
-        ) IN (
-          'BTTS',
-          'BTTSYES',
-          'YESBTTS',
-          'GG'
-        )
-          THEN 'BTTS'
-
-        WHEN UPPER(
-          REGEXP_REPLACE(
-            COALESCE(
-              NULLIF(
-                BTRIM(
-                  official_tracked_market_key
-                ),
-                ''
-              ),
-              NULLIF(
-                BTRIM(
-                  studio_market_key
-                ),
-                ''
-              ),
-              'UNKNOWN'
-            ),
-            '[^A-Z0-9]',
-            '',
-            'g'
-          )
-        ) IN (
-          'NOBTTS',
-          'BTTSNO',
-          'NGBTTS',
-          'NG'
-        )
-          THEN 'NO_BTTS'
-
-        WHEN UPPER(
-          REGEXP_REPLACE(
-            COALESCE(
-              NULLIF(
-                BTRIM(
-                  official_tracked_market_key
-                ),
-                ''
-              ),
-              NULLIF(
-                BTRIM(
-                  studio_market_key
-                ),
-                ''
-              ),
-              'UNKNOWN'
-            ),
-            '[^A-Z0-9]',
-            '',
-            'g'
-          )
-        ) IN (
-          'UNDER25',
-          'UNDER250',
-          'UNDER2POINT5',
-          'MOINS25'
-        )
-          THEN 'UNDER25'
-
-        WHEN UPPER(
-          REGEXP_REPLACE(
-            COALESCE(
-              NULLIF(
-                BTRIM(
-                  official_tracked_market_key
-                ),
-                ''
-              ),
-              NULLIF(
-                BTRIM(
-                  studio_market_key
-                ),
-                ''
-              ),
-              'UNKNOWN'
-            ),
-            '[^A-Z0-9]',
-            '',
-            'g'
-          )
-        ) IN (
-          'OVER25',
-          'OVER250',
-          'OVER2POINT5',
-          'PLUS25'
-        )
-          THEN 'OVER25'
-
-        ELSE 'UNKNOWN'
-      END AS market_key,
-
-      result_status,
-
-      COALESCE(
-        official_market_won,
-        won
-      ) AS market_won,
-
-      manual_stake_units,
-      manual_profit_units,
-      manual_market_odd
-
-    FROM predictions
-
-    WHERE result_status =
-      'COMPLETED'
-  )
-
-  SELECT
-    market_key,
-
-    COUNT(*) FILTER (
-      WHERE market_won
-        IS NOT NULL
-    )::INTEGER AS volume,
-
-    COUNT(*) FILTER (
-      WHERE market_won
-        IS NOT NULL
-    )::INTEGER AS evaluated,
-
-    COUNT(*) FILTER (
-      WHERE market_won = TRUE
-    )::INTEGER AS wins,
-
-    COUNT(*) FILTER (
-      WHERE manual_profit_units
-        IS NOT NULL
-    )::INTEGER AS settled_bets,
-
-    COALESCE(
-      SUM(
-        manual_stake_units
-      ) FILTER (
-        WHERE manual_profit_units
-          IS NOT NULL
-      ),
-      0
-    )::NUMERIC AS stake,
-
-    COALESCE(
-      SUM(
-        manual_profit_units
-      ) FILTER (
-        WHERE manual_profit_units
-          IS NOT NULL
-      ),
-      0
-    )::NUMERIC AS profit,
-
-    ROUND(
-      (
-        SUM(
-          manual_market_odd *
-          manual_stake_units
-        ) FILTER (
-          WHERE manual_profit_units
-            IS NOT NULL
-            AND manual_market_odd > 1
-            AND manual_stake_units > 0
-        )
-        /
-        NULLIF(
-          SUM(
-            manual_stake_units
-          ) FILTER (
-            WHERE manual_profit_units
-              IS NOT NULL
-              AND manual_market_odd > 1
-              AND manual_stake_units > 0
+            0
+          )::NUMERIC AS profit,
+          ROUND(
+            AVG(manual_market_odd) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+                AND manual_market_odd > 1
+            )::NUMERIC,
+            2
+          ) AS average_odd
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+        GROUP BY
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), ''),
+            'UNKNOWN'
           ),
-          0
-        )
-      )::NUMERIC,
-      2
-    ) AS average_odd
-
-  FROM normalized_markets
-
-  WHERE market_key IN (
-    'HOME_WIN',
-    'AWAY_WIN',
-    'DRAW',
-    'BTTS',
-    'NO_BTTS',
-    'UNDER25',
-    'OVER25'
-  )
-
-  GROUP BY market_key
-
-  HAVING COUNT(*) FILTER (
-    WHERE market_won
-      IS NOT NULL
-  ) > 0
-
-  ORDER BY
-    evaluated DESC,
-    market_key ASC
-`),
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché inconnu'
+          )
+        HAVING COUNT(*) FILTER (
+          WHERE COALESCE(official_market_won, won) IS NOT NULL
+        ) > 0
+        ORDER BY evaluated DESC, market_label ASC
+      `),
 
       pool.query(`
         SELECT
@@ -22178,50 +21911,12 @@ pool.query(`
       };
     });
 
-   const publicMarketLabels = {
-  HOME_WIN:
-    "Victoire domicile",
-
-  AWAY_WIN:
-    "Victoire extérieur",
-
-  DRAW:
-    "Match nul",
-
-  BTTS:
-    "Les deux équipes marquent",
-
-  NO_BTTS:
-    "Les deux équipes ne marquent pas",
-
-  UNDER25:
-    "Moins de 2,5 buts",
-
-  OVER25:
-    "Plus de 2,5 buts",
-};
-
-const markets =
-  marketsResult.rows
-    .filter(
-      (row) =>
-        Boolean(
-          publicMarketLabels[
-            row.market_key
-          ]
-        )
-    )
-    .map((row) => ({
+    const markets = marketsResult.rows.map((row) => ({
       ...mapPerformanceRow(row),
-
-      key:
-        row.market_key,
-
-      label:
-        publicMarketLabels[
-          row.market_key
-        ],
+      key: row.market_key,
+      label: row.market_label,
     }));
+
     const oddsBands = oddsBandsResult.rows.map((row) => ({
       ...mapPerformanceRow(row),
       band: row.odd_band,
