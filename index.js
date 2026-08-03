@@ -23065,7 +23065,24 @@ function formatQualifiedBetForPublic(row = {}) {
     kickoff: row.kickoff || row.fixture_date || null,
     marketKey: row.market_key,
     marketLabel: row.market_label || row.market_key,
-    category: String(row.category || "OPPORTUNITY").toUpperCase(),
+    category: String(
+      row.ranking_tier || row.category || "IA_PICK"
+    ).toUpperCase(),
+    rankingTier: String(
+      row.ranking_tier || row.category || "IA_PICK"
+    ).toUpperCase(),
+    selectionSource: row.selection_source || null,
+    portfolioScore:
+      row.portfolio_score === null ? null : Number(row.portfolio_score),
+    dailyRank:
+      row.daily_rank === null ? null : Number(row.daily_rank),
+    globalRank:
+      row.global_rank === null ? null : Number(row.global_rank),
+    globalTotal:
+      row.global_total === null ? null : Number(row.global_total),
+    portfolioRecommended: row.portfolio_recommended !== false,
+    bookmaker: row.bookmaker || null,
+    bookmakerSource: row.bookmaker_source || null,
     betScore:
       row.bet_score === null ? null : Number(row.bet_score),
     decisionScore:
@@ -23356,6 +23373,16 @@ function portfolioCandidateFromMarket(prediction, market) {
   };
 }
 
+function portfolioRankingTier(score) {
+  const value = portfolioNumber(score);
+  if (value >= 82) return "SAFE";
+  if (value >= 74) return "VALUE";
+  if (value >= 66) return "OPPORTUNITY";
+  if (value >= 58) return "IA_PICK";
+  if (value >= 48) return "WATCHLIST";
+  return "NO_BET";
+}
+
 function buildDailyPortfolio(candidates = [], matchCount = 0) {
   const target = Math.max(
     DAILY_PORTFOLIO_MIN_TARGET,
@@ -23364,8 +23391,9 @@ function buildDailyPortfolio(candidates = [], matchCount = 0) {
       Math.round(Math.max(1, matchCount) * DAILY_PORTFOLIO_SHARE)
     )
   );
-  const ranked = candidates
-    .filter((candidate) => candidate && !candidate.hardBlocked)
+
+  const sortedCandidates = candidates
+    .filter(Boolean)
     .sort((a, b) =>
       Number(Boolean(b.bookmakerOdd)) - Number(Boolean(a.bookmakerOdd)) ||
       b.portfolioScore - a.portfolioScore ||
@@ -23373,12 +23401,33 @@ function buildDailyPortfolio(candidates = [], matchCount = 0) {
       b.decisionScore - a.decisionScore
     );
 
+  const globalTotal = sortedCandidates.length;
+  const ranked = sortedCandidates.map((candidate, index) => ({
+    ...candidate,
+    globalRank: index + 1,
+    globalTotal,
+    rankingTier: candidate.hardBlocked
+      ? "NO_BET"
+      : portfolioRankingTier(candidate.portfolioScore),
+    category: candidate.hardBlocked
+      ? "NO_BET"
+      : portfolioRankingTier(candidate.portfolioScore),
+    portfolioRecommended: false,
+  }));
+
+  const selectable = ranked.filter(
+    (candidate) =>
+      !candidate.hardBlocked &&
+      candidate.rankingTier !== "WATCHLIST" &&
+      candidate.rankingTier !== "NO_BET"
+  );
+
   const selected = [];
   const usedFixtures = new Set();
   const marketCounts = new Map();
   const leagueCounts = new Map();
 
-  for (const candidate of ranked) {
+  for (const candidate of selectable) {
     if (selected.length >= target) break;
     if (usedFixtures.has(candidate.fixtureId)) continue;
     const marketCount = marketCounts.get(candidate.marketKey) || 0;
@@ -23390,13 +23439,30 @@ function buildDailyPortfolio(candidates = [], matchCount = 0) {
       ...candidate,
       dailyRank: selected.length + 1,
       targetSize: target,
+      portfolioRecommended: true,
+      selectionSource:
+        candidate.rankingTier === "IA_PICK"
+          ? "DAILY_PORTFOLIO"
+          : "GLOBAL_RANKING",
     });
     usedFixtures.add(candidate.fixtureId);
     marketCounts.set(candidate.marketKey, marketCount + 1);
     leagueCounts.set(candidate.leagueName, leagueCount + 1);
   }
 
-  return { target, rankedCount: ranked.length, selected };
+  const tierCounts = ranked.reduce((summary, candidate) => {
+    const tier = candidate.rankingTier || "NO_BET";
+    summary[tier] = (summary[tier] || 0) + 1;
+    return summary;
+  }, {});
+
+  return {
+    target,
+    rankedCount: ranked.length,
+    ranked,
+    selected,
+    tierCounts,
+  };
 }
 
 async function ensureDailyPortfolioColumns() {
@@ -23408,7 +23474,11 @@ async function ensureDailyPortfolioColumns() {
       ADD COLUMN IF NOT EXISTS daily_rank INTEGER,
       ADD COLUMN IF NOT EXISTS portfolio_date DATE,
       ADD COLUMN IF NOT EXISTS bookmaker TEXT,
-      ADD COLUMN IF NOT EXISTS bookmaker_source TEXT;
+      ADD COLUMN IF NOT EXISTS bookmaker_source TEXT,
+      ADD COLUMN IF NOT EXISTS ranking_tier TEXT,
+      ADD COLUMN IF NOT EXISTS global_rank INTEGER,
+      ADD COLUMN IF NOT EXISTS global_total INTEGER,
+      ADD COLUMN IF NOT EXISTS portfolio_recommended BOOLEAN NOT NULL DEFAULT TRUE;
   `);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_qualified_bets_portfolio_date
@@ -23468,6 +23538,11 @@ async function freezeDailyPortfolioSelections() {
   let skipped = 0;
 
   for (const candidate of portfolio.selected) {
+    if (!(Number(candidate.bookmakerOdd) > 1)) {
+      skipped += 1;
+      continue;
+    }
+
     const kickoff = new Date(candidate.kickoff);
     if (Number.isNaN(kickoff.getTime())) {
       skipped += 1;
@@ -23485,6 +23560,8 @@ async function freezeDailyPortfolioSelections() {
           bookmaker_odd, bookmaker, bookmaker_source,
           qualification_version, qualification_snapshot,
           selection_source, portfolio_score, daily_rank,
+          ranking_tier, global_rank, global_total,
+          portfolio_recommended,
           portfolio_date, frozen_at, kickoff,
           result_status, updated_at
         ) VALUES (
@@ -23494,7 +23571,9 @@ async function freezeDailyPortfolioSelections() {
           $13, $14, $15,
           $16, $17::jsonb,
           $18, $19, $20,
-          $21::date, NOW(), $22,
+          $21, $22, $23,
+          TRUE,
+          $24::date, NOW(), $25,
           'PENDING', NOW()
         )
         ON CONFLICT (fixture_id, market_key) DO NOTHING
@@ -23521,6 +23600,9 @@ async function freezeDailyPortfolioSelections() {
         candidate.selectionSource,
         candidate.portfolioScore,
         candidate.dailyRank,
+        candidate.rankingTier || candidate.category,
+        candidate.globalRank,
+        candidate.globalTotal,
         portfolio.date,
         kickoff.toISOString(),
       ]
@@ -23638,7 +23720,7 @@ if (AUTOMATIC_SCHEDULERS_ENABLED) {
 
 app.get("/public/bilan/paris", async (req, res) => {
   try {
-    await ensureBetQualificationCalibrationTables();
+    await ensureDailyPortfolioColumns();
 
     const result = await pool.query(`
       SELECT
@@ -23650,6 +23732,7 @@ app.get("/public/bilan/paris", async (req, res) => {
       FROM qualified_bets qb
       LEFT JOIN predictions p
         ON p.fixture_id = qb.fixture_id
+      WHERE COALESCE(qb.portfolio_recommended, TRUE) = TRUE
       ORDER BY qb.frozen_at DESC, qb.id DESC
       LIMIT 1000
     `);
@@ -23661,10 +23744,64 @@ app.get("/public/bilan/paris", async (req, res) => {
       categories[category] = summarizeQualifiedBetRows(
         rows.filter(
           (row) =>
-            String(row.category || "").toUpperCase() === category
+            String(row.ranking_tier || row.category || "")
+              .toUpperCase() === category
         )
       );
     }
+
+    let currentPortfolio = {
+      date: null,
+      analyzedMarkets: 0,
+      rankedCount: 0,
+      target: 0,
+      recommended: 0,
+      tierCounts: {},
+    };
+
+    try {
+      const portfolio = await loadDailyPortfolio(req.query.date || null);
+      currentPortfolio = {
+        date: portfolio.date,
+        analyzedMarkets: portfolio.analyzedMarkets || 0,
+        rankedCount: portfolio.rankedCount || 0,
+        target: portfolio.target || 0,
+        recommended: Array.isArray(portfolio.selected)
+          ? portfolio.selected.length
+          : 0,
+        tierCounts: portfolio.tierCounts || {},
+      };
+    } catch (portfolioError) {
+      console.warn(
+        "BILAN PARIS : portefeuille courant indisponible",
+        portfolioError?.message || portfolioError
+      );
+    }
+
+    const summary = summarizeQualifiedBetRows(rows);
+    const overall = {
+      ...summary,
+      analyzed: currentPortfolio.analyzedMarkets,
+      ranked: currentPortfolio.rankedCount,
+      recommended: currentPortfolio.recommended,
+      frozen: summary.volume,
+      financialBets: summary.priced,
+      stake: summary.priced,
+      selectionRate:
+        currentPortfolio.rankedCount > 0
+          ? bilanPublicRound(
+              (currentPortfolio.recommended / currentPortfolio.rankedCount) * 100,
+              2
+            )
+          : null,
+      freezeRate:
+        currentPortfolio.recommended > 0
+          ? bilanPublicRound(
+              (summary.volume / currentPortfolio.recommended) * 100,
+              2
+            )
+          : null,
+    };
 
     const trackingStartedAt =
       rows.length > 0
@@ -23682,7 +23819,8 @@ app.get("/public/bilan/paris", async (req, res) => {
 
     return res.json({
       ok: true,
-      overall: summarizeQualifiedBetRows(rows),
+      overall,
+      currentPortfolio,
       categories,
       recent: rows.slice(0, 250).map(formatQualifiedBetForPublic),
       trackingStartedAt,
