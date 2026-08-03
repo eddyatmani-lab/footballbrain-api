@@ -12155,11 +12155,6 @@ async function runAutomaticResultSync() {
     summary.manualOddsRefresh =
       manualOddsRefresh;
 
-    summary.qualifiedBetsSettlement =
-      await runQualifiedBetSettlementCycle({
-        source: "result-sync",
-      });
-
     console.log(
       "RESULT SYNC TERMINÉ :",
       {
@@ -12417,76 +12412,8 @@ function compactStudioMarket(
   const value =
     finiteStudioNumberOrNull(
       market?.fairOdds?.value ??
-      market?.fairOdds?.valueEdge ??
-      market?.valueEdge ??
       market?.value
     );
-
-  const bookmakerOdds =
-    finiteStudioNumberOrNull(
-      market?.fairOdds?.bookmakerOdds ??
-      market?.bookmakerOdds ??
-      market?.manualMarketOdd ??
-      market?.manual_market_odd
-    );
-
-  const rawQualification =
-    market?.betQualification ||
-    market?.qualification ||
-    null;
-
-  const compactQualification =
-    rawQualification &&
-    typeof rawQualification === "object"
-      ? {
-          qualified:
-            rawQualification.qualified === true ||
-            rawQualification.playable === true,
-          playable:
-            rawQualification.playable === true ||
-            rawQualification.qualified === true,
-          status:
-            rawQualification.status ||
-            null,
-          category:
-            rawQualification.category ||
-            "NO_BET",
-          label:
-            rawQualification.label ||
-            rawQualification.category ||
-            "NO_BET",
-          betScore:
-            finiteStudioNumberOrNull(
-              rawQualification.betScore
-            ),
-          version:
-            rawQualification.version ||
-            rawQualification.qualificationVersion ||
-            rawQualification.thresholdsVersion ||
-            null,
-          roiEligible:
-            rawQualification.roiEligible === true,
-          learningEligible:
-            rawQualification.learningEligible !== false,
-          criteria:
-            rawQualification.criteria &&
-            typeof rawQualification.criteria === "object"
-              ? rawQualification.criteria
-              : {},
-          positiveSignals:
-            Array.isArray(rawQualification.positiveSignals)
-              ? rawQualification.positiveSignals.slice(0, 12)
-              : [],
-          warnings:
-            Array.isArray(rawQualification.warnings)
-              ? rawQualification.warnings.slice(0, 12)
-              : [],
-          blockingReasons:
-            Array.isArray(rawQualification.blockingReasons)
-              ? rawQualification.blockingReasons.slice(0, 12)
-              : [],
-        }
-      : null;
 
   const compact = {
     key:
@@ -12532,20 +12459,8 @@ function compactStudioMarket(
 
       fairOdd,
       marketOdd,
-      bookmakerOdds,
-      bookmaker:
-        market?.fairOdds?.bookmaker ||
-        market?.bookmaker ||
-        null,
-      bookmakerSource:
-        market?.fairOdds?.bookmakerSource ||
-        market?.bookmakerSource ||
-        null,
       value,
     },
-
-    betQualification:
-      compactQualification,
   };
 
   /*
@@ -12568,24 +12483,6 @@ function compactStudioMarket(
     compact.fairOdds.value == null
   ) {
     delete compact.fairOdds.value;
-  }
-
-  if (
-    compact.fairOdds.bookmakerOdds == null
-  ) {
-    delete compact.fairOdds.bookmakerOdds;
-  }
-
-  if (!compact.fairOdds.bookmaker) {
-    delete compact.fairOdds.bookmaker;
-  }
-
-  if (!compact.fairOdds.bookmakerSource) {
-    delete compact.fairOdds.bookmakerSource;
-  }
-
-  if (!compact.betQualification) {
-    delete compact.betQualification;
   }
 
   return compact;
@@ -13254,6 +13151,259 @@ app.post(
     }
   }
 );
+
+/*
+ * ============================================================
+ * TICKET DU JOUR — MATCHS ET SNAPSHOTS BRAIN STUDIO DEPUIS RAILWAY
+ * ============================================================
+ *
+ * Cette route remplace la dépendance à WorldCupMatch/Base44.
+ * Elle fournit au Ticket du jour la même source que Brain Studio :
+ * la table predictions et ses snapshots enregistrés dans Railway.
+ */
+app.get(
+  "/public/studio/upcoming",
+  async (req, res) => {
+    try {
+      await ensureBilanV3Columns();
+
+      const requestedDate = String(
+        req.query.date || ""
+      ).trim();
+
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Le paramètre date est obligatoire au format YYYY-MM-DD.",
+        });
+      }
+
+      const requestedLimit = Number(req.query.limit);
+      const limit = Math.max(
+        1,
+        Math.min(
+          1000,
+          Number.isFinite(requestedLimit)
+            ? Math.trunc(requestedLimit)
+            : 500
+        )
+      );
+
+      const result = await pool.query(
+        `
+          SELECT DISTINCT ON (fixture_id)
+            fixture_id,
+            fixture_date,
+            league_id,
+            league_name,
+            home_team_name,
+            away_team_name,
+            result_status,
+
+            studio_market_key,
+            studio_market_label,
+            studio_probability,
+            studio_decision_score,
+            studio_decision_type,
+            studio_decision_grade,
+            studio_analysis_version,
+            studio_snapshot,
+            studio_saved_at,
+
+            manual_market_odd,
+            manual_market_key,
+            manual_odd_source,
+            manual_odd_updated_at,
+
+            updated_at
+          FROM predictions
+          WHERE fixture_date IS NOT NULL
+            AND (fixture_date AT TIME ZONE 'Europe/Paris')::date = $1::date
+          ORDER BY
+            fixture_id,
+            updated_at DESC NULLS LAST,
+            id DESC
+          LIMIT $2
+        `,
+        [requestedDate, limit]
+      );
+
+      const matches = result.rows.map((prediction) => {
+        const snapshot =
+          prediction.studio_snapshot &&
+          typeof prediction.studio_snapshot === "object"
+            ? JSON.parse(
+                JSON.stringify(prediction.studio_snapshot)
+              )
+            : {};
+
+        const manualOdd = Number(
+          prediction.manual_market_odd
+        );
+
+        const manualMarketKey =
+          normalizeManualOddsMarketKey(
+            prediction.manual_market_key || ""
+          );
+
+        if (
+          Array.isArray(snapshot.markets) &&
+          Number.isFinite(manualOdd) &&
+          manualOdd > 1 &&
+          manualMarketKey
+        ) {
+          snapshot.markets = snapshot.markets.map(
+            (market) => {
+              const marketKey =
+                normalizeManualOddsMarketKey(
+                  market?.key ||
+                    market?.marketKey ||
+                    ""
+                );
+
+              if (marketKey !== manualMarketKey) {
+                return market;
+              }
+
+              return {
+                ...market,
+                bookmakerOdds: manualOdd,
+                manualMarketOdd: manualOdd,
+                manual_market_odd: manualOdd,
+                bookmaker:
+                  prediction.manual_odd_source ||
+                  "Admin Football AI Pro",
+                bookmakerSource: "MANUAL_ADMIN",
+                manualMarketKey,
+                manualOddMatchesMarket: true,
+                bookmakerOddUpdatedAt:
+                  prediction.manual_odd_updated_at ||
+                  null,
+                fairOdds: {
+                  ...(market?.fairOdds || {}),
+                  bookmakerOdds: manualOdd,
+                  manualMarketOdd: manualOdd,
+                  bookmaker:
+                    prediction.manual_odd_source ||
+                    "Admin Football AI Pro",
+                  bookmakerSource: "MANUAL_ADMIN",
+                  manualMarketKey,
+                  manualOddMatchesMarket: true,
+                  bookmakerOddUpdatedAt:
+                    prediction.manual_odd_updated_at ||
+                    null,
+                },
+              };
+            }
+          );
+        }
+
+        const fixtureDate = prediction.fixture_date
+          ? new Date(prediction.fixture_date)
+          : null;
+
+        const fixtureDateIsValid =
+          fixtureDate &&
+          !Number.isNaN(fixtureDate.getTime());
+
+        return {
+          fixture_id: Number(prediction.fixture_id),
+          fixtureId: Number(prediction.fixture_id),
+          id: Number(prediction.fixture_id),
+
+          fixture_date: fixtureDateIsValid
+            ? fixtureDate.toISOString()
+            : null,
+          date: fixtureDateIsValid
+            ? fixtureDate.toISOString().slice(0, 10)
+            : requestedDate,
+          kickoff: fixtureDateIsValid
+            ? fixtureDate.toISOString()
+            : null,
+
+          league_id:
+            prediction.league_id == null
+              ? null
+              : Number(prediction.league_id),
+          league_name: prediction.league_name || null,
+          league: prediction.league_name || null,
+
+          home_team_name:
+            prediction.home_team_name || null,
+          away_team_name:
+            prediction.away_team_name || null,
+          team_home:
+            prediction.home_team_name || null,
+          team_away:
+            prediction.away_team_name || null,
+
+          status: prediction.result_status || "PENDING",
+          fixture_status:
+            prediction.result_status || "PENDING",
+          result_status:
+            prediction.result_status || "PENDING",
+
+          studioMarketKey:
+            prediction.studio_market_key || null,
+          studioMarketLabel:
+            prediction.studio_market_label || null,
+          studioProbability:
+            prediction.studio_probability == null
+              ? null
+              : Number(prediction.studio_probability),
+          studioDecisionScore:
+            prediction.studio_decision_score == null
+              ? null
+              : Number(prediction.studio_decision_score),
+          studioDecisionType:
+            prediction.studio_decision_type || null,
+          studioDecisionGrade:
+            prediction.studio_decision_grade || null,
+          studioAnalysisVersion:
+            prediction.studio_analysis_version || null,
+          studioSavedAt:
+            prediction.studio_saved_at || null,
+          studioSnapshot: snapshot,
+
+          manualMarketOdd:
+            Number.isFinite(manualOdd) && manualOdd > 1
+              ? manualOdd
+              : null,
+          manualMarketKey:
+            manualMarketKey || null,
+          manualOddSource:
+            prediction.manual_odd_source || null,
+          manualOddUpdatedAt:
+            prediction.manual_odd_updated_at || null,
+
+          updatedAt: prediction.updated_at || null,
+        };
+      });
+
+      return res.json({
+        ok: true,
+        date: requestedDate,
+        count: matches.length,
+        source: "RAILWAY_BRAIN_STUDIO",
+        matches,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /public/studio/upcoming :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de charger les matchs Brain Studio.",
+      });
+    }
+  }
+);
+
 app.get(
   "/public/studio-snapshot/:fixtureId",
   async (req, res) => {
@@ -21587,750 +21737,6 @@ function startAutomaticCalibrationScheduler() {
   );
 }
 
-
-/* ==========================================================================\n * QUALIFIED BETS — GEL T-30 / T-10 ET DOUBLE BILAN\n * ========================================================================== */
-const QUALIFIED_BET_FREEZE_START_MINUTES = 30;
-const QUALIFIED_BET_FREEZE_END_MINUTES = 10;
-const QUALIFIED_BET_SCHEDULER_INTERVAL_MS = 60 * 1000;
-const QUALIFIED_BET_VERSION = "qualified-bets-v1.0.0";
-const QUALIFIED_BET_CATEGORIES = new Set([
-  "SAFE",
-  "VALUE",
-  "OPPORTUNITY",
-]);
-
-let qualifiedBetFreezeRunning = false;
-let qualifiedBetSettlementRunning = false;
-
-function qualifiedBetNumber(value, fallback = null) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
-
-function parseQualifiedBetJson(value, fallback = {}) {
-  if (value && typeof value === "object") return value;
-  if (typeof value === "string") {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return fallback;
-    }
-  }
-  return fallback;
-}
-
-function normalizeQualifiedBetCategory(value) {
-  const category = String(value || "NO_BET")
-    .trim()
-    .toUpperCase();
-
-  return QUALIFIED_BET_CATEGORIES.has(category)
-    ? category
-    : "NO_BET";
-}
-
-function normalizeQualifiedBetMarketKey(value) {
-  return normalizeStudioMarketKey(value);
-}
-
-function evaluateQualifiedBetMarket({ marketKey, homeGoals, awayGoals }) {
-  const key = normalizeQualifiedBetMarketKey(marketKey);
-  const home = Number(homeGoals);
-  const away = Number(awayGoals);
-
-  if (!Number.isFinite(home) || !Number.isFinite(away)) return null;
-  if (key === "HOME") return home > away;
-  if (key === "DRAW") return home === away;
-  if (key === "AWAY") return away > home;
-  if (key === "OVER25") return home + away >= 3;
-  if (key === "UNDER25") return home + away <= 2;
-  if (key === "BTTS") return home > 0 && away > 0;
-  if (key === "NO_BTTS") return home === 0 || away === 0;
-  return null;
-}
-
-async function ensureQualifiedBetTables() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS qualified_bets (
-      id BIGSERIAL PRIMARY KEY,
-      fixture_id BIGINT NOT NULL,
-      fixture_date TIMESTAMPTZ NOT NULL,
-      league_id BIGINT,
-      league_name TEXT,
-      home_team_name TEXT,
-      away_team_name TEXT,
-
-      market_key TEXT NOT NULL,
-      market_label TEXT,
-      category TEXT NOT NULL DEFAULT 'NO_BET',
-      qualified BOOLEAN NOT NULL DEFAULT FALSE,
-      playable BOOLEAN NOT NULL DEFAULT FALSE,
-      bet_score NUMERIC,
-      probability NUMERIC,
-      decision_score NUMERIC,
-      confidence NUMERIC,
-      consensus NUMERIC,
-      reliability NUMERIC,
-      risk NUMERIC,
-      value_percent NUMERIC,
-
-      bookmaker_odd NUMERIC,
-      bookmaker TEXT,
-      bookmaker_source TEXT,
-      stake_units NUMERIC NOT NULL DEFAULT 1,
-
-      qualification_version TEXT,
-      qualification_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      frozen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      freeze_offset_minutes NUMERIC,
-      freeze_source TEXT NOT NULL DEFAULT 'AUTOMATIC_T_MINUS_30',
-
-      result_status TEXT NOT NULL DEFAULT 'PENDING',
-      won BOOLEAN,
-      home_goals INTEGER,
-      away_goals INTEGER,
-      profit_units NUMERIC,
-      roi_percent NUMERIC,
-      settled_at TIMESTAMPTZ,
-
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-      UNIQUE (fixture_id, market_key)
-    );
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_qualified_bets_fixture
-    ON qualified_bets(fixture_id);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_qualified_bets_category
-    ON qualified_bets(category, result_status);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_qualified_bets_frozen_at
-    ON qualified_bets(frozen_at DESC);
-  `);
-}
-
-function extractQualifiedMarketsFromPrediction(prediction = {}) {
-  const snapshot = parseQualifiedBetJson(prediction.studio_snapshot, {});
-  const rawMarkets = Array.isArray(snapshot?.markets)
-    ? snapshot.markets
-    : [];
-
-  const primary = snapshot?.primaryMarket || snapshot?.bestDecision || null;
-  const unique = new Map();
-
-  for (const market of [primary, ...rawMarkets]) {
-    if (!market || typeof market !== "object") continue;
-
-    const key = normalizeQualifiedBetMarketKey(
-      market?.key || market?.marketKey
-    );
-    if (!key || unique.has(key)) continue;
-
-    const qualification =
-      market?.betQualification || market?.qualification || {};
-    const category = normalizeQualifiedBetCategory(
-      qualification?.category
-    );
-    const playable =
-      qualification?.playable === true ||
-      qualification?.qualified === true;
-
-    if (!playable || category === "NO_BET") continue;
-
-    const probability = qualifiedBetNumber(
-      market?.fairOdds?.calibratedProbability ??
-        market?.calibratedProbability ??
-        market?.probability,
-      null
-    );
-
-    const manualMarketKey = normalizeQualifiedBetMarketKey(
-      prediction.manual_market_key
-    );
-    const manualOdd = qualifiedBetNumber(
-      prediction.manual_market_odd,
-      null
-    );
-    const marketBookmakerOdd = qualifiedBetNumber(
-      market?.fairOdds?.bookmakerOdds ??
-        market?.bookmakerOdds ??
-        market?.manualMarketOdd ??
-        market?.manual_market_odd,
-      null
-    );
-
-    const bookmakerOdd =
-      key === manualMarketKey && manualOdd !== null && manualOdd > 1
-        ? manualOdd
-        : marketBookmakerOdd !== null && marketBookmakerOdd > 1
-          ? marketBookmakerOdd
-          : null;
-
-    const criteria =
-      qualification?.criteria && typeof qualification.criteria === "object"
-        ? qualification.criteria
-        : {};
-
-    unique.set(key, {
-      key,
-      label: market?.label || market?.marketLabel || key,
-      category,
-      playable: true,
-      qualified: true,
-      betScore: qualifiedBetNumber(qualification?.betScore, null),
-      probability,
-      decisionScore: qualifiedBetNumber(
-        criteria?.decisionScore ??
-          market?.decision?.score ??
-          market?.decisionScore ??
-          market?.score,
-        null
-      ),
-      confidence: qualifiedBetNumber(criteria?.confidence, null),
-      consensus: qualifiedBetNumber(criteria?.consensus, null),
-      reliability: qualifiedBetNumber(criteria?.reliability, null),
-      risk: qualifiedBetNumber(criteria?.risk, null),
-      valuePercent: qualifiedBetNumber(
-        criteria?.valuePercent ??
-          market?.fairOdds?.valueEdge ??
-          market?.valueEdge,
-        null
-      ),
-      bookmakerOdd,
-      bookmaker:
-        key === manualMarketKey && bookmakerOdd !== null
-          ? prediction.manual_odd_source || "Admin Football AI Pro"
-          : market?.fairOdds?.bookmaker || market?.bookmaker || null,
-      bookmakerSource:
-        key === manualMarketKey && bookmakerOdd !== null
-          ? "MANUAL_ADMIN"
-          : market?.fairOdds?.bookmakerSource ||
-            market?.bookmakerSource ||
-            null,
-      qualificationVersion:
-        qualification?.version ||
-        qualification?.qualificationVersion ||
-        qualification?.thresholdsVersion ||
-        QUALIFIED_BET_VERSION,
-      qualificationSnapshot: {
-        ...qualification,
-        frozen: true,
-        frozenSource: "RAILWAY_T_MINUS_30",
-      },
-    });
-  }
-
-  return [...unique.values()];
-}
-
-async function freezeQualifiedBetPrediction(prediction, now = new Date()) {
-  const fixtureId = Number(prediction.fixture_id);
-  const kickoff = new Date(prediction.fixture_date);
-
-  if (!Number.isInteger(fixtureId) || Number.isNaN(kickoff.getTime())) {
-    return { fixtureId, skipped: true, reason: "INVALID_FIXTURE" };
-  }
-
-  const existing = await pool.query(
-    `SELECT 1 FROM qualified_bets WHERE fixture_id = $1 LIMIT 1`,
-    [fixtureId]
-  );
-
-  if (existing.rows.length > 0) {
-    return { fixtureId, skipped: true, reason: "ALREADY_FROZEN" };
-  }
-
-  const markets = extractQualifiedMarketsFromPrediction(prediction);
-  const freezeOffsetMinutes = Number(
-    ((kickoff.getTime() - now.getTime()) / 60000).toFixed(2)
-  );
-
-  const rows = markets.length > 0
-    ? markets
-    : [{
-        key: "__NO_BET__",
-        label: "Aucune possibilité de pari",
-        category: "NO_BET",
-        playable: false,
-        qualified: false,
-        betScore: null,
-        probability: null,
-        decisionScore: null,
-        confidence: null,
-        consensus: null,
-        reliability: null,
-        risk: null,
-        valuePercent: null,
-        bookmakerOdd: null,
-        bookmaker: null,
-        bookmakerSource: null,
-        qualificationVersion: QUALIFIED_BET_VERSION,
-        qualificationSnapshot: {
-          qualified: false,
-          playable: false,
-          category: "NO_BET",
-          frozen: true,
-          frozenSource: "RAILWAY_T_MINUS_30",
-          reason: "NO_PLAYABLE_MARKET_AT_FREEZE_TIME",
-        },
-      }];
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    for (const market of rows) {
-      await client.query(
-        `
-          INSERT INTO qualified_bets (
-            fixture_id, fixture_date, league_id, league_name,
-            home_team_name, away_team_name,
-            market_key, market_label, category, qualified, playable,
-            bet_score, probability, decision_score, confidence,
-            consensus, reliability, risk, value_percent,
-            bookmaker_odd, bookmaker, bookmaker_source, stake_units,
-            qualification_version, qualification_snapshot,
-            frozen_at, freeze_offset_minutes, freeze_source,
-            updated_at
-          ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-            $16,$17,$18,$19,$20,$21,$22,1,$23,$24::jsonb,NOW(),$25,
-            'AUTOMATIC_T_MINUS_30',NOW()
-          )
-          ON CONFLICT (fixture_id, market_key) DO NOTHING
-        `,
-        [
-          fixtureId,
-          kickoff.toISOString(),
-          prediction.league_id || null,
-          prediction.league_name || null,
-          prediction.home_team_name || null,
-          prediction.away_team_name || null,
-          market.key,
-          market.label,
-          market.category,
-          market.qualified === true,
-          market.playable === true,
-          market.betScore,
-          market.probability,
-          market.decisionScore,
-          market.confidence,
-          market.consensus,
-          market.reliability,
-          market.risk,
-          market.valuePercent,
-          market.bookmakerOdd,
-          market.bookmaker,
-          market.bookmakerSource,
-          market.qualificationVersion,
-          JSON.stringify(market.qualificationSnapshot || {}),
-          freezeOffsetMinutes,
-        ]
-      );
-    }
-
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
-
-  return {
-    fixtureId,
-    frozen: true,
-    qualifiedMarkets: markets.length,
-    noBet: markets.length === 0,
-    freezeOffsetMinutes,
-  };
-}
-
-async function runQualifiedBetFreezeCycle({ source = "automatic" } = {}) {
-  if (qualifiedBetFreezeRunning) {
-    return { skipped: true, reason: "ALREADY_RUNNING" };
-  }
-
-  qualifiedBetFreezeRunning = true;
-
-  try {
-    await ensureQualifiedBetTables();
-    await ensureBilanV3Columns();
-
-    const result = await pool.query(
-      `
-        SELECT
-          fixture_id, fixture_date, league_id, league_name,
-          home_team_name, away_team_name,
-          result_status, studio_snapshot,
-          manual_market_key, manual_market_odd, manual_odd_source
-        FROM predictions
-        WHERE fixture_date > NOW() + ($1::text || ' minutes')::interval
-          AND fixture_date <= NOW() + ($2::text || ' minutes')::interval
-          AND COALESCE(result_status, 'PENDING') NOT IN ('COMPLETED','FT','AET','PEN')
-          AND studio_snapshot IS NOT NULL
-          AND jsonb_typeof(studio_snapshot) = 'object'
-        ORDER BY fixture_date ASC
-      `,
-      [QUALIFIED_BET_FREEZE_END_MINUTES, QUALIFIED_BET_FREEZE_START_MINUTES]
-    );
-
-    const summary = {
-      ok: true,
-      source,
-      candidates: result.rows.length,
-      frozenFixtures: 0,
-      qualifiedMarkets: 0,
-      noBetFixtures: 0,
-      skipped: 0,
-      errors: [],
-    };
-
-    for (const prediction of result.rows) {
-      try {
-        const frozen = await freezeQualifiedBetPrediction(
-          prediction,
-          new Date()
-        );
-        if (frozen.frozen) {
-          summary.frozenFixtures += 1;
-          summary.qualifiedMarkets += frozen.qualifiedMarkets || 0;
-          if (frozen.noBet) summary.noBetFixtures += 1;
-        } else {
-          summary.skipped += 1;
-        }
-      } catch (error) {
-        summary.errors.push({
-          fixtureId: prediction.fixture_id,
-          error: error?.message || "Erreur inconnue",
-        });
-      }
-    }
-
-    console.log("QUALIFIED BET FREEZE :", summary);
-    return summary;
-  } finally {
-    qualifiedBetFreezeRunning = false;
-  }
-}
-
-async function runQualifiedBetSettlementCycle({ source = "automatic" } = {}) {
-  if (qualifiedBetSettlementRunning) {
-    return { skipped: true, reason: "ALREADY_RUNNING" };
-  }
-
-  qualifiedBetSettlementRunning = true;
-
-  try {
-    await ensureQualifiedBetTables();
-
-    const result = await pool.query(`
-      SELECT
-        qb.id, qb.fixture_id, qb.market_key, qb.bookmaker_odd,
-        qb.stake_units,
-        p.home_goals, p.away_goals, p.result_status
-      FROM qualified_bets qb
-      JOIN predictions p ON p.fixture_id = qb.fixture_id
-      WHERE qb.result_status = 'PENDING'
-        AND qb.market_key <> '__NO_BET__'
-        AND p.result_status = 'COMPLETED'
-        AND p.home_goals IS NOT NULL
-        AND p.away_goals IS NOT NULL
-      ORDER BY qb.id ASC
-    `);
-
-    let settled = 0;
-    let wins = 0;
-    let losses = 0;
-    let voids = 0;
-
-    for (const row of result.rows) {
-      const won = evaluateQualifiedBetMarket({
-        marketKey: row.market_key,
-        homeGoals: row.home_goals,
-        awayGoals: row.away_goals,
-      });
-
-      const odd = qualifiedBetNumber(row.bookmaker_odd, null);
-      const stake = qualifiedBetNumber(row.stake_units, 1) || 1;
-      const status = won === null ? "VOID" : won ? "WIN" : "LOSS";
-      const profit =
-        won === null || odd === null || odd <= 1
-          ? null
-          : won
-            ? Number(((odd - 1) * stake).toFixed(4))
-            : Number((-stake).toFixed(4));
-      const roi =
-        profit === null || stake <= 0
-          ? null
-          : Number(((profit / stake) * 100).toFixed(2));
-
-      await pool.query(
-        `
-          UPDATE qualified_bets
-          SET result_status = $2, won = $3,
-              home_goals = $4, away_goals = $5,
-              profit_units = $6, roi_percent = $7,
-              settled_at = NOW(), updated_at = NOW()
-          WHERE id = $1
-        `,
-        [
-          row.id,
-          status,
-          won,
-          Number(row.home_goals),
-          Number(row.away_goals),
-          profit,
-          roi,
-        ]
-      );
-
-      settled += 1;
-      if (status === "WIN") wins += 1;
-      else if (status === "LOSS") losses += 1;
-      else voids += 1;
-    }
-
-    const summary = { ok: true, source, settled, wins, losses, voids };
-    if (settled > 0) console.log("QUALIFIED BET SETTLEMENT :", summary);
-    return summary;
-  } finally {
-    qualifiedBetSettlementRunning = false;
-  }
-}
-
-function buildQualifiedBetPerformance(rows = []) {
-  const settled = rows.filter((row) =>
-    ["WIN", "LOSS"].includes(String(row.result_status || "").toUpperCase())
-  );
-  const financial = settled.filter((row) =>
-    qualifiedBetNumber(row.bookmaker_odd, null) !== null &&
-    qualifiedBetNumber(row.profit_units, null) !== null
-  );
-  const wins = settled.filter((row) => row.result_status === "WIN").length;
-  const stake = financial.reduce(
-    (sum, row) => sum + (qualifiedBetNumber(row.stake_units, 1) || 1),
-    0
-  );
-  const profit = financial.reduce(
-    (sum, row) => sum + (qualifiedBetNumber(row.profit_units, 0) || 0),
-    0
-  );
-  const weightedOddStake = financial.reduce((sum, row) => {
-    const odd = qualifiedBetNumber(row.bookmaker_odd, null);
-    const rowStake = qualifiedBetNumber(row.stake_units, 1) || 1;
-    return odd && odd > 1 ? sum + odd * rowStake : sum;
-  }, 0);
-
-  return {
-    volume: rows.length,
-    settled: settled.length,
-    pending: rows.filter((row) => row.result_status === "PENDING").length,
-    wins,
-    losses: settled.length - wins,
-    accuracy: settled.length > 0
-      ? Number(((wins / settled.length) * 100).toFixed(2))
-      : null,
-    financialBets: financial.length,
-    stake: Number(stake.toFixed(4)),
-    profit: Number(profit.toFixed(4)),
-    roi: stake > 0 ? Number(((profit / stake) * 100).toFixed(2)) : null,
-    averageOdd: stake > 0
-      ? Number((weightedOddStake / stake).toFixed(2))
-      : null,
-  };
-}
-
-app.get("/public/bilan/ia", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT fixture_id, home_goals, away_goals, studio_snapshot
-      FROM predictions
-      WHERE result_status = 'COMPLETED'
-        AND home_goals IS NOT NULL
-        AND away_goals IS NOT NULL
-        AND studio_snapshot IS NOT NULL
-        AND jsonb_typeof(studio_snapshot) = 'object'
-      ORDER BY fixture_date DESC
-    `);
-
-    const markets = [];
-    for (const prediction of result.rows) {
-      const snapshot = parseQualifiedBetJson(prediction.studio_snapshot, {});
-      const snapshotMarkets = Array.isArray(snapshot?.markets)
-        ? snapshot.markets
-        : [];
-
-      for (const market of snapshotMarkets) {
-        const key = normalizeQualifiedBetMarketKey(market?.key);
-        if (!key) continue;
-        const won = evaluateQualifiedBetMarket({
-          marketKey: key,
-          homeGoals: prediction.home_goals,
-          awayGoals: prediction.away_goals,
-        });
-        if (won === null) continue;
-        markets.push({ key, won });
-      }
-    }
-
-    const byMarketMap = new Map();
-    for (const market of markets) {
-      const current = byMarketMap.get(market.key) || {
-        marketKey: market.key,
-        evaluated: 0,
-        wins: 0,
-      };
-      current.evaluated += 1;
-      if (market.won) current.wins += 1;
-      byMarketMap.set(market.key, current);
-    }
-
-    const wins = markets.filter((market) => market.won).length;
-    return res.json({
-      ok: true,
-      scope: "ALL_ANALYZED_MARKETS",
-      matches: result.rows.length,
-      marketsAnalyzed: markets.length,
-      wins,
-      losses: markets.length - wins,
-      accuracy: markets.length > 0
-        ? Number(((wins / markets.length) * 100).toFixed(2))
-        : null,
-      roi: null,
-      profit: null,
-      byMarket: [...byMarketMap.values()].map((row) => ({
-        ...row,
-        losses: row.evaluated - row.wins,
-        accuracy: row.evaluated > 0
-          ? Number(((row.wins / row.evaluated) * 100).toFixed(2))
-          : null,
-      })),
-    });
-  } catch (error) {
-    return res.status(500).json({
-      ok: false,
-      error: error?.message || "Impossible de charger le Bilan IA.",
-    });
-  }
-});
-
-app.get("/public/bilan/paris", async (req, res) => {
-  try {
-    await ensureQualifiedBetTables();
-    const result = await pool.query(`
-      SELECT *
-      FROM qualified_bets
-      WHERE qualified = TRUE
-        AND market_key <> '__NO_BET__'
-      ORDER BY frozen_at DESC, id DESC
-    `);
-
-    const rows = result.rows;
-    const categories = {};
-    for (const category of QUALIFIED_BET_CATEGORIES) {
-      categories[category] = buildQualifiedBetPerformance(
-        rows.filter((row) => row.category === category)
-      );
-    }
-
-    return res.json({
-      ok: true,
-      scope: "QUALIFIED_BETS_ONLY",
-      freezeRule: {
-        normalFreezeMinutesBeforeKickoff: QUALIFIED_BET_FREEZE_START_MINUTES,
-        latestFreezeMinutesBeforeKickoff: QUALIFIED_BET_FREEZE_END_MINUTES,
-      },
-      trackingStartedAt: rows.length > 0 ? rows[rows.length - 1].frozen_at : null,
-      overall: buildQualifiedBetPerformance(rows),
-      categories,
-      recent: rows.slice(0, 100).map((row) => ({
-        id: Number(row.id),
-        fixtureId: Number(row.fixture_id),
-        kickoff: row.fixture_date,
-        competition: row.league_name,
-        homeTeam: row.home_team_name,
-        awayTeam: row.away_team_name,
-        marketKey: row.market_key,
-        marketLabel: row.market_label,
-        category: row.category,
-        betScore: qualifiedBetNumber(row.bet_score, null),
-        probability: qualifiedBetNumber(row.probability, null),
-        bookmakerOdd: qualifiedBetNumber(row.bookmaker_odd, null),
-        resultStatus: row.result_status,
-        won: row.won,
-        profitUnits: qualifiedBetNumber(row.profit_units, null),
-        roiPercent: qualifiedBetNumber(row.roi_percent, null),
-        frozenAt: row.frozen_at,
-      })),
-    });
-  } catch (error) {
-    return res.status(500).json({
-      ok: false,
-      error: error?.message || "Impossible de charger le Bilan Paris.",
-    });
-  }
-});
-
-app.post("/internal/qualified-bets/freeze", async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  try {
-    const summary = await runQualifiedBetFreezeCycle({ source: "manual-admin" });
-    return res.json(summary);
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || "Erreur" });
-  }
-});
-
-app.post("/internal/qualified-bets/settle", async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  try {
-    const summary = await runQualifiedBetSettlementCycle({ source: "manual-admin" });
-    return res.json(summary);
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || "Erreur" });
-  }
-});
-
-function startQualifiedBetScheduler() {
-  if (!AUTOMATIC_SCHEDULERS_ENABLED) {
-    console.log("⏸️ Gel automatique des paris qualifiés désactivé.");
-    return;
-  }
-
-  setTimeout(() => {
-    runQualifiedBetFreezeCycle({ source: "startup" }).catch((error) => {
-      console.error("ERREUR PREMIER GEL QUALIFIED BETS :", error);
-    });
-    runQualifiedBetSettlementCycle({ source: "startup" }).catch((error) => {
-      console.error("ERREUR PREMIER RÈGLEMENT QUALIFIED BETS :", error);
-    });
-  }, 30 * 1000);
-
-  setInterval(() => {
-    runQualifiedBetFreezeCycle({ source: "scheduler" }).catch((error) => {
-      console.error("ERREUR SCHEDULER QUALIFIED BETS :", error);
-    });
-  }, QUALIFIED_BET_SCHEDULER_INTERVAL_MS);
-
-  setInterval(() => {
-    runQualifiedBetSettlementCycle({ source: "scheduler" }).catch((error) => {
-      console.error("ERREUR RÈGLEMENT QUALIFIED BETS :", error);
-    });
-  }, 15 * 60 * 1000);
-
-  console.log(
-    `✅ Qualified Bets : gel entre T-${QUALIFIED_BET_FREEZE_START_MINUTES} et T-${QUALIFIED_BET_FREEZE_END_MINUTES}`
-  );
-}
-
 function startAutomaticSchedulers() {
   if (!AUTOMATIC_SCHEDULERS_ENABLED) {
     console.log(
@@ -22969,14 +22375,6 @@ app.listen(
         );
       });
 
-    ensureQualifiedBetTables()
-      .catch((error) => {
-        console.error(
-          "ERREUR TABLE QUALIFIED BETS :",
-          error
-        );
-      });
-
     /*
      * Les initialisations SQL restent actives.
      * Seules les tâches consommatrices d'API
@@ -22984,7 +22382,6 @@ app.listen(
      */
     startAutomaticCalibrationScheduler();
     startDailyTicketScheduler();
-    startQualifiedBetScheduler();
     startAutomaticSchedulers();
   }
 );
