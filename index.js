@@ -23785,11 +23785,12 @@ app.get("/public/bilan/detaille", async (req, res) => {
   try {
     await ensureStudioPredictionColumns();
 
-    const limit = Math.max(
-      1,
-      Math.min(1000, Number(req.query.limit) || 300)
-    );
-
+    /*
+     * Aucun plafond arbitraire ici :
+     * la route doit rendre disponible tout l'historique des matchs terminés.
+     * L'interface limite seulement le nombre de cartes visibles et permet
+     * d'en charger davantage par blocs de 50.
+     */
     const result = await pool.query(
       `
         SELECT DISTINCT ON (p.fixture_id)
@@ -23825,9 +23826,7 @@ app.get("/public/bilan/detaille", async (req, res) => {
           p.fixture_id,
           p.updated_at DESC NULLS LAST,
           p.id DESC
-        LIMIT $1
-      `,
-      [limit]
+      `
     );
 
     const fixtureIds = result.rows
