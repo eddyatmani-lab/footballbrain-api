@@ -85,12 +85,26 @@ function createEngineSettlementService({ pool }) {
         log_loss NUMERIC(12, 8),
         absolute_error NUMERIC(12, 8),
 
+        settlement_status TEXT NOT NULL DEFAULT 'SETTLED',
+        ignored_reason TEXT,
+
         settlement_version TEXT NOT NULL,
         settled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
         UNIQUE(prediction_log_id)
       );
+    `);
+
+    await pool.query(`
+      ALTER TABLE engine_prediction_settlements
+      ADD COLUMN IF NOT EXISTS settlement_status TEXT
+        NOT NULL DEFAULT 'SETTLED';
+    `);
+
+    await pool.query(`
+      ALTER TABLE engine_prediction_settlements
+      ADD COLUMN IF NOT EXISTS ignored_reason TEXT;
     `);
 
     await pool.query(`
@@ -144,6 +158,7 @@ function createEngineSettlementService({ pool }) {
     );
 
     let settled = 0;
+    let ignored = 0;
     let skipped = 0;
 
     for (const row of result.rows) {
@@ -156,7 +171,73 @@ function createEngineSettlementService({ pool }) {
       );
 
       if (won === null) {
-        skipped += 1;
+        const ignoredReason =
+          String(row.predicted_side || "").toUpperCase() ===
+          "NEUTRAL"
+            ? "NEUTRAL_PREDICTION"
+            : "UNSUPPORTED_PREDICTED_SIDE";
+
+        const ignoredResult = await pool.query(
+          `
+            INSERT INTO engine_prediction_settlements (
+              prediction_log_id,
+              fixture_id,
+              engine_name,
+              engine_version,
+              predicted_side,
+              predicted_probability,
+              home_goals,
+              away_goals,
+              actual_outcome,
+              won,
+              brier_score,
+              log_loss,
+              absolute_error,
+              settlement_status,
+              ignored_reason,
+              settlement_version,
+              settled_at,
+              updated_at
+            )
+            VALUES (
+              $1, $2, $3, $4, $5,
+              $6, $7, $8, $9,
+              NULL, NULL, NULL, NULL,
+              'IGNORED', $10, $11,
+              NOW(), NOW()
+            )
+            ON CONFLICT (prediction_log_id)
+            DO NOTHING
+            RETURNING id
+          `,
+          [
+            row.prediction_log_id,
+            row.fixture_id,
+            row.engine_name,
+            row.engine_version,
+            row.predicted_side,
+            Number.isFinite(
+              Number(row.predicted_probability)
+            )
+              ? Number(row.predicted_probability)
+              : null,
+            homeGoals,
+            awayGoals,
+            outcomeFromScore(
+              homeGoals,
+              awayGoals
+            ),
+            ignoredReason,
+            ENGINE_LEARNING_VERSION,
+          ]
+        );
+
+        if (ignoredResult.rowCount > 0) {
+          ignored += 1;
+        } else {
+          skipped += 1;
+        }
+
         continue;
       }
 
@@ -183,6 +264,8 @@ function createEngineSettlementService({ pool }) {
             brier_score,
             log_loss,
             absolute_error,
+            settlement_status,
+            ignored_reason,
             settlement_version,
             settled_at,
             updated_at
@@ -190,7 +273,8 @@ function createEngineSettlementService({ pool }) {
           VALUES (
             $1, $2, $3, $4, $5,
             $6, $7, $8, $9, $10,
-            $11, $12, $13, $14,
+            $11, $12, $13,
+            'SETTLED', NULL, $14,
             NOW(), NOW()
           )
           ON CONFLICT (prediction_log_id)
@@ -221,7 +305,9 @@ function createEngineSettlementService({ pool }) {
         ok: true,
         found: result.rows.length,
         settled,
+        ignored,
         skipped,
+        processed: settled + ignored,
         settledAt: new Date().toISOString(),
       };
 
@@ -237,7 +323,7 @@ function createEngineSettlementService({ pool }) {
         `,
         [
           runId,
-          settled,
+          settled + ignored,
           JSON.stringify(summary),
         ]
       );

@@ -138,6 +138,8 @@ function createEnginePerformanceService({ pool }) {
             AS average_absolute_error
 
         FROM engine_prediction_settlements
+        WHERE settlement_status = 'SETTLED'
+          AND won IS NOT NULL
         GROUP BY
           engine_name,
           engine_version,

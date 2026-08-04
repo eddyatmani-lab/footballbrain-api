@@ -113,6 +113,7 @@ function createEngineLearningCore({
             settlements,
             stats,
             pending,
+            ignored,
             latestRuns,
           ] = await Promise.all([
             pool.query(
@@ -135,6 +136,20 @@ function createEngineLearningCore({
                 AND p.result_status = 'COMPLETED'
                 AND p.home_goals IS NOT NULL
                 AND p.away_goals IS NOT NULL
+                AND UPPER(COALESCE(log.predicted_side, '')) IN (
+                  'HOME',
+                  'DRAW',
+                  'AWAY',
+                  'BTTS',
+                  'NO_BTTS',
+                  'OVER25',
+                  'UNDER25'
+                )
+            `),
+            pool.query(`
+              SELECT COUNT(*)::INTEGER AS count
+              FROM engine_prediction_settlements
+              WHERE settlement_status = 'IGNORED'
             `),
             pool.query(`
               SELECT DISTINCT ON (run_type)
@@ -167,6 +182,9 @@ function createEngineLearningCore({
             ),
             pendingSettlements: Number(
               pending.rows[0]?.count || 0
+            ),
+            ignoredSettlements: Number(
+              ignored.rows[0]?.count || 0
             ),
             performanceGroups: Number(
               stats.rows[0]?.count || 0
