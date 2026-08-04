@@ -104,6 +104,176 @@ function scoreOf(raw = {}) {
 }
 
 function collectEngineCandidates(snapshot = {}) {
+  const explicitPayload =
+    snapshot?.learningPayload &&
+    typeof snapshot.learningPayload ===
+      "object"
+      ? snapshot.learningPayload
+      : null;
+
+  if (
+    explicitPayload?.engines &&
+    typeof explicitPayload.engines ===
+      "object"
+  ) {
+    const votes =
+      Array.isArray(
+        explicitPayload.engineVotes
+      )
+        ? explicitPayload.engineVotes
+        : [];
+
+    const voteMap =
+      new Map(
+        votes
+          .filter(Boolean)
+          .map((vote) => [
+            String(
+              vote.engine ||
+                vote.engineName ||
+                ""
+            ),
+            normalizeSide(vote.side),
+          ])
+      );
+
+    const candidates = [];
+
+    for (
+      const [
+        engineName,
+        rawOutput,
+      ] of Object.entries(
+        explicitPayload.engines
+      )
+    ) {
+      if (
+        !SUPPORTED_ENGINES.includes(
+          engineName
+        ) ||
+        !rawOutput
+      ) {
+        continue;
+      }
+
+      let side =
+        voteMap.get(engineName) ||
+        normalizeSide(
+          rawOutput?.side ||
+            rawOutput?.predictedSide ||
+            rawOutput?.marketKey
+        ) ||
+        "NEUTRAL";
+
+      let probability = null;
+
+      if (
+        engineName ===
+        "ProbabilityEngine"
+      ) {
+        side =
+          side !== "NEUTRAL"
+            ? side
+            : sideFromPair(
+                rawOutput.homeProb,
+                rawOutput.awayProb,
+                1
+              );
+
+        probability =
+          probabilityForSide(
+            rawOutput,
+            side
+          );
+      } else if (
+        engineName ===
+        "MonteCarloEngine"
+      ) {
+        side =
+          side !== "NEUTRAL"
+            ? side
+            : sideFromPair(
+                rawOutput.homeWin,
+                rawOutput.awayWin,
+                1
+              );
+
+        probability =
+          side === "HOME"
+            ? clamp(rawOutput.homeWin)
+            : side === "AWAY"
+              ? clamp(
+                  rawOutput.awayWin
+                )
+              : side === "DRAW"
+                ? clamp(
+                    rawOutput.draw
+                  )
+                : null;
+      } else if (
+        engineName ===
+        "GoalMarketEngine"
+      ) {
+        side =
+          Number(rawOutput.over25) >=
+          Number(rawOutput.under25)
+            ? "OVER25"
+            : "UNDER25";
+
+        probability =
+          side === "OVER25"
+            ? clamp(
+                rawOutput.over25
+              )
+            : clamp(
+                rawOutput.under25
+              );
+      } else if (
+        engineName ===
+        "BTTSProfile"
+      ) {
+        side =
+          Number(rawOutput.btts) >= 50
+            ? "BTTS"
+            : "NO_BTTS";
+
+        probability =
+          side === "BTTS"
+            ? clamp(rawOutput.btts)
+            : rawOutput.btts != null
+              ? 100 -
+                clamp(rawOutput.btts)
+              : null;
+      }
+
+      candidates.push({
+        engineName,
+        side,
+        marketKey:
+          side === "NEUTRAL"
+            ? null
+            : side,
+        predictedProbability:
+          probability,
+        engineScore:
+          scoreOf(rawOutput),
+        confidence:
+          clamp(
+            rawOutput?.confidence ??
+              rawOutput
+                ?.confidenceScore ??
+              rawOutput
+                ?.reliability
+          ),
+        rawOutput,
+      });
+    }
+
+    if (candidates.length > 0) {
+      return candidates;
+    }
+  }
+
   const brain =
     snapshot?.brain ||
     snapshot?.analysis?.brain ||
@@ -467,6 +637,9 @@ function createEnginePredictionLog({ pool }) {
 
     const selectedPrimary =
       primaryMarket ||
+      snapshot
+        ?.learningPayload
+        ?.primaryMarket ||
       snapshot?.primaryMarket ||
       snapshot?.bestDecision ||
       snapshot?.studio?.bestDecision ||

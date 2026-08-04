@@ -13162,6 +13162,13 @@ app.post(
 
             locked:
               false,
+
+            learningPayload:
+              body.learningPayload &&
+              typeof body.learningPayload ===
+                "object"
+                ? body.learningPayload
+                : null,
           },
         });
 
