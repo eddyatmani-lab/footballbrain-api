@@ -42,6 +42,9 @@ const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
 const { createOddsSyncService } = require("./src/services/OddsSyncService");
+const {
+  createEngineLearningCore,
+} = require("./src/learning");
 const cors = require("cors");
 const {
   FootballMonteCarlo,
@@ -234,6 +237,16 @@ registerAIEventRoutes({
   app,
   aiEventEngine,
 });
+
+const engineLearningCore =
+  createEngineLearningCore({
+    app,
+    pool,
+    schedulersEnabled:
+      AUTOMATIC_SCHEDULERS_ENABLED,
+  });
+
+engineLearningCore.registerRoutes();
 const HISTORY_FILE = path.join(__dirname, "predictions-history.json");
 
 function getApiKey() {
@@ -12894,6 +12907,57 @@ async function saveStudioSnapshot({
     );
   }
 
+  /*
+   * Journal d'apprentissage moteur par moteur.
+   *
+   * Le mode SHADOW n'influence aucune décision publique :
+   * il enregistre uniquement les sorties disponibles avant match.
+   */
+  try {
+    await engineLearningCore
+      .logStudioSnapshot({
+        fixtureId:
+          normalizedFixtureId,
+
+        snapshot:
+          snapshot || {},
+
+        analysisVersion:
+          String(
+            analysisVersion ||
+              "brain-studio-v1"
+          ),
+
+        primaryMarket: {
+          key:
+            normalizedMarketKey,
+
+          label:
+            marketLabel,
+
+          probability:
+            finalStudioProbability,
+
+          decision: {
+            score:
+              normalizedDecisionScore,
+
+            type:
+              normalizedDecisionType,
+
+            grade:
+              normalizedDecisionGrade,
+          },
+        },
+      });
+  } catch (learningError) {
+    console.warn(
+      "ENGINE LEARNING LOG IGNORÉ :",
+      learningError?.message ||
+        learningError
+    );
+  }
+
   return result.rows[0];
 }
 app.post(
@@ -24121,6 +24185,15 @@ app.listen(
         );
       });
 
+    engineLearningCore
+      .ensureTables()
+      .catch((error) => {
+        console.error(
+          "ERREUR TABLES ENGINE LEARNING CORE :",
+          error
+        );
+      });
+
 
     ensureCalibrationDecisionTables()
       .catch((error) => {
@@ -24153,6 +24226,7 @@ app.listen(
      * dépendent de l'interrupteur.
      */
     oddsSyncService.startScheduler();
+    engineLearningCore.startScheduler();
     startAutomaticCalibrationScheduler();
     startDailyTicketScheduler();
     startAutomaticSchedulers();
