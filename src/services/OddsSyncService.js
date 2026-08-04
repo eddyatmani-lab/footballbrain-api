@@ -6,6 +6,143 @@ const DEFAULT_NEAR_KICKOFF_INTERVAL_MINUTES = 15;
 const DEFAULT_NEAR_KICKOFF_MAX_MINUTES = 100;
 const DEFAULT_NEAR_KICKOFF_MIN_MINUTES = 20;
 
+const BOOKMAKER_POLICY_VERSION = "FR_PINNACLE_V1";
+
+/*
+ * Politique de cotes Football AI Pro :
+ * - Pinnacle reste la référence prioritaire lorsqu'il est disponible ;
+ * - sinon, seuls les opérateurs de paris sportifs autorisés en France
+ *   sont acceptés ;
+ * - tous les autres bookmakers sont ignorés à la synchronisation et
+ *   exclus des anciennes lignes déjà présentes en base.
+ *
+ * Les alias correspondent aux noms susceptibles d'être renvoyés par
+ * API-Football. La normalisation supprime accents, espaces et ponctuation.
+ */
+const ALLOWED_BOOKMAKER_ALIASES = Object.freeze({
+  PINNACLE: [
+    "pinnacle",
+    "pinnacle sports",
+  ],
+
+  BETCLIC: [
+    "betclic",
+    "betclic fr",
+  ],
+
+  WINAMAX: [
+    "winamax",
+  ],
+
+  UNIBET: [
+    "unibet",
+    "unibet fr",
+  ],
+
+  BET365: [
+    "bet365",
+    "bet 365",
+    "bet365 fr",
+  ],
+
+  BWIN: [
+    "bwin",
+    "bwin fr",
+  ],
+
+  NETBET: [
+    "netbet",
+    "netbet fr",
+    "netbet sport",
+    "netbetsport",
+  ],
+
+  PMU: [
+    "pmu",
+    "pmu sport",
+    "pmu sports",
+  ],
+
+  PARIONS_SPORT: [
+    "parions sport",
+    "parionssport",
+    "parions web",
+    "parionsweb",
+    "fdj",
+    "fdj sport",
+  ],
+
+  POKERSTARS_SPORTS: [
+    "pokerstars sports",
+    "pokerstarssports",
+    "betstars",
+    "poker stars sports",
+  ],
+
+  VBET: [
+    "vbet",
+    "vbet france",
+  ],
+
+  BETSSON: [
+    "betsson",
+    "betsson france",
+  ],
+
+  CIRCUSBET: [
+    "circusbet",
+    "circus bet",
+  ],
+
+  DAZN_BET: [
+    "dazn bet",
+    "daznbet",
+  ],
+
+  OLYBET: [
+    "olybet",
+    "oly bet",
+  ],
+
+  FEELINGBET: [
+    "feelingbet",
+    "feeling bet",
+  ],
+
+  GENYBET: [
+    "genybet",
+    "geny bet",
+  ],
+
+  YES_OR_NO: [
+    "yesorno",
+    "yes or no",
+    "yesorno jeu",
+  ],
+});
+
+const BOOKMAKER_PRIORITY_ORDER = Object.freeze([
+  "PINNACLE",
+  "BETCLIC",
+  "WINAMAX",
+  "UNIBET",
+  "BET365",
+  "BWIN",
+  "PARIONS_SPORT",
+  "PMU",
+  "NETBET",
+  "POKERSTARS_SPORTS",
+  "VBET",
+  "BETSSON",
+  "CIRCUSBET",
+  "DAZN_BET",
+  "OLYBET",
+  "FEELINGBET",
+  "GENYBET",
+  "YES_OR_NO",
+]);
+
+
 function toNumber(value, fallback = null) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -17,6 +154,186 @@ function normalizeText(value) {
     .replace(/[\u0300-\u036f]/g, "")
     .trim()
     .toLowerCase();
+}
+
+
+function compactBookmakerName(value) {
+  return normalizeText(value)
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+const BOOKMAKER_ALIAS_INDEX = (() => {
+  const index = new Map();
+
+  for (const [canonicalName, aliases] of Object.entries(
+    ALLOWED_BOOKMAKER_ALIASES
+  )) {
+    index.set(
+      compactBookmakerName(canonicalName),
+      canonicalName
+    );
+
+    for (const alias of aliases) {
+      index.set(
+        compactBookmakerName(alias),
+        canonicalName
+      );
+    }
+  }
+
+  return index;
+})();
+
+function canonicalBookmakerName(name, id = null) {
+  /*
+   * Identifiants API-Football déjà confirmés dans l'ancien service.
+   */
+  if (Number(id) === 4) return "PINNACLE";
+  if (Number(id) === 8) return "BET365";
+  if (Number(id) === 16) return "UNIBET";
+
+  const compact = compactBookmakerName(name);
+
+  if (!compact) return null;
+
+  const exact = BOOKMAKER_ALIAS_INDEX.get(compact);
+  if (exact) return exact;
+
+  /*
+   * Secours contrôlé pour les noms enrichis du type
+   * "Pinnacle Sports EU" ou "Betclic France".
+   */
+  for (const [alias, canonicalName] of BOOKMAKER_ALIAS_INDEX.entries()) {
+    if (
+      alias.length >= 4 &&
+      (
+        compact === alias ||
+        compact.startsWith(alias) ||
+        alias.startsWith(compact)
+      )
+    ) {
+      return canonicalName;
+    }
+  }
+
+  return null;
+}
+
+function isAllowedBookmaker(name, id = null) {
+  return canonicalBookmakerName(name, id) !== null;
+}
+
+function publicBookmakerName(canonicalName, fallback = null) {
+  return (
+    {
+      PINNACLE: "Pinnacle",
+      BETCLIC: "Betclic",
+      WINAMAX: "Winamax",
+      UNIBET: "Unibet",
+      BET365: "Bet365",
+      BWIN: "Bwin",
+      NETBET: "NetBet",
+      PMU: "PMU",
+      PARIONS_SPORT: "Parions Sport",
+      POKERSTARS_SPORTS: "PokerStars Sports",
+      VBET: "VBET",
+      BETSSON: "Betsson",
+      CIRCUSBET: "Circusbet",
+      DAZN_BET: "DAZN BET",
+      OLYBET: "OlyBet",
+      FEELINGBET: "Feelingbet",
+      GENYBET: "Genybet",
+      YES_OR_NO: "YesOrNo",
+    }[canonicalName] ||
+    fallback ||
+    canonicalName
+  );
+}
+
+function bookmakerPriority(name, id) {
+  const canonicalName =
+    canonicalBookmakerName(name, id);
+
+  if (!canonicalName) return 1000;
+
+  const index =
+    BOOKMAKER_PRIORITY_ORDER.indexOf(
+      canonicalName
+    );
+
+  return index >= 0 ? index + 1 : 999;
+}
+
+function allowedBookmakerSql(columnName = "bookmaker_name") {
+  /*
+   * PostgreSQL : même logique de normalisation que côté JavaScript.
+   * Ce filtre protège aussi les anciennes lignes enregistrées avant
+   * l'activation de la liste blanche.
+   */
+  const normalizedColumn =
+    `REGEXP_REPLACE(LOWER(COALESCE(${columnName}, '')), '[^a-z0-9]+', '', 'g')`;
+
+  const aliases = Array.from(
+    new Set(
+      Object.values(ALLOWED_BOOKMAKER_ALIASES)
+        .flat()
+        .map(compactBookmakerName)
+        .filter(Boolean)
+    )
+  );
+
+  return `${normalizedColumn} = ANY(ARRAY[${aliases
+    .map((alias) => `'${alias.replaceAll("'", "''")}'`)
+    .join(", ")}]::text[])`;
+}
+
+function bookmakerPrioritySql(
+  nameColumn = "bookmaker_name",
+  idColumn = "bookmaker_id"
+) {
+  const clauses = BOOKMAKER_PRIORITY_ORDER.map(
+    (canonicalName, index) => {
+      const aliases = (
+        ALLOWED_BOOKMAKER_ALIASES[
+          canonicalName
+        ] || []
+      )
+        .map(compactBookmakerName)
+        .filter(Boolean);
+
+      const normalizedColumn =
+        `REGEXP_REPLACE(LOWER(COALESCE(${nameColumn}, '')), '[^a-z0-9]+', '', 'g')`;
+
+      const ids =
+        canonicalName === "PINNACLE"
+          ? [4]
+          : canonicalName === "BET365"
+            ? [8]
+            : canonicalName === "UNIBET"
+              ? [16]
+              : [];
+
+      const checks = [];
+
+      if (ids.length > 0) {
+        checks.push(
+          `${idColumn} IN (${ids.join(", ")})`
+        );
+      }
+
+      if (aliases.length > 0) {
+        checks.push(
+          `${normalizedColumn} = ANY(ARRAY[${aliases
+            .map((alias) => `'${alias.replaceAll("'", "''")}'`)
+            .join(", ")}]::text[])`
+        );
+      }
+
+      return `WHEN ${checks.join(" OR ")} THEN ${index + 1}`;
+    }
+  );
+
+  return `CASE ${clauses.join(" ")} ELSE 1000 END`;
 }
 
 function normalizeMarketKeyFromApi(betName, valueName) {
@@ -66,14 +383,6 @@ function parisDate(value = new Date()) {
     month: "2-digit",
     day: "2-digit",
   }).format(value);
-}
-
-function bookmakerPriority(name, id) {
-  const normalized = normalizeText(name);
-  if (Number(id) === 4 || normalized.includes("pinnacle")) return 1;
-  if (Number(id) === 8 || normalized.includes("bet365")) return 2;
-  if (Number(id) === 16 || normalized.includes("unibet")) return 3;
-  return 100;
 }
 
 function createOddsSyncService({
@@ -181,7 +490,24 @@ function createOddsSyncService({
 
     for (const bookmaker of bookmakers) {
       const bookmakerId = toNumber(bookmaker?.id, null);
-      const bookmakerName = bookmaker?.name || null;
+      const rawBookmakerName = bookmaker?.name || null;
+      const canonicalName = canonicalBookmakerName(
+        rawBookmakerName,
+        bookmakerId
+      );
+
+      /*
+       * Liste blanche : Pinnacle + opérateurs français uniquement.
+       */
+      if (!canonicalName) {
+        continue;
+      }
+
+      const bookmakerName = publicBookmakerName(
+        canonicalName,
+        rawBookmakerName
+      );
+
       const bets = Array.isArray(bookmaker?.bets) ? bookmaker.bets : [];
 
       for (const bet of bets) {
@@ -204,6 +530,12 @@ function createOddsSyncService({
               value: value?.value ?? null,
               suspended: value?.suspended ?? null,
               main: value?.main ?? null,
+              bookmakerPolicyVersion:
+                BOOKMAKER_POLICY_VERSION,
+              bookmakerCanonicalName:
+                canonicalName,
+              bookmakerRawName:
+                rawBookmakerName,
             },
           });
         }
@@ -410,15 +742,17 @@ function createOddsSyncService({
         WHERE fixture_id = ANY($1::bigint[])
           AND is_current = TRUE
           AND odd > 1
+          AND (
+            bookmaker_id IN (4, 8, 16)
+            OR ${allowedBookmakerSql("bookmaker_name")}
+          )
         ORDER BY
           fixture_id,
           market_key,
-          CASE
-            WHEN bookmaker_id = 4 THEN 1
-            WHEN bookmaker_id = 8 THEN 2
-            WHEN bookmaker_id = 16 THEN 3
-            ELSE 100
-          END,
+          ${bookmakerPrioritySql(
+            "bookmaker_name",
+            "bookmaker_id"
+          )},
           captured_at DESC
       `,
       [ids]
@@ -512,15 +846,18 @@ function createOddsSyncService({
             ) p ON TRUE
             WHERE (p.fixture_date AT TIME ZONE $2)::date = $1::date
               AND mo.is_current = TRUE
+              AND mo.odd > 1
+              AND (
+                mo.bookmaker_id IN (4, 8, 16)
+                OR ${allowedBookmakerSql("mo.bookmaker_name")}
+              )
             ORDER BY
               mo.fixture_id,
               mo.market_key,
-              CASE
-                WHEN mo.bookmaker_id = 4 THEN 1
-                WHEN mo.bookmaker_id = 8 THEN 2
-                WHEN mo.bookmaker_id = 16 THEN 3
-                ELSE 100
-              END,
+              ${bookmakerPrioritySql(
+                "mo.bookmaker_name",
+                "mo.bookmaker_id"
+              )},
               mo.captured_at DESC
           `,
           [date, DEFAULT_TIMEZONE]
@@ -548,6 +885,33 @@ function createOddsSyncService({
       } catch (error) {
         return res.status(500).json({ ok: false, error: error.message });
       }
+    });
+
+    app.get("/public/odds/bookmakers", (req, res) => {
+      return res.json({
+        ok: true,
+        policyVersion:
+          BOOKMAKER_POLICY_VERSION,
+        referenceBookmaker: "Pinnacle",
+        priority:
+          BOOKMAKER_PRIORITY_ORDER.map(
+            (canonicalName, index) => ({
+              rank: index + 1,
+              canonicalName,
+              bookmaker:
+                publicBookmakerName(
+                  canonicalName
+                ),
+            })
+          ),
+        allowed:
+          BOOKMAKER_PRIORITY_ORDER.map(
+            (canonicalName) =>
+              publicBookmakerName(
+                canonicalName
+              )
+          ),
+      });
     });
 
     const syncDateHandler = async (req, res) => {
@@ -610,10 +974,17 @@ function createOddsSyncService({
     applyOddsToMarket,
     normalizeMarketKeyFromApi,
     bookmakerPriority,
+    canonicalBookmakerName,
+    isAllowedBookmaker,
+    BOOKMAKER_POLICY_VERSION,
   };
 }
 
 module.exports = {
   createOddsSyncService,
   normalizeMarketKeyFromApi,
+  canonicalBookmakerName,
+  isAllowedBookmaker,
+  bookmakerPriority,
+  BOOKMAKER_POLICY_VERSION,
 };
