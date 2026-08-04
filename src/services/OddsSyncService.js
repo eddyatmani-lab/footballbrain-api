@@ -8,6 +8,18 @@ const DEFAULT_NEAR_KICKOFF_MIN_MINUTES = 20;
 
 const BOOKMAKER_POLICY_VERSION = "FR_PINNACLE_V1";
 
+const AUTO_ODDS_POLICY_VERSION = "BEST_ALLOWED_COHERENT_V2";
+
+/*
+ * Une cote très éloignée de la probabilité IA est généralement un marché
+ * mal apparié, une ligne alternative ou une donnée bookmaker erronée.
+ *
+ * La meilleure cote reste choisie, mais seulement parmi les cotes cohérentes.
+ */
+const AUTO_ODDS_MIN_FAIR_MULTIPLIER = 0.55;
+const AUTO_ODDS_MAX_FAIR_MULTIPLIER = 2.0;
+const AUTO_ODDS_ABSOLUTE_MAX = 15;
+
 /*
  * Politique de cotes Football AI Pro :
  * - Pinnacle reste la référence prioritaire lorsqu'il est disponible ;
@@ -937,11 +949,31 @@ function createOddsSyncService({
           WHERE mo.fixture_id = p.fixture_id
             AND mo.is_current = TRUE
             AND mo.odd > 1
+            AND mo.odd <= ${AUTO_ODDS_ABSOLUTE_MAX}
             AND (
               mo.bookmaker_id IN (4, 8, 16)
               OR ${allowedSql}
             )
             AND ${oddsMarketSql} = ${predictionMarketSql}
+
+            /*
+             * Contrôle de cohérence par rapport à la probabilité du marché
+             * principal. Exemple : une cote 4.00 sur un marché évalué à 74 %
+             * est rejetée comme anomalie ou mauvais appariement.
+             */
+            AND (
+              p.studio_probability IS NULL
+              OR p.studio_probability <= 0
+              OR (
+                mo.odd >=
+                  (100.0 / p.studio_probability) *
+                  ${AUTO_ODDS_MIN_FAIR_MULTIPLIER}
+                AND mo.odd <=
+                  (100.0 / p.studio_probability) *
+                  ${AUTO_ODDS_MAX_FAIR_MULTIPLIER}
+              )
+            )
+
           ORDER BY
             mo.odd DESC,
             mo.captured_at DESC,
@@ -1069,6 +1101,19 @@ function createOddsSyncService({
             ),
           odd,
           bookmaker,
+          probability:
+            candidate.studio_probability != null
+              ? Number(candidate.studio_probability)
+              : null,
+          fairOdd:
+            Number(candidate.studio_probability) > 0
+              ? Number(
+                  (
+                    100 /
+                    Number(candidate.studio_probability)
+                  ).toFixed(3)
+                )
+              : null,
           capturedAt:
             candidate.captured_at,
         });
@@ -1079,7 +1124,9 @@ function createOddsSyncService({
       ok: true,
       policyVersion:
         BOOKMAKER_POLICY_VERSION,
-      mode: "BEST_AVAILABLE",
+      autoOddsPolicyVersion:
+        AUTO_ODDS_POLICY_VERSION,
+      mode: "BEST_AVAILABLE_COHERENT",
       candidates: candidates.rows.length,
       updated,
       skipped:
