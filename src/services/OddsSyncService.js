@@ -376,6 +376,40 @@ function normalizeMarketKeyFromApi(betName, valueName) {
   return null;
 }
 
+
+function normalizeStoredMarketKey(value = "") {
+  const compact = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
+  if (["HOME", "HOMEWIN", "1"].includes(compact)) return "HOME";
+  if (["DRAW", "X", "N"].includes(compact)) return "DRAW";
+  if (["AWAY", "AWAYWIN", "2"].includes(compact)) return "AWAY";
+  if (["BTTS", "BTTSYES", "GG"].includes(compact)) return "BTTS_YES";
+  if (["NOBTTS", "BTTSNO", "NG"].includes(compact)) return "BTTS_NO";
+  if (["OVER25", "OVER250", "PLUS25"].includes(compact)) return "OVER25";
+  if (["UNDER25", "UNDER250", "MOINS25"].includes(compact)) return "UNDER25";
+
+  return compact || null;
+}
+
+function normalizedMarketSql(columnName) {
+  const compact =
+    `REGEXP_REPLACE(UPPER(COALESCE(${columnName}, '')), '[^A-Z0-9]+', '', 'g')`;
+
+  return `CASE
+    WHEN ${compact} IN ('HOME', 'HOMEWIN', '1') THEN 'HOME'
+    WHEN ${compact} IN ('DRAW', 'X', 'N') THEN 'DRAW'
+    WHEN ${compact} IN ('AWAY', 'AWAYWIN', '2') THEN 'AWAY'
+    WHEN ${compact} IN ('BTTS', 'BTTSYES', 'GG') THEN 'BTTS_YES'
+    WHEN ${compact} IN ('NOBTTS', 'BTTSNO', 'NG') THEN 'BTTS_NO'
+    WHEN ${compact} IN ('OVER25', 'OVER250', 'PLUS25') THEN 'OVER25'
+    WHEN ${compact} IN ('UNDER25', 'UNDER250', 'MOINS25') THEN 'UNDER25'
+    ELSE ${compact}
+  END`;
+}
+
 function parisDate(value = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: DEFAULT_TIMEZONE,
@@ -811,6 +845,254 @@ function createOddsSyncService({
     };
   }
 
+
+  async function applyBestAvailableOdds({
+    fixtureIds = [],
+    daysAhead = 7,
+    overwriteAutomatic = true,
+    enteredBy = "automatic-odds",
+  } = {}) {
+    await ensureTables();
+
+    const normalizedFixtureIds = [
+      ...new Set(
+        (Array.isArray(fixtureIds) ? fixtureIds : [])
+          .map(Number)
+          .filter(
+            (fixtureId) =>
+              Number.isInteger(fixtureId) &&
+              fixtureId > 0
+          )
+      ),
+    ];
+
+    const safeDaysAhead = Math.max(
+      1,
+      Math.min(30, Number(daysAhead) || 7)
+    );
+
+    const allowedSql = allowedBookmakerSql(
+      "mo.bookmaker_name"
+    );
+
+    const predictionMarketSql =
+      normalizedMarketSql("p.studio_market_key");
+
+    const oddsMarketSql =
+      normalizedMarketSql("mo.market_key");
+
+    const fixtureFilter =
+      normalizedFixtureIds.length > 0
+        ? "AND p.fixture_id = ANY($1::bigint[])"
+        : `
+          AND p.fixture_date >= NOW() - INTERVAL '2 hours'
+          AND p.fixture_date < NOW() + ($1::text || ' days')::interval
+        `;
+
+    const firstParameter =
+      normalizedFixtureIds.length > 0
+        ? normalizedFixtureIds
+        : String(safeDaysAhead);
+
+    /*
+     * Une cote saisie réellement à la main reste protégée.
+     * Seules les cotes absentes ou déjà issues de l'automatisation
+     * peuvent être remplacées lors d'une actualisation.
+     */
+    const overwriteFilter = overwriteAutomatic
+      ? `AND (
+          p.manual_market_odd IS NULL
+          OR p.manual_odd_source LIKE 'AUTO_BEST_ODD%'
+        )`
+      : "AND p.manual_market_odd IS NULL";
+
+    const candidates = await pool.query(
+      `
+        SELECT DISTINCT ON (p.fixture_id)
+          p.fixture_id,
+          p.studio_market_key,
+          p.studio_market_label,
+          p.studio_probability,
+          p.studio_decision_score,
+          p.manual_stake_units,
+
+          best_odd.odd,
+          best_odd.bookmaker_id,
+          best_odd.bookmaker_name,
+          best_odd.source,
+          best_odd.api_updated_at,
+          best_odd.captured_at
+
+        FROM predictions p
+
+        JOIN LATERAL (
+          SELECT
+            mo.odd,
+            mo.bookmaker_id,
+            mo.bookmaker_name,
+            mo.source,
+            mo.api_updated_at,
+            mo.captured_at
+          FROM market_odds mo
+          WHERE mo.fixture_id = p.fixture_id
+            AND mo.is_current = TRUE
+            AND mo.odd > 1
+            AND (
+              mo.bookmaker_id IN (4, 8, 16)
+              OR ${allowedSql}
+            )
+            AND ${oddsMarketSql} = ${predictionMarketSql}
+          ORDER BY
+            mo.odd DESC,
+            mo.captured_at DESC,
+            ${bookmakerPrioritySql(
+              "mo.bookmaker_name",
+              "mo.bookmaker_id"
+            )} ASC
+          LIMIT 1
+        ) best_odd ON TRUE
+
+        WHERE NULLIF(
+          BTRIM(COALESCE(p.studio_market_key, '')),
+          ''
+        ) IS NOT NULL
+          ${fixtureFilter}
+          ${overwriteFilter}
+
+        ORDER BY
+          p.fixture_id,
+          p.updated_at DESC NULLS LAST,
+          p.id DESC
+      `,
+      [firstParameter]
+    );
+
+    let updated = 0;
+    const applied = [];
+
+    for (const candidate of candidates.rows) {
+      const fixtureId = Number(candidate.fixture_id);
+      const odd = Number(candidate.odd);
+
+      if (
+        !Number.isInteger(fixtureId) ||
+        !Number.isFinite(odd) ||
+        odd <= 1
+      ) {
+        continue;
+      }
+
+      const bookmaker =
+        candidate.bookmaker_name ||
+        "Bookmaker autorisé";
+
+      const source =
+        `AUTO_BEST_ODD · ${bookmaker}`;
+
+      const result = await pool.query(
+        `
+          UPDATE predictions
+          SET
+            manual_market_odd = $2,
+            manual_market_key = studio_market_key,
+            manual_stake_units = COALESCE(
+              NULLIF(manual_stake_units, 0),
+              1
+            ),
+            manual_profit_units = NULL,
+            manual_roi_percent = NULL,
+            manual_odd_source = $3,
+            manual_odd_entered_at = COALESCE(
+              manual_odd_entered_at,
+              NOW()
+            ),
+            manual_odd_updated_at = NOW(),
+            manual_odd_entered_by = $4,
+
+            official_tracked_market_key =
+              studio_market_key,
+            official_tracked_market_label =
+              studio_market_label,
+            official_tracked_probability =
+              studio_probability,
+            official_tracked_decision_score =
+              studio_decision_score,
+            official_tracked_at = NOW(),
+
+            prematch_final_market_key = COALESCE(
+              prematch_final_market_key,
+              studio_market_key
+            ),
+            prematch_final_market_label = COALESCE(
+              prematch_final_market_label,
+              studio_market_label
+            ),
+            prematch_final_probability = COALESCE(
+              prematch_final_probability,
+              studio_probability
+            ),
+            prematch_final_decision_score = COALESCE(
+              prematch_final_decision_score,
+              studio_decision_score
+            ),
+            prematch_final_captured_at = COALESCE(
+              prematch_final_captured_at,
+              NOW()
+            ),
+
+            official_market_won = NULL,
+            prematch_final_market_won = NULL,
+            market_changed = NULL,
+            market_change_outcome = NULL,
+            updated_at = NOW()
+
+          WHERE fixture_id = $1
+          RETURNING fixture_id
+        `,
+        [
+          fixtureId,
+          odd,
+          source,
+          String(enteredBy || "automatic-odds")
+            .trim()
+            .slice(0, 200),
+        ]
+      );
+
+      if (result.rowCount > 0) {
+        updated += 1;
+        applied.push({
+          fixtureId,
+          marketKey:
+            normalizeStoredMarketKey(
+              candidate.studio_market_key
+            ),
+          odd,
+          bookmaker,
+          capturedAt:
+            candidate.captured_at,
+        });
+      }
+    }
+
+    return {
+      ok: true,
+      policyVersion:
+        BOOKMAKER_POLICY_VERSION,
+      mode: "BEST_AVAILABLE",
+      candidates: candidates.rows.length,
+      updated,
+      skipped:
+        Math.max(
+          0,
+          candidates.rows.length - updated
+        ),
+      applied,
+      generatedAt:
+        new Date().toISOString(),
+    };
+  }
+
   function withAdminGuard(handler) {
     if (typeof adminGuard !== "function") return handler;
     return [adminGuard, handler];
@@ -886,6 +1168,49 @@ function createOddsSyncService({
         return res.status(500).json({ ok: false, error: error.message });
       }
     });
+
+    const applyBestOddsHandler =
+      async (req, res) => {
+        try {
+          const result =
+            await applyBestAvailableOdds({
+              fixtureIds:
+                req.body?.fixtureIds,
+              daysAhead:
+                req.body?.daysAhead,
+              overwriteAutomatic:
+                req.body?.overwriteAutomatic !==
+                false,
+              enteredBy:
+                req.body?.enteredBy ||
+                "Admin Football AI Pro",
+            });
+
+          return res.json(result);
+        } catch (error) {
+          console.error(
+            "ERREUR APPLICATION COTES AUTOMATIQUES :",
+            error
+          );
+
+          return res.status(500).json({
+            ok: false,
+            error:
+              error?.message ||
+              "Impossible d'appliquer les meilleures cotes.",
+          });
+        }
+      };
+
+    const applyBestOddsHandlers =
+      withAdminGuard(applyBestOddsHandler);
+
+    app.post(
+      "/internal/odds/apply-best",
+      ...(Array.isArray(applyBestOddsHandlers)
+        ? applyBestOddsHandlers
+        : [applyBestOddsHandlers])
+    );
 
     app.get("/public/odds/bookmakers", (req, res) => {
       return res.json({
@@ -972,6 +1297,7 @@ function createOddsSyncService({
     syncNearKickoff,
     getCurrentOddsMap,
     applyOddsToMarket,
+    applyBestAvailableOdds,
     normalizeMarketKeyFromApi,
     bookmakerPriority,
     canonicalBookmakerName,
