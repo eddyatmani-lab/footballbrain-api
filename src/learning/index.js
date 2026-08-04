@@ -108,18 +108,54 @@ function createEngineLearningCore({
         try {
           await ensureTables();
 
-          const [logs, settlements, stats] =
-            await Promise.all([
-              pool.query(
-                "SELECT COUNT(*)::INTEGER AS count FROM engine_prediction_logs"
-              ),
-              pool.query(
-                "SELECT COUNT(*)::INTEGER AS count FROM engine_prediction_settlements"
-              ),
-              pool.query(
-                "SELECT COUNT(*)::INTEGER AS count FROM engine_performance_stats"
-              ),
-            ]);
+          const [
+            logs,
+            settlements,
+            stats,
+            pending,
+            latestRuns,
+          ] = await Promise.all([
+            pool.query(
+              "SELECT COUNT(*)::INTEGER AS count FROM engine_prediction_logs"
+            ),
+            pool.query(
+              "SELECT COUNT(*)::INTEGER AS count FROM engine_prediction_settlements"
+            ),
+            pool.query(
+              "SELECT COUNT(*)::INTEGER AS count FROM engine_performance_stats"
+            ),
+            pool.query(`
+              SELECT COUNT(*)::INTEGER AS count
+              FROM engine_prediction_logs log
+              JOIN predictions p
+                ON p.fixture_id = log.fixture_id
+              LEFT JOIN engine_prediction_settlements settlement
+                ON settlement.prediction_log_id = log.id
+              WHERE settlement.id IS NULL
+                AND p.result_status = 'COMPLETED'
+                AND p.home_goals IS NOT NULL
+                AND p.away_goals IS NOT NULL
+            `),
+            pool.query(`
+              SELECT DISTINCT ON (run_type)
+                run_type,
+                status,
+                rows_processed,
+                summary,
+                error_message,
+                started_at,
+                finished_at
+              FROM engine_learning_runs
+              ORDER BY run_type, started_at DESC
+            `),
+          ]);
+
+          const runsByType = Object.fromEntries(
+            latestRuns.rows.map((run) => [
+              run.run_type,
+              run,
+            ])
+          );
 
           return res.json({
             ok: true,
@@ -129,9 +165,16 @@ function createEngineLearningCore({
             settlements: Number(
               settlements.rows[0]?.count || 0
             ),
+            pendingSettlements: Number(
+              pending.rows[0]?.count || 0
+            ),
             performanceGroups: Number(
               stats.rows[0]?.count || 0
             ),
+            lastSettlementRun:
+              runsByType.ENGINE_SETTLEMENT || null,
+            lastPerformanceRun:
+              runsByType.PERFORMANCE_REBUILD || null,
           });
         } catch (error) {
           return res.status(500).json({
@@ -194,13 +237,35 @@ function createEngineLearningCore({
     if (!schedulersEnabled) return;
     if (settlementTimer || performanceTimer) return;
 
-    settlementTimer = setInterval(() => {
-      runSettlement().catch((error) => {
+    setTimeout(async () => {
+      try {
+        await ensureTables();
+        const settlement = await runSettlement();
+
+        if (Number(settlement?.settled || 0) > 0) {
+          await rebuildPerformance();
+        }
+      } catch (error) {
+        console.error(
+          "ENGINE LEARNING INITIAL RUN :",
+          error
+        );
+      }
+    }, 30 * 1000);
+
+    settlementTimer = setInterval(async () => {
+      try {
+        const settlement = await runSettlement();
+
+        if (Number(settlement?.settled || 0) > 0) {
+          await rebuildPerformance();
+        }
+      } catch (error) {
         console.error(
           "ENGINE LEARNING SETTLEMENT :",
           error
         );
-      });
+      }
     }, SETTLEMENT_INTERVAL_MINUTES * 60 * 1000);
 
     performanceTimer = setInterval(() => {

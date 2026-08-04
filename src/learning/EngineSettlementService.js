@@ -108,7 +108,16 @@ function createEngineSettlementService({ pool }) {
       Math.min(10000, Number(limit) || 1000)
     );
 
-    const result = await pool.query(
+    const runResult = await pool.query(`
+      INSERT INTO engine_learning_runs(run_type)
+      VALUES ('ENGINE_SETTLEMENT')
+      RETURNING id
+    `);
+
+    const runId = runResult.rows[0]?.id;
+
+    try {
+      const result = await pool.query(
       `
         SELECT
           log.id AS prediction_log_id,
@@ -208,13 +217,50 @@ function createEngineSettlementService({ pool }) {
       settled += 1;
     }
 
-    return {
-      ok: true,
-      found: result.rows.length,
-      settled,
-      skipped,
-      settledAt: new Date().toISOString(),
-    };
+      const summary = {
+        ok: true,
+        found: result.rows.length,
+        settled,
+        skipped,
+        settledAt: new Date().toISOString(),
+      };
+
+      await pool.query(
+        `
+          UPDATE engine_learning_runs
+          SET
+            status = 'COMPLETED',
+            rows_processed = $2,
+            summary = $3::jsonb,
+            finished_at = NOW()
+          WHERE id = $1
+        `,
+        [
+          runId,
+          settled,
+          JSON.stringify(summary),
+        ]
+      );
+
+      return summary;
+    } catch (error) {
+      await pool.query(
+        `
+          UPDATE engine_learning_runs
+          SET
+            status = 'FAILED',
+            error_message = $2,
+            finished_at = NOW()
+          WHERE id = $1
+        `,
+        [
+          runId,
+          String(error?.message || error).slice(0, 2000),
+        ]
+      );
+
+      throw error;
+    }
   }
 
   return {
