@@ -19,6 +19,10 @@ const {
   createEnginePerformanceService,
 } = require("./EnginePerformanceService");
 
+const {
+  createEngineWeightRecommendationService,
+} = require("./EngineWeightRecommendationService");
+
 function createEngineLearningCore({
   app,
   pool,
@@ -40,10 +44,16 @@ function createEngineLearningCore({
   const performanceService =
     createEnginePerformanceService({ pool });
 
+  const weightRecommendationService =
+    createEngineWeightRecommendationService({
+      pool,
+    });
+
   let settlementTimer = null;
   let performanceTimer = null;
   let settlementRunning = false;
   let performanceRunning = false;
+  let recommendationsRunning = false;
 
   function withAdminGuard(handler) {
     if (typeof adminGuard !== "function") {
@@ -57,6 +67,7 @@ function createEngineLearningCore({
     await predictionLog.ensureTables();
     await settlementService.ensureTables();
     await performanceService.ensureTables();
+    await weightRecommendationService.ensureTables();
   }
 
   async function logStudioSnapshot(payload = {}) {
@@ -95,9 +106,34 @@ function createEngineLearningCore({
     performanceRunning = true;
 
     try {
-      return await performanceService.rebuildPerformance();
+      const performance =
+        await performanceService.rebuildPerformance();
+
+      await rebuildWeightRecommendations();
+
+      return performance;
     } finally {
       performanceRunning = false;
+    }
+  }
+
+  async function rebuildWeightRecommendations() {
+    if (recommendationsRunning) {
+      return {
+        ok: true,
+        skipped: true,
+        reason:
+          "WEIGHT_RECOMMENDATIONS_ALREADY_RUNNING",
+      };
+    }
+
+    recommendationsRunning = true;
+
+    try {
+      return await weightRecommendationService
+        .rebuildRecommendations();
+    } finally {
+      recommendationsRunning = false;
     }
   }
 
@@ -249,6 +285,41 @@ function createEngineLearningCore({
         }
       })
     );
+
+    app.post(
+      "/internal/learning/engines/rebuild-weight-recommendations",
+      ...withAdminGuard(async (req, res) => {
+        try {
+          await ensureTables();
+          return res.json(
+            await rebuildWeightRecommendations()
+          );
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
+        }
+      })
+    );
+
+    app.get(
+      "/internal/learning/engines/weight-recommendations",
+      ...withAdminGuard(async (req, res) => {
+        try {
+          await ensureTables();
+          return res.json(
+            await weightRecommendationService
+              .getRecommendations()
+          );
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
+        }
+      })
+    );
   }
 
   function startScheduler() {
@@ -312,6 +383,7 @@ function createEngineLearningCore({
     logStudioSnapshot,
     runSettlement,
     rebuildPerformance,
+    rebuildWeightRecommendations,
     mode: LEARNING_MODE,
     version: ENGINE_LEARNING_VERSION,
   };
