@@ -42,6 +42,7 @@ const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
 const { createOddsSyncService } = require("./src/services/OddsSyncService");
+const { createTodayProgrammeService } = require("./src/services/TodayProgrammeService");
 const {
   createEngineLearningCore,
 } = require("./src/learning");
@@ -314,6 +315,16 @@ const oddsSyncService = createOddsSyncService({
 });
 
 oddsSyncService.registerRoutes();
+
+const todayProgrammeService =
+  createTodayProgrammeService({
+    app,
+    pool,
+    callApiFootball,
+    isExcludedFixture,
+  });
+
+todayProgrammeService.registerRoutes();
 
 function isExcludedFixture(
   fixture = {}
