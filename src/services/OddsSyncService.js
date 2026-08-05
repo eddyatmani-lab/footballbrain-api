@@ -1307,115 +1307,21 @@ function createOddsSyncService({
     app.post("/internal/odds/sync/fixture/:fixtureId", ...(Array.isArray(fixtureHandlers) ? fixtureHandlers : [fixtureHandlers]));
   }
 
-  async function syncAndApplyTodayOdds({
-    source = "scheduler",
-  } = {}) {
-    const dateResult = await syncDate();
-
-    const applyResult =
-      await applyBestAvailableOdds({
-        daysAhead: 2,
-        overwriteAutomatic: true,
-        enteredBy:
-          `automatic-odds:${source}`,
-      });
-
-    return {
-      ok: true,
-      dateSync: dateResult,
-      appliedOdds: applyResult,
-      completedAt:
-        new Date().toISOString(),
-    };
-  }
-
-  async function syncNearKickoffAndApply() {
-    const proximityResult =
-      await syncNearKickoff();
-
-    const fixtureIds =
-      Array.isArray(
-        proximityResult?.details
-      )
-        ? proximityResult.details
-            .map(
-              (item) =>
-                Number(item?.fixtureId)
-            )
-            .filter(
-              (fixtureId) =>
-                Number.isInteger(fixtureId) &&
-                fixtureId > 0
-            )
-        : [];
-
-    const applyResult =
-      await applyBestAvailableOdds({
-        fixtureIds,
-        daysAhead: 2,
-        overwriteAutomatic: true,
-        enteredBy:
-          "automatic-odds:near-kickoff",
-      });
-
-    return {
-      ok: true,
-      proximitySync:
-        proximityResult,
-      appliedOdds:
-        applyResult,
-      completedAt:
-        new Date().toISOString(),
-    };
-  }
-
   function startScheduler() {
     if (!schedulersEnabled) return;
     if (dateTimer || nearKickoffTimer) return;
 
-    /*
-     * Avant ce correctif, le scheduler alimentait uniquement market_odds.
-     * Il ne recopiait jamais la meilleure cote dans les champs officiels
-     * du panneau Admin. Le bouton manuel était donc encore nécessaire.
-     */
     initialTimer = setTimeout(() => {
-      syncAndApplyTodayOdds({
-        source: "initial",
-      }).catch((error) =>
-        console.error(
-          "ERREUR ODDS SYNC + APPLY INITIAL :",
-          error
-        )
-      );
-
-      syncNearKickoffAndApply()
-        .catch((error) =>
-          console.error(
-            "ERREUR ODDS PROXIMITÉ + APPLY INITIAL :",
-            error
-          )
-        );
+      syncDate().catch((error) => console.error("ERREUR ODDS SYNC INITIAL :", error));
+      syncNearKickoff().catch((error) => console.error("ERREUR ODDS SYNC PROXIMITÉ INITIAL :", error));
     }, 20000);
 
     dateTimer = setInterval(() => {
-      syncAndApplyTodayOdds({
-        source: "date-scheduler",
-      }).catch((error) =>
-        console.error(
-          "ERREUR ODDS SYNC + APPLY DATE :",
-          error
-        )
-      );
+      syncDate().catch((error) => console.error("ERREUR ODDS SYNC DATE :", error));
     }, DEFAULT_SYNC_HOURS * 60 * 60 * 1000);
 
     nearKickoffTimer = setInterval(() => {
-      syncNearKickoffAndApply()
-        .catch((error) =>
-          console.error(
-            "ERREUR ODDS PROXIMITÉ + APPLY :",
-            error
-          )
-        );
+      syncNearKickoff().catch((error) => console.error("ERREUR ODDS SYNC PROXIMITÉ :", error));
     }, DEFAULT_NEAR_KICKOFF_INTERVAL_MINUTES * 60 * 1000);
   }
 
@@ -1436,8 +1342,6 @@ function createOddsSyncService({
     syncDate,
     syncFixture,
     syncNearKickoff,
-    syncAndApplyTodayOdds,
-    syncNearKickoffAndApply,
     getCurrentOddsMap,
     applyOddsToMarket,
     applyBestAvailableOdds,
