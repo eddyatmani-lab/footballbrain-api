@@ -561,6 +561,13 @@ function createOddsSyncService({
         for (const value of values) {
           const marketKey = normalizeMarketKeyFromApi(bet?.name, value?.value);
           const odd = toNumber(value?.odd, null);
+          const suspended =
+  value?.suspended === true ||
+  String(value?.suspended || "").toLowerCase() === "true";
+
+if (suspended) {
+  continue;
+}
           if (!marketKey || odd === null || odd <= 1) continue;
 
           rows.push({
@@ -588,7 +595,80 @@ function createOddsSyncService({
       }
     }
 
-    return rows;
+    /*
+ * Plusieurs lignes API peuvent correspondre au même marché chez un même
+ * bookmaker. On ne conserve qu'une seule ligne par :
+ *
+ * fixture + marché + bookmaker
+ *
+ * Priorités :
+ * 1. ligne non suspendue ;
+ * 2. ligne principale ;
+ * 3. donnée la plus proche d'un marché standard ;
+ * 4. en dernier recours, cote la moins extrême.
+ */
+const groupedRows = new Map();
+
+for (const row of rows) {
+  const key = [
+    row.fixtureId,
+    row.marketKey,
+    row.bookmakerId ?? row.bookmakerName,
+  ].join(":");
+
+  const current = groupedRows.get(key);
+
+  if (!current) {
+    groupedRows.set(key, row);
+    continue;
+  }
+
+  const rowSuspended =
+    row.rawPayload?.suspended === true ||
+    String(row.rawPayload?.suspended || "").toLowerCase() === "true";
+
+  const currentSuspended =
+    current.rawPayload?.suspended === true ||
+    String(current.rawPayload?.suspended || "").toLowerCase() === "true";
+
+  if (currentSuspended && !rowSuspended) {
+    groupedRows.set(key, row);
+    continue;
+  }
+
+  if (!currentSuspended && rowSuspended) {
+    continue;
+  }
+
+  const rowIsMain =
+    row.rawPayload?.main === true ||
+    String(row.rawPayload?.main || "").toLowerCase() === "true" ||
+    Number(row.rawPayload?.main) === 1;
+
+  const currentIsMain =
+    current.rawPayload?.main === true ||
+    String(current.rawPayload?.main || "").toLowerCase() === "true" ||
+    Number(current.rawPayload?.main) === 1;
+
+  if (rowIsMain && !currentIsMain) {
+    groupedRows.set(key, row);
+    continue;
+  }
+
+  if (!rowIsMain && currentIsMain) {
+    continue;
+  }
+
+  /*
+   * À priorité égale, on évite qu'une cote secondaire très haute écrase
+   * arbitrairement une cote standard.
+   */
+  if (Number(row.odd) < Number(current.odd)) {
+    groupedRows.set(key, row);
+  }
+}
+
+return Array.from(groupedRows.values());
   }
 
   async function saveRows(rows = []) {
