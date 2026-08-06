@@ -75,6 +75,43 @@ function requireAdminKey(req, res) {
 
   return true;
 }
+/**
+ * Toutes les routes d'administration Railway sont protégées.
+ *
+ * Toute nouvelle route créée sous :
+ *  - /internal/admin/
+ *  - /internal/league-manager/
+ *  - /internal/learning/
+ *  - /internal/odds/
+ *
+ * exigera automatiquement la clé ADMIN_API_KEY.
+ */
+app.use((req, res, next) => {
+  const path = String(req.path || "").replace(/\/+$/, "");
+
+  const protectedPrefixes = [
+    "/internal/admin/",
+    "/internal/league-manager/",
+    "/internal/learning/",
+    "/internal/odds/",
+  ];
+
+  const requiresAdminKey = protectedPrefixes.some(
+    (prefix) =>
+      path === prefix.slice(0, -1) ||
+      path.startsWith(prefix)
+  );
+
+  if (!requiresAdminKey) {
+    return next();
+  }
+
+  if (!requireAdminKey(req, res)) {
+    return;
+  }
+
+  next();
+});
 const ALLOWED_ORIGINS = new Set([
   "https://footballaipro.fr",
   "https://www.footballaipro.fr",
