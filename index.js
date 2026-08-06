@@ -49,6 +49,137 @@ const {
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const { z } = require("zod");
+function validateRequest(schema, source = "body") {
+  return (req, res, next) => {
+    const result = schema.safeParse(
+      req[source]
+    );
+
+    if (!result.success) {
+      return res.status(400).json({
+        ok: false,
+        error: "Données invalides.",
+        details: result.error.issues.map(
+          (issue) => ({
+            field: issue.path.join("."),
+            message: issue.message,
+          })
+        ),
+      });
+    }
+
+    req[source] = result.data;
+
+    return next();
+  };
+}
+const leagueManagerListQuerySchema = z
+  .object({
+    search: z
+      .string()
+      .trim()
+      .max(120)
+      .optional()
+      .default(""),
+
+    country: z
+      .string()
+      .trim()
+      .max(120)
+      .optional()
+      .default(""),
+
+    type: z
+      .enum([
+        "",
+        "league",
+        "cup",
+        "unknown",
+      ])
+      .optional()
+      .default(""),
+
+    enabled: z
+      .enum([
+        "",
+        "true",
+        "false",
+      ])
+      .optional()
+      .default(""),
+  })
+  .strict();
+
+const leagueManagerSyncQuerySchema = z
+  .object({
+    force: z
+      .enum([
+        "0",
+        "1",
+      ])
+      .optional()
+      .default("0"),
+  })
+  .strict();
+
+const leagueManagerParamsSchema = z
+  .object({
+    leagueId: z.coerce
+      .number()
+      .int()
+      .positive(),
+  })
+  .strict();
+
+const leagueManagerUpdateBodySchema = z
+  .object({
+    enabled: z
+      .boolean()
+      .optional(),
+
+    priority: z
+      .enum([
+        "LOW",
+        "NORMAL",
+        "HIGH",
+        "CRITICAL",
+      ])
+      .optional(),
+
+    notes: z
+      .string()
+      .trim()
+      .max(1000)
+      .optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.enabled !== undefined ||
+      value.priority !== undefined ||
+      value.notes !== undefined,
+    {
+      message:
+        "Au moins un champ doit être fourni.",
+    }
+  );
+
+const leagueManagerBulkBodySchema = z
+  .object({
+    leagueIds: z
+      .array(
+        z.coerce
+          .number()
+          .int()
+          .positive()
+      )
+      .min(1)
+      .max(500),
+
+    enabled: z.boolean(),
+  })
+  .strict();
 const {
   FootballMonteCarlo,
 } = require("./FootballMonteCarlo");
@@ -1240,6 +1371,10 @@ async function syncLeagueManagerCatalogue({ forceRefresh = false } = {}) {
 
 app.get(
   "/internal/league-manager/leagues",
+  validateRequest(
+    leagueManagerListQuerySchema,
+    "query"
+  ),
   async (req, res) => {
 
     if (!requireAdminKey(req, res)) {
@@ -1385,6 +1520,10 @@ app.get(
 
 app.post(
   "/internal/league-manager/sync",
+  validateRequest(
+    leagueManagerSyncQuerySchema,
+    "query"
+  ),
   async (req, res) => {
 
     if (!requireAdminKey(req, res)) {
@@ -1419,6 +1558,14 @@ app.post(
 
 app.patch(
   "/internal/league-manager/leagues/:leagueId",
+  validateRequest(
+    leagueManagerParamsSchema,
+    "params"
+  ),
+  validateRequest(
+    leagueManagerUpdateBodySchema,
+    "body"
+  ),
   async (req, res) => {
 
     if (!requireAdminKey(req, res)) {
@@ -1510,6 +1657,10 @@ app.patch(
 
 app.post(
   "/internal/league-manager/bulk",
+  validateRequest(
+    leagueManagerBulkBodySchema,
+    "body"
+  ),
   async (req, res) => {
 
     if (!requireAdminKey(req, res)) {
@@ -24587,4 +24738,9 @@ app.listen(
     startDailyTicketScheduler();
     startAutomaticSchedulers();
   }
-);
+);#include <stdio.h>
+
+int main() {
+    printf("Hello world!\n");
+    return 0;
+}
