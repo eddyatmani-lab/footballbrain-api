@@ -41,145 +41,7 @@ const {
 const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
-const { createOddsSyncService } = require("./src/services/OddsSyncService");
-const { createTodayProgrammeService } = require("./src/services/TodayProgrammeService");
-const {
-  createEngineLearningCore,
-} = require("./src/learning");
 const cors = require("cors");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const { z } = require("zod");
-function validateRequest(schema, source = "body") {
-  return (req, res, next) => {
-    const result = schema.safeParse(
-      req[source]
-    );
-
-    if (!result.success) {
-      return res.status(400).json({
-        ok: false,
-        error: "Données invalides.",
-        details: result.error.issues.map(
-          (issue) => ({
-            field: issue.path.join("."),
-            message: issue.message,
-          })
-        ),
-      });
-    }
-
-    req[source] = result.data;
-
-    return next();
-  };
-}
-const leagueManagerListQuerySchema = z
-  .object({
-    search: z
-      .string()
-      .trim()
-      .max(120)
-      .optional()
-      .default(""),
-
-    country: z
-      .string()
-      .trim()
-      .max(120)
-      .optional()
-      .default(""),
-
-    type: z
-      .enum([
-        "",
-        "league",
-        "cup",
-        "unknown",
-      ])
-      .optional()
-      .default(""),
-
-    enabled: z
-      .enum([
-        "",
-        "true",
-        "false",
-      ])
-      .optional()
-      .default(""),
-  })
-  .strict();
-
-const leagueManagerSyncQuerySchema = z
-  .object({
-    force: z
-      .enum([
-        "0",
-        "1",
-      ])
-      .optional()
-      .default("0"),
-  })
-  .strict();
-
-const leagueManagerParamsSchema = z
-  .object({
-    leagueId: z.coerce
-      .number()
-      .int()
-      .positive(),
-  })
-  .strict();
-
-const leagueManagerUpdateBodySchema = z
-  .object({
-    enabled: z
-      .boolean()
-      .optional(),
-
-    priority: z
-      .enum([
-        "LOW",
-        "NORMAL",
-        "HIGH",
-        "CRITICAL",
-      ])
-      .optional(),
-
-    notes: z
-      .string()
-      .trim()
-      .max(1000)
-      .optional(),
-  })
-  .strict()
-  .refine(
-    (value) =>
-      value.enabled !== undefined ||
-      value.priority !== undefined ||
-      value.notes !== undefined,
-    {
-      message:
-        "Au moins un champ doit être fourni.",
-    }
-  );
-
-const leagueManagerBulkBodySchema = z
-  .object({
-    leagueIds: z
-      .array(
-        z.coerce
-          .number()
-          .int()
-          .positive()
-      )
-      .min(1)
-      .max(500),
-
-    enabled: z.boolean(),
-  })
-  .strict();
 const {
   FootballMonteCarlo,
 } = require("./FootballMonteCarlo");
@@ -194,266 +56,9 @@ const {
   createMarketExplainability,
 } = require("./core/explainability/decisionExplainability");
 const app = express();
-
-const IS_PRODUCTION =
-  process.env.NODE_ENV === "production";
-
-const SENSITIVE_LOG_KEY_PATTERN =
-  /authorization|cookie|token|secret|password|api[-_]?key|x-admin-key|x-apisports-key/i;
-
-function sanitizeLogValue(
-  value,
-  depth = 0,
-  seen = new WeakSet()
-) {
-  if (
-    value === null ||
-    value === undefined ||
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return value;
-  }
-
-  if (value instanceof Error) {
-    return {
-      name: value.name,
-      message: value.message,
-      code: value.code || null,
-      status:
-        value.status ||
-        value.response?.status ||
-        null,
-      stack:
-        IS_PRODUCTION
-          ? undefined
-          : value.stack,
-    };
-  }
-
-  if (depth >= 4) {
-    return "[profondeur limitée]";
-  }
-
-  if (Array.isArray(value)) {
-    return value
-      .slice(0, 100)
-      .map((item) =>
-        sanitizeLogValue(
-          item,
-          depth + 1,
-          seen
-        )
-      );
-  }
-
-  if (typeof value === "object") {
-    if (seen.has(value)) {
-      return "[référence circulaire]";
-    }
-
-    seen.add(value);
-
-    const sanitized = {};
-
-    for (const [
-      key,
-      nestedValue,
-    ] of Object.entries(value)) {
-      sanitized[key] =
-        SENSITIVE_LOG_KEY_PATTERN.test(key)
-          ? "[REDACTED]"
-          : sanitizeLogValue(
-              nestedValue,
-              depth + 1,
-              seen
-            );
-    }
-
-    return sanitized;
-  }
-
-  return String(value);
-}
-
-function debugLog(...values) {
-  if (!IS_PRODUCTION) {
-    console.log(
-      ...values.map((value) =>
-        sanitizeLogValue(value)
-      )
-    );
-  }
-}
-
-function logWarning(...values) {
-  console.warn(
-    ...values.map((value) =>
-      sanitizeLogValue(value)
-    )
-  );
-}
-
-function logError(...values) {
-  console.error(
-    ...values.map((value) =>
-      sanitizeLogValue(value)
-    )
-  );
-}
-
-    app.disable("x-powered-by");
-
-app.use(
-  helmet({
-    crossOriginResourcePolicy: {
-      policy: "cross-origin",
-    },
-  })
-);
-    
-
-/*
- * En production, aucune réponse HTTP 500 ne doit exposer
- * un message SQL, une stack ou les détails d'un fournisseur externe.
- * Les détails restent disponibles dans les logs Railway nettoyés.
- */
-app.use((req, res, next) => {
-  const originalJson =
-    res.json.bind(res);
-
-  res.json = (payload) => {
-    if (
-      IS_PRODUCTION &&
-      res.statusCode >= 500
-    ) {
-      return originalJson({
-        ok: false,
-        error:
-          "Erreur interne du serveur.",
-      });
-    }
-
-    return originalJson(payload);
-  };
-
-  next();
-});
-
-const publicApiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 300,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    ok: false,
-    error:
-      "Trop de requêtes. Réessayez dans quelques minutes.",
-  },
-});
-
-const adminApiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 120,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    ok: false,
-    error:
-      "Trop de requêtes administrateur. Réessayez dans quelques minutes.",
-  },
-});
-function requireAdminKey(req, res) {
-  const adminKey = req.get("x-admin-key");
-
-  if (adminKey !== process.env.ADMIN_API_KEY) {
-    res.status(403).json({
-      ok: false,
-      error: "Clé administrateur invalide.",
-    });
-
-    return false;
-  }
-
-  return true;
-}
-/**
- * Toutes les routes d'administration Railway sont protégées.
- *
- * Toute nouvelle route créée sous :
- *  - /internal/admin/
- *  - /internal/league-manager/
- *  - /internal/learning/
- *  - /internal/odds/
- *
- * exigera automatiquement la clé ADMIN_API_KEY.
- */
-app.use((req, res, next) => {
-  const path = String(req.path || "").replace(/\/+$/, "");
-
-  const protectedPrefixes = [
-    "/internal/admin/",
-    "/internal/league-manager/",
-    "/internal/learning/",
-    "/internal/odds/",
-  ];
-
-  const requiresAdminKey = protectedPrefixes.some(
-    (prefix) =>
-      path === prefix.slice(0, -1) ||
-      path.startsWith(prefix)
-  );
-
-  if (!requiresAdminKey) {
-    return next();
-  }
-
-  if (!requireAdminKey(req, res)) {
-    return;
-  }
-
-  next();
-});
-const ALLOWED_ORIGINS = new Set([
-  "https://footballaipro.fr",
-  "https://www.footballaipro.fr",
-  "https://footballaipro.base44.app",
-
-  // Développement local uniquement
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-]);
-
 app.use(
   cors({
-    origin(origin, callback) {
-      /*
-       * Les requêtes serveur-à-serveur, les tâches Railway
-       * et certains outils techniques n'envoient pas d'Origin.
-       */
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      if (ALLOWED_ORIGINS.has(origin)) {
-        return callback(null, true);
-      }
-
-      logWarning(
-        "CORS : origine refusée",
-        origin
-      );
-
-      const error = new Error(
-        "Origine non autorisée."
-      );
-
-      error.status = 403;
-
-      return callback(error);
-    },
-
+    origin: true,
     methods: [
       "GET",
       "POST",
@@ -462,23 +67,18 @@ app.use(
       "DELETE",
       "OPTIONS",
     ],
-
     allowedHeaders: [
       "Content-Type",
       "Authorization",
       "X-Admin-Key",
     ],
-
-    credentials: false,
-
-    maxAge: 86400,
   })
 );
 // Les snapshots Brain Studio contiennent tous les marchés et peuvent
 // dépasser la limite Express par défaut de 100 Ko.
 app.use(
   express.json({
-    limit: "10mb", 
+    limit: "10mb",
   })
 );
 
@@ -488,12 +88,6 @@ app.use(
     limit: "10mb",
   })
 );
-app.use("/internal/admin", adminApiLimiter);
-app.use("/internal/league-manager", adminApiLimiter);
-app.use("/internal/learning", adminApiLimiter);
-app.use("/internal/odds", adminApiLimiter);
-
-app.use(publicApiLimiter);
 const analysisCache = new Map();
 const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
 const FINISHED_FIXTURE_STATUSES = new Set([
@@ -611,7 +205,7 @@ async function executeQueuedApiFootballRequest(endpoint, params = {}) {
           ? getRetryAfterMilliseconds(error, attempt)
           : Math.min(30000, 2000 * (2 ** attempt));
 
-      logWarning("API-FOOTBALL : nouvelle tentative", {
+      console.warn("API-FOOTBALL : nouvelle tentative", {
         endpoint,
         status,
         attempt: attempt + 1,
@@ -639,16 +233,6 @@ registerAIEventRoutes({
   app,
   aiEventEngine,
 });
-
-const engineLearningCore =
-  createEngineLearningCore({
-    app,
-    pool,
-    schedulersEnabled:
-      AUTOMATIC_SCHEDULERS_ENABLED,
-  });
-
-engineLearningCore.registerRoutes();
 const HISTORY_FILE = path.join(__dirname, "predictions-history.json");
 
 function getApiKey() {
@@ -708,25 +292,6 @@ async function callApiFootball(
 
   return response;
 }
-const oddsSyncService = createOddsSyncService({
-  app,
-  pool,
-  callApiFootball,
-  schedulersEnabled: AUTOMATIC_SCHEDULERS_ENABLED,
-});
-
-oddsSyncService.registerRoutes();
-
-const todayProgrammeService =
-  createTodayProgrammeService({
-    app,
-    pool,
-    callApiFootball,
-    isExcludedFixture,
-  });
-
-todayProgrammeService.registerRoutes();
-
 function isExcludedFixture(
   fixture = {}
 ) {
@@ -910,7 +475,7 @@ app.post("/internal/fixture-competitions", async (req, res) => {
       competitions,
     });
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR /internal/fixture-competitions :",
       error
     );
@@ -943,7 +508,7 @@ app.get(
    
 
 } catch (error) {
-  logError("ERREUR ANALYSE COMPLÈTE :", error);
+  console.error("ERREUR ANALYSE COMPLÈTE :", error);
 
   return res
     .status(error.response?.status || 500)
@@ -1371,16 +936,7 @@ async function syncLeagueManagerCatalogue({ forceRefresh = false } = {}) {
 
 app.get(
   "/internal/league-manager/leagues",
-  validateRequest(
-    leagueManagerListQuerySchema,
-    "query"
-  ),
   async (req, res) => {
-
-    if (!requireAdminKey(req, res)) {
-      return;
-    }
-
     try {
       await ensureLeagueManagerTables();
 
@@ -1506,7 +1062,7 @@ app.get(
         })),
       });
     } catch (error) {
-      logError("ERREUR LEAGUE MANAGER LISTE :", error);
+      console.error("ERREUR LEAGUE MANAGER LISTE :", error);
 
       return res.status(500).json({
         ok: false,
@@ -1520,16 +1076,7 @@ app.get(
 
 app.post(
   "/internal/league-manager/sync",
-  validateRequest(
-    leagueManagerSyncQuerySchema,
-    "query"
-  ),
   async (req, res) => {
-
-    if (!requireAdminKey(req, res)) {
-      return;
-    }
-
     try {
       await ensureLeagueManagerTables();
 
@@ -1542,7 +1089,7 @@ app.post(
         ...result,
       });
     } catch (error) {
-      logError("ERREUR SYNCHRONISATION LIGUES :", error);
+      console.error("ERREUR SYNCHRONISATION LIGUES :", error);
 
       return res
         .status(error?.status || error?.response?.status || 500)
@@ -1558,20 +1105,7 @@ app.post(
 
 app.patch(
   "/internal/league-manager/leagues/:leagueId",
-  validateRequest(
-    leagueManagerParamsSchema,
-    "params"
-  ),
-  validateRequest(
-    leagueManagerUpdateBodySchema,
-    "body"
-  ),
   async (req, res) => {
-
-    if (!requireAdminKey(req, res)) {
-      return;
-    }
-
     try {
       await ensureLeagueManagerTables();
 
@@ -1643,7 +1177,7 @@ app.patch(
         },
       });
     } catch (error) {
-      logError("ERREUR MISE À JOUR LIGUE :", error);
+      console.error("ERREUR MISE À JOUR LIGUE :", error);
 
       return res.status(500).json({
         ok: false,
@@ -1657,16 +1191,7 @@ app.patch(
 
 app.post(
   "/internal/league-manager/bulk",
-  validateRequest(
-    leagueManagerBulkBodySchema,
-    "body"
-  ),
   async (req, res) => {
-
-    if (!requireAdminKey(req, res)) {
-      return;
-    }
-
     try {
       await ensureLeagueManagerTables();
 
@@ -1712,7 +1237,7 @@ app.post(
         updated: result.rowCount,
       });
     } catch (error) {
-      logError("ERREUR MISE À JOUR GROUPÉE LIGUES :", error);
+      console.error("ERREUR MISE À JOUR GROUPÉE LIGUES :", error);
 
       return res.status(500).json({
         ok: false,
@@ -1996,7 +1521,7 @@ const headToHead = h2hMatches.map((item) => ({
 
 
 } catch (error) {
-  logError("DEBUG CATCH ANALYSE :", error);
+  console.error("DEBUG CATCH ANALYSE :", error);
 
   return res.status(error.response?.status || 500).json({
     ok: false,
@@ -2210,17 +1735,6 @@ const advancedXGModel =
       away: 1.1,
     },
 
-    /*
-     * Le Poisson reste un baseline unique.
-     * Il n'est plus recopié dans season et venue.
-     */
-    baselineExpectedGoals: {
-      home:
-        poissonModel.expectedGoals.home,
-      away:
-        poissonModel.expectedGoals.away,
-    },
-
     home: {
       recent: {
         goalsFor:
@@ -2229,20 +1743,18 @@ const advancedXGModel =
           homeGoalsData.goalsAgainst,
       },
 
-      /*
-       * À remplacer plus tard par de vraies statistiques saison.
-       */
       season: {
-        goalsForPerMatch: null,
-        goalsAgainstPerMatch: null,
+        goalsForPerMatch:
+          poissonModel.expectedGoals.home,
+        goalsAgainstPerMatch:
+          poissonModel.expectedGoals.away,
       },
 
-      /*
-       * À remplacer plus tard par de vraies statistiques à domicile.
-       */
       venue: {
-        goalsForPerMatch: null,
-        goalsAgainstPerMatch: null,
+        goalsForPerMatch:
+          poissonModel.expectedGoals.home,
+        goalsAgainstPerMatch:
+          poissonModel.expectedGoals.away,
       },
 
       injuryImpact: 0,
@@ -2259,20 +1771,18 @@ const advancedXGModel =
           awayGoalsData.goalsAgainst,
       },
 
-      /*
-       * À remplacer plus tard par de vraies statistiques saison.
-       */
       season: {
-        goalsForPerMatch: null,
-        goalsAgainstPerMatch: null,
+        goalsForPerMatch:
+          poissonModel.expectedGoals.away,
+        goalsAgainstPerMatch:
+          poissonModel.expectedGoals.home,
       },
 
-      /*
-       * À remplacer plus tard par de vraies statistiques à l'extérieur.
-       */
       venue: {
-        goalsForPerMatch: null,
-        goalsAgainstPerMatch: null,
+        goalsForPerMatch:
+          poissonModel.expectedGoals.away,
+        goalsAgainstPerMatch:
+          poissonModel.expectedGoals.home,
       },
 
       injuryImpact: 0,
@@ -2290,6 +1800,7 @@ const advancedXGModel =
         Array.isArray(injuries),
     },
   });
+
 const xgConfidence =
   computeXgConfidence({
     homeRecentForm,
@@ -2589,7 +2100,7 @@ return res.json({
 });
 
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR /internal/analyze :",
       error
     );
@@ -3268,7 +2779,7 @@ function readPredictionHistory() {
 
     return content ? JSON.parse(content) : [];
   } catch (error) {
-    logError("Erreur lecture historique :", error.message);
+    console.error("Erreur lecture historique :", error.message);
     return [];
   }
 }
@@ -3881,7 +3392,7 @@ app.get("/internal/db-test", async (req, res) => {
       time: result.rows[0].current_time,
     });
   } catch (error) {
-    logError("ERREUR DB TEST :", error);
+    console.error("ERREUR DB TEST :", error);
 
     return res.status(500).json({
       ok: false,
@@ -5148,7 +4659,7 @@ async function synchronizeFinishedPredictionsByDate() {
           "Erreur API-Football",
       });
 
-      logError(
+      console.error(
         `RESULT SYNC : erreur pour la date ${date}`,
         error?.message || error
       );
@@ -5375,7 +4886,7 @@ async function synchronizeFinishedPredictionsByDate() {
           fixture
         );
       } catch (eloError) {
-        logWarning(
+        console.warn(
           `RESULT SYNC : ELO non mis à jour pour ${fixtureId}`,
           eloError?.message ||
             eloError
@@ -5400,7 +4911,7 @@ async function synchronizeFinishedPredictionsByDate() {
           "Erreur de règlement",
       });
 
-      logError(
+      console.error(
         `RESULT SYNC : erreur fixture ${fixtureId}`,
         error?.message || error
       );
@@ -5437,7 +4948,7 @@ app.get(
         summary,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR RESULT SYNC :",
         error
       );
@@ -6037,7 +5548,7 @@ app.get(
    
 
 } catch (error) {
-  logError("ERREUR ANALYSE COMPLÈTE :", error);
+  console.error("ERREUR ANALYSE COMPLÈTE :", error);
 
   return res
     .status(error.response?.status || 500)
@@ -6479,7 +5990,7 @@ const headToHead = h2hMatches.map((item) => ({
 
 
 } catch (error) {
-  logError("DEBUG CATCH ANALYSE :", error);
+  console.error("DEBUG CATCH ANALYSE :", error);
 
   return res.status(error.response?.status || 500).json({
     ok: false,
@@ -6693,7 +6204,7 @@ function readPredictionHistory() {
 
     return content ? JSON.parse(content) : [];
   } catch (error) {
-    logError("Erreur lecture historique :", error.message);
+    console.error("Erreur lecture historique :", error.message);
     return [];
   }
 }
@@ -7322,7 +6833,7 @@ app.get("/internal/db-test", async (req, res) => {
       time: result.rows[0].current_time,
     });
   } catch (error) {
-    logError("ERREUR DB TEST :", error);
+    console.error("ERREUR DB TEST :", error);
 
     return res.status(500).json({
       ok: false,
@@ -8713,7 +8224,7 @@ const fixture =
         error.message,
     });
 
-    logWarning(
+    console.warn(
       [
         "⚠️ Quota API-Football atteint.",
         "Arrêt immédiat de la synchronisation.",
@@ -8742,7 +8253,7 @@ const fixture =
       error.message,
   });
 
-  logError(
+  console.error(
     `Erreur de règlement du match ${prediction.fixture_id} :`,
     error.message
   );
@@ -9592,7 +9103,7 @@ app.get("/internal/db-columns", async (req, res) => {
       columns: result.rows,
     });
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR DB COLUMNS :",
       error
     );
@@ -9647,7 +9158,7 @@ app.get("/internal/db-migrate-xg", async (req, res) => {
         "Migration xG/explicabilité appliquée",
     });
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR MIGRATION XG :",
       error
     );
@@ -10215,7 +9726,7 @@ monteCarloModel:
           prediction.updated_at,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR PUBLIC AI LAB :",
         error
       );
@@ -10245,7 +9756,7 @@ app.get(
           "Colonne monte_carlo_model créée",
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR MIGRATION MONTE CARLO :",
         error
       );
@@ -10670,7 +10181,7 @@ const fixtures = rawFixtures
         matches,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR /public/daily-picks :",
         error
       );
@@ -11054,7 +10565,7 @@ const response = await fetch(
         results,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR REBUILD DAILY ANALYSIS :",
         error
       );
@@ -11074,7 +10585,7 @@ async function runAutomaticDailyAnalysis({
   date = getParisDateString(),
 } = {}) {
   if (dailyAnalysisJobRunning) {
-    debugLog(
+    console.log(
       "ANALYSE QUOTIDIENNE : tâche déjà en cours"
     );
 
@@ -11094,7 +10605,7 @@ async function runAutomaticDailyAnalysis({
       `?date=${encodeURIComponent(date)}` +
       `&limit=8`;
 
-    debugLog(
+    console.log(
       `ANALYSE QUOTIDIENNE : démarrage ${date}`
     );
 
@@ -11113,14 +10624,14 @@ async function runAutomaticDailyAnalysis({
       );
     }
 
-    debugLog(
+    console.log(
       "ANALYSE QUOTIDIENNE : terminée",
       data.summary
     );
 
     return data;
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR ANALYSE QUOTIDIENNE :",
       error.message
     );
@@ -11286,7 +10797,7 @@ app.get(
         incomplete,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR DAILY ANALYSIS STATUS :",
         error
       );
@@ -11316,7 +10827,7 @@ app.get(
           "Colonne analysis_context créée",
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR MIGRATION CONTEXT :",
         error
       );
@@ -11481,7 +10992,7 @@ function wait(milliseconds) {
 
 async function runLineupWatcher() {
   if (lineupWatcherRunning) {
-    debugLog(
+    console.log(
       "LINEUP WATCHER : contrôle déjà en cours"
     );
 
@@ -11494,7 +11005,7 @@ async function runLineupWatcher() {
     const date =
       getParisDateString();
 
-    debugLog(
+    console.log(
       `LINEUP WATCHER : contrôle du ${date}`
     );
 
@@ -11657,7 +11168,7 @@ async function runLineupWatcher() {
           continue;
         }
 
-        debugLog(
+        console.log(
           "LINEUP WATCHER : compositions détectées",
           {
             fixtureId,
@@ -11730,7 +11241,7 @@ async function runLineupWatcher() {
          * on attend avant le match suivant.
          */
         if (status === 429) {
-          logWarning(
+          console.warn(
             "LINEUP WATCHER : limite API, pause de 60 secondes"
           );
 
@@ -11739,7 +11250,7 @@ async function runLineupWatcher() {
       }
     }
 
-    debugLog(
+    console.log(
       "LINEUP WATCHER : terminé",
       {
         checked:
@@ -11768,7 +11279,7 @@ async function runLineupWatcher() {
       }
     );
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR LINEUP WATCHER :",
       error.message
     );
@@ -11781,7 +11292,7 @@ let lineupWatcherSchedulerStarted = false;
 
 function startLineupWatcherScheduler() {
   if (lineupWatcherSchedulerStarted) {
-    debugLog(
+    console.log(
       "⏭️ Lineup Watcher Scheduler déjà démarré."
     );
     return;
@@ -11795,7 +11306,7 @@ function startLineupWatcherScheduler() {
    */
   setTimeout(() => {
     runLineupWatcher().catch((error) => {
-      logError(
+      console.error(
         "ERREUR PREMIER LINEUP WATCHER :",
         error
       );
@@ -11807,14 +11318,14 @@ function startLineupWatcherScheduler() {
    */
   setInterval(() => {
     runLineupWatcher().catch((error) => {
-      logError(
+      console.error(
         "ERREUR INTERVAL LINEUP WATCHER :",
         error
       );
     });
   }, 10 * 60 * 1000);
 
-  debugLog(
+  console.log(
     "✅ Lineup Watcher Scheduler : toutes les 10 minutes"
   );
 }
@@ -11919,7 +11430,7 @@ function getSelectedProbability(
 
 async function runHourlyOddsWatcher() {
   if (hourlyOddsWatcherRunning) {
-    debugLog(
+    console.log(
       "ODDS WATCHER : contrôle déjà en cours"
     );
     return;
@@ -11939,7 +11450,7 @@ async function runHourlyOddsWatcher() {
     const date =
       getParisDateString();
 
-    debugLog(
+    console.log(
       `ODDS WATCHER : contrôle du ${date}`
     );
 
@@ -12070,7 +11581,7 @@ async function runHourlyOddsWatcher() {
         if (
           movementPercent >= 10
         ) {
-          debugLog(
+          console.log(
             "ODDS WATCHER : mouvement important",
             {
               fixtureId,
@@ -12130,7 +11641,7 @@ async function runHourlyOddsWatcher() {
       } catch (error) {
         summary.failed += 1;
 
-        logError(
+        console.error(
           "ODDS WATCHER : erreur",
           {
             fixtureId,
@@ -12144,12 +11655,12 @@ async function runHourlyOddsWatcher() {
       }
     }
 
-    debugLog(
+    console.log(
       "ODDS WATCHER : terminé",
       summary
     );
   } catch (error) {
-    logError(
+    console.error(
       "ODDS WATCHER : erreur générale",
       error.message
     );
@@ -12243,7 +11754,7 @@ async function checkDailyFullAnalysisSchedule() {
 
   lastDailyFullAnalysisAttemptAt = now;
 
-  debugLog(
+  console.log(
     `ANALYSE COMPLÈTE : contrôle/rattrapage ${paris.date}`
   );
 
@@ -12287,16 +11798,16 @@ async function checkDailyFullAnalysisSchedule() {
       lastDailyFullAnalysisDate =
         paris.date;
 
-      debugLog(
+      console.log(
         `ANALYSE COMPLÈTE : journée ${paris.date} couverte (${covered}/${fixturesFound})`
       );
     } else {
-      logWarning(
+      console.warn(
         `ANALYSE COMPLÈTE : journée incomplète (${covered}/${fixturesFound}, ${failed} échec(s)). Nouveau lot dans environ 3 minutes.`
       );
     }
   } catch (error) {
-    logError(
+    console.error(
       "ANALYSE COMPLÈTE : erreur",
       error.message
     );
@@ -12444,7 +11955,7 @@ app.get(
         reports,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR /public/bilan/reports :",
         error
       );
@@ -12601,7 +12112,7 @@ OFFSET $2
     result.rows,
 });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR /public/learning/finished :",
         error
       );
@@ -12622,7 +12133,7 @@ let automaticResultSyncRunning =
 
 async function runAutomaticResultSync() {
   if (automaticResultSyncRunning) {
-    debugLog(
+    console.log(
       "RESULT SYNC : cycle déjà actif"
     );
 
@@ -12644,7 +12155,7 @@ async function runAutomaticResultSync() {
     summary.manualOddsRefresh =
       manualOddsRefresh;
 
-    debugLog(
+    console.log(
       "RESULT SYNC TERMINÉ :",
       {
         apiCalls:
@@ -12669,7 +12180,7 @@ async function runAutomaticResultSync() {
 
     return summary;
   } catch (error) {
-    logError(
+    console.error(
       "RESULT SYNC ERREUR :",
       error
     );
@@ -12763,7 +12274,7 @@ async function runAutomaticResultSync() {
     WHERE analysis_status IS NULL;
   `);
 
-  debugLog(
+  console.log(
     "✅ Colonnes Brain Studio vérifiées"
   );
 }
@@ -13359,57 +12870,6 @@ async function saveStudioSnapshot({
     );
   }
 
-  /*
-   * Journal d'apprentissage moteur par moteur.
-   *
-   * Le mode SHADOW n'influence aucune décision publique :
-   * il enregistre uniquement les sorties disponibles avant match.
-   */
-  try {
-    await engineLearningCore
-      .logStudioSnapshot({
-        fixtureId:
-          normalizedFixtureId,
-
-        snapshot:
-          snapshot || {},
-
-        analysisVersion:
-          String(
-            analysisVersion ||
-              "brain-studio-v1"
-          ),
-
-        primaryMarket: {
-          key:
-            normalizedMarketKey,
-
-          label:
-            marketLabel,
-
-          probability:
-            finalStudioProbability,
-
-          decision: {
-            score:
-              normalizedDecisionScore,
-
-            type:
-              normalizedDecisionType,
-
-            grade:
-              normalizedDecisionGrade,
-          },
-        },
-      });
-  } catch (learningError) {
-    logWarning(
-      "ENGINE LEARNING LOG IGNORÉ :",
-      learningError?.message ||
-        learningError
-    );
-  }
-
   return result.rows[0];
 }
 app.post(
@@ -13614,13 +13074,6 @@ app.post(
 
             locked:
               false,
-
-            learningPayload:
-              body.learningPayload &&
-              typeof body.learningPayload ===
-                "object"
-                ? body.learningPayload
-                : null,
           },
         });
 
@@ -13682,7 +13135,7 @@ app.post(
           saved,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR STUDIO SNAPSHOT :",
         error
       );
@@ -13936,7 +13389,7 @@ app.get(
         matches,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR /public/studio/upcoming :",
         error
       );
@@ -14422,7 +13875,7 @@ if (
           null,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR LECTURE STUDIO SNAPSHOT :",
         error
       );
@@ -15084,7 +14537,7 @@ app.get(
         })),
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR LISTE RECONSTRUCTION STUDIO :",
         error
       );
@@ -15233,7 +14686,7 @@ app.post(
         prediction: saved,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR FORCE STUDIO SNAPSHOT :",
         error
       );
@@ -15725,7 +15178,7 @@ manualSnapshotRebuildRunning =
         ...result,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR REBUILD BRAIN STUDIO :",
         error
       );
@@ -15986,7 +15439,7 @@ async function runAutomaticStudioScheduler({
     STUDIO_SCHEDULER_MAX_MATCHES,
 } = {}) {
   if (studioSchedulerRunning) {
-    debugLog(
+    console.log(
       "BRAIN STUDIO SCHEDULER : cycle déjà actif"
     );
 
@@ -16136,7 +15589,7 @@ async function runAutomaticStudioScheduler({
     summary.fixturesFound =
       fixtures.length;
 
-    debugLog(
+    console.log(
       "BRAIN STUDIO SCHEDULER : démarrage",
       {
         source,
@@ -16226,7 +15679,7 @@ async function runAutomaticStudioScheduler({
       summary.attempted += 1;
 
       try {
-        debugLog(
+        console.log(
           `BRAIN STUDIO SCHEDULER : analyse ${index + 1}/${fixtures.length}`,
           {
             fixtureId,
@@ -16324,7 +15777,7 @@ async function runAutomaticStudioScheduler({
             "Erreur inconnue",
         });
 
-        logError(
+        console.error(
           `BRAIN STUDIO SCHEDULER : erreur fixture ${fixtureId}`,
           error
         );
@@ -16353,7 +15806,7 @@ async function runAutomaticStudioScheduler({
     studioSchedulerLastSummary =
       summary;
 
-    debugLog(
+    console.log(
       "BRAIN STUDIO SCHEDULER : terminé",
       {
         fixturesFound:
@@ -16389,7 +15842,7 @@ async function runAutomaticStudioScheduler({
     studioSchedulerLastSummary =
       summary;
 
-    logError(
+    console.error(
       "BRAIN STUDIO SCHEDULER : erreur générale",
       error
     );
@@ -16575,8 +16028,26 @@ const LEARNING_MODEL_VERSION =
 const CALIBRATION_BUCKET_SIZE = 5;
 const CALIBRATION_MIN_PROBABILITY = 50;
 const CALIBRATION_MAX_PROBABILITY = 100;
-const CALIBRATION_MIN_SAMPLE_SIZE = 20;
-const CALIBRATION_MAX_ADJUSTMENT = 3;
+const CALIBRATION_MIN_SAMPLE_SIZE =
+  Math.max(
+    20,
+    Number(
+      process.env.CALIBRATION_MIN_SAMPLE_SIZE ||
+        30
+    ) || 30
+  );
+
+const CALIBRATION_MAX_ADJUSTMENT =
+  Math.min(
+    5,
+    Math.max(
+      0.5,
+      Number(
+        process.env.CALIBRATION_MAX_ADJUSTMENT ||
+          3
+      ) || 3
+    )
+  );
 
 /*
  * Par sécurité, la V1 observe et calcule par défaut sans modifier les
@@ -16811,7 +16282,7 @@ async function ensureLearningEngineTables() {
       WHERE result_status = 'COMPLETED' AND won IS NOT NULL;
   `);
 
-  debugLog("✅ Tables Calibration Engine V1 vérifiées");
+  console.log("✅ Tables Calibration Engine V1 vérifiées");
 }
 
 function learningProbabilitySql() {
@@ -16984,7 +16455,7 @@ async function getAdaptiveLearningAdjustment({
       },
     };
   } catch (error) {
-    logWarning(
+    console.warn(
       "CALIBRATION ENGINE V1 : ajustement ignoré",
       error?.message || error
     );
@@ -17328,7 +16799,7 @@ async function rebuildLearningEngine({
       ).catch(() => null);
     }
 
-    logError("ERREUR CALIBRATION ENGINE V1 :", error);
+    console.error("ERREUR CALIBRATION ENGINE V1 :", error);
     return {
       ok: false,
       source,
@@ -17529,11 +17000,84 @@ const CALIBRATION_RECOMMENDATION_SEVERITIES = new Set([
   "CRITICAL",
 ]);
 
-const CALIBRATION_EVALUATION_MIN_NEW_SAMPLES = 50;
-const CALIBRATION_MIN_GAP_IMPROVEMENT = 1;
-const CALIBRATION_MAX_BRIER_DEGRADATION = 0.02;
-const CALIBRATION_MAX_GAP_DEGRADATION = 2;
-const CALIBRATION_MAX_ADJUSTMENT_STEP = 1;
+const CALIBRATION_AUTO_ACTIVATION_MIN_SAMPLES =
+  Math.max(
+    50,
+    Number(
+      process.env
+        .CALIBRATION_AUTO_ACTIVATION_MIN_SAMPLES ||
+        150
+    ) || 150
+  );
+
+const CALIBRATION_AUTO_ACTIVATION_MIN_GAP =
+  Math.min(
+    15,
+    Math.max(
+      2,
+      Number(
+        process.env
+          .CALIBRATION_AUTO_ACTIVATION_MIN_GAP ||
+          5
+      ) || 5
+    )
+  );
+
+const CALIBRATION_EVALUATION_MIN_NEW_SAMPLES =
+  Math.max(
+    25,
+    Number(
+      process.env
+        .CALIBRATION_EVALUATION_MIN_NEW_SAMPLES ||
+        50
+    ) || 50
+  );
+
+const CALIBRATION_MIN_GAP_IMPROVEMENT =
+  Math.max(
+    0,
+    Number(
+      process.env
+        .CALIBRATION_MIN_GAP_IMPROVEMENT ||
+        1
+    ) || 1
+  );
+
+const CALIBRATION_MAX_BRIER_DEGRADATION =
+  Math.min(
+    0.1,
+    Math.max(
+      0,
+      Number(
+        process.env
+          .CALIBRATION_MAX_BRIER_DEGRADATION ||
+          0.02
+      ) || 0.02
+    )
+  );
+
+const CALIBRATION_MAX_GAP_DEGRADATION =
+  Math.max(
+    0.5,
+    Number(
+      process.env
+        .CALIBRATION_MAX_GAP_DEGRADATION ||
+        2
+    ) || 2
+  );
+
+const CALIBRATION_MAX_ADJUSTMENT_STEP =
+  Math.min(
+    1,
+    Math.max(
+      0.25,
+      Number(
+        process.env
+          .CALIBRATION_MAX_ADJUSTMENT_STEP ||
+          1
+      ) || 1
+    )
+  );
 
 let calibrationAutoEvaluationRunning = false;
 let automaticCalibrationCycleRunning = false;
@@ -17851,8 +17395,10 @@ function getAutomaticCalibrationStatus({
   }
 
   if (
-    sampleSize >= 100 &&
-    absoluteGap >= 5 &&
+    sampleSize >=
+      CALIBRATION_AUTO_ACTIVATION_MIN_SAMPLES &&
+    absoluteGap >=
+      CALIBRATION_AUTO_ACTIVATION_MIN_GAP &&
     ["MEDIUM", "HIGH"].includes(evidenceLevel) &&
     action === "ADJUST_PROBABILITY"
   ) {
@@ -18722,7 +18268,7 @@ async function evaluateActiveCalibrations({
           error: error?.message || "Erreur inconnue",
         });
 
-        logError(
+        console.error(
           "ERREUR AUTO-ÉVALUATION CALIBRATION :",
           recommendation.recommendation_key,
           error
@@ -18735,7 +18281,7 @@ async function evaluateActiveCalibrations({
     summary.finishedAt = new Date().toISOString();
     return summary;
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR MOTEUR AUTO-ÉVALUATION CALIBRATION :",
       error
     );
@@ -18750,6 +18296,172 @@ async function evaluateActiveCalibrations({
     calibrationAutoEvaluationRunning = false;
   }
 }
+
+
+app.get(
+  "/internal/learning/living-status",
+  async (req, res) => {
+    try {
+      await ensureLearningEngineTables();
+      await ensureCalibrationDecisionTables();
+
+      const [
+        calibrationCountResult,
+        recommendationCountResult,
+        recentEventsResult,
+      ] = await Promise.all([
+        pool.query(`
+          SELECT
+            COUNT(*)::int AS total_groups,
+            COALESCE(
+              SUM(sample_size),
+              0
+            )::bigint AS total_samples,
+            MAX(calculated_at) AS last_learning_run
+          FROM learning_calibration
+        `),
+
+        pool.query(`
+          SELECT
+            COUNT(*)::int AS total,
+            COUNT(*) FILTER (
+              WHERE status = 'ACTIVE'
+            )::int AS active,
+            COUNT(*) FILTER (
+              WHERE status = 'OBSERVING'
+            )::int AS observing,
+            COUNT(*) FILTER (
+              WHERE status = 'COOLDOWN'
+            )::int AS cooldown,
+            COUNT(*) FILTER (
+              WHERE status = 'REVERTED'
+            )::int AS reverted,
+            MAX(updated_at) AS last_calibration_run
+          FROM calibration_recommendations
+        `),
+
+        pool.query(`
+          SELECT
+            event_type,
+            recommendation_key,
+            previous_status,
+            new_status,
+            previous_adjustment,
+            new_adjustment,
+            effectiveness_score,
+            reason,
+            created_at
+          FROM calibration_recommendation_events
+          ORDER BY created_at DESC
+          LIMIT 20
+        `),
+      ]);
+
+      const learning =
+        calibrationCountResult.rows[0] || {};
+
+      const calibration =
+        recommendationCountResult.rows[0] || {};
+
+      return res.json({
+        ok: true,
+
+        mode:
+          CALIBRATION_APPLY_ENABLED
+            ? "ACTIVE_CONTROLLED"
+            : "OBSERVATION_ONLY",
+
+        alive:
+          CALIBRATION_APPLY_ENABLED &&
+          AUTOMATIC_SCHEDULERS_ENABLED,
+
+        learning: {
+          engineVersion:
+            LEARNING_ENGINE_VERSION,
+          modelVersion:
+            LEARNING_MODEL_VERSION,
+          groups:
+            Number(
+              learning.total_groups
+            ) || 0,
+          samples:
+            Number(
+              learning.total_samples
+            ) || 0,
+          lastRun:
+            learning.last_learning_run ||
+            null,
+        },
+
+        calibration: {
+          applyEnabled:
+            CALIBRATION_APPLY_ENABLED,
+          schedulerEnabled:
+            AUTOMATIC_SCHEDULERS_ENABLED,
+          totalRecommendations:
+            Number(
+              calibration.total
+            ) || 0,
+          active:
+            Number(
+              calibration.active
+            ) || 0,
+          observing:
+            Number(
+              calibration.observing
+            ) || 0,
+          cooldown:
+            Number(
+              calibration.cooldown
+            ) || 0,
+          reverted:
+            Number(
+              calibration.reverted
+            ) || 0,
+          lastRun:
+            calibration.last_calibration_run ||
+            null,
+        },
+
+        guardrails: {
+          minimumSamples:
+            CALIBRATION_MIN_SAMPLE_SIZE,
+          activationMinimumSamples:
+            CALIBRATION_AUTO_ACTIVATION_MIN_SAMPLES,
+          activationMinimumGap:
+            CALIBRATION_AUTO_ACTIVATION_MIN_GAP,
+          maximumAdjustment:
+            CALIBRATION_MAX_ADJUSTMENT,
+          maximumStepPerCycle:
+            CALIBRATION_MAX_ADJUSTMENT_STEP,
+          evaluationMinimumNewSamples:
+            CALIBRATION_EVALUATION_MIN_NEW_SAMPLES,
+          minimumGapImprovement:
+            CALIBRATION_MIN_GAP_IMPROVEMENT,
+          maximumGapDegradation:
+            CALIBRATION_MAX_GAP_DEGRADATION,
+          maximumBrierDegradation:
+            CALIBRATION_MAX_BRIER_DEGRADATION,
+        },
+
+        automaticRollback: true,
+        recentEvents:
+          recentEventsResult.rows,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR STATUT LEARNING VIVANT :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Impossible de charger le statut du Learning.",
+      });
+    }
+  }
+);
 
 async function runAutomaticCalibrationCycle({
   source = "scheduler",
@@ -18792,7 +18504,7 @@ async function runAutomaticCalibrationCycle({
       evaluation,
     };
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR CYCLE AUTOMATIQUE CALIBRATION :",
       error
     );
@@ -18823,7 +18535,7 @@ app.post(
 
       return res.status(result.ok ? 200 : 500).json(result);
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR GÉNÉRATION CALIBRATIONS :",
         error
       );
@@ -18964,7 +18676,7 @@ app.get(
         recommendations: result.rows,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR LISTE CALIBRATIONS :",
         error
       );
@@ -19156,7 +18868,7 @@ app.get("/public/calibration/summary", async (req, res) => {
       },
     });
   } catch (error) {
-    logError(error);
+    console.error(error);
 
     res.status(500).json({
       ok: false,
@@ -19566,7 +19278,7 @@ app.get("/public/bilan/stats", async (req, res) => {
       },
     });
   } catch (error) {
-    logError("ERREUR /public/bilan/stats :", error);
+    console.error("ERREUR /public/bilan/stats :", error);
     return res.status(500).json({
       ok: false,
       error: error.message || "Impossible de calculer les statistiques globales du Bilan.",
@@ -19803,7 +19515,7 @@ manual_odd_updated_at,
       }),
     });
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR /internal/admin/brainstudio/rebuild-needed :",
       error
     );
@@ -19983,7 +19695,7 @@ adminStudioRebuildRunning = true;
       results,
     });
   } catch (error) {
-    logError(
+    console.error(
       "ERREUR /internal/admin/brainstudio/rebuild-missing :",
       error
     );
@@ -20313,7 +20025,7 @@ app.get("/internal/admin/bilan/markets", async (req, res) => {
       markets: rows,
     });
   } catch (error) {
-    logError("ERREUR /internal/admin/bilan/markets :", error);
+    console.error("ERREUR /internal/admin/bilan/markets :", error);
     return res.status(500).json({
       ok: false,
       error: error.message,
@@ -20550,7 +20262,7 @@ app.get("/internal/admin/manual-odds", async (req, res) => {
       },
     });
   } catch (error) {
-    logError("ERREUR LISTE COTES MANUELLES :", error);
+    console.error("ERREUR LISTE COTES MANUELLES :", error);
 
     return res.status(500).json({
       ok: false,
@@ -20741,7 +20453,7 @@ app.get(
             : null,
       });
     } catch (error) {
-      logError(
+      console.error(
         "ERREUR PERFORMANCE FINANCIÈRE RÉELLE :",
         error
       );
@@ -20952,7 +20664,7 @@ async function saveOrUpdateManualOdd(req, res) {
       prediction: result.rows[0],
     });
   } catch (error) {
-    logError("ERREUR ENREGISTREMENT COTE MANUELLE :", error);
+    console.error("ERREUR ENREGISTREMENT COTE MANUELLE :", error);
 
     return res.status(500).json({
       ok: false,
@@ -21035,7 +20747,7 @@ app.delete(
         fixtureId,
       });
     } catch (error) {
-      logError("ERREUR SUPPRESSION COTE MANUELLE :", error);
+      console.error("ERREUR SUPPRESSION COTE MANUELLE :", error);
 
       return res.status(500).json({
         ok: false,
@@ -21056,7 +20768,7 @@ app.post(
       const result = await refreshManualOddsProfits();
       return res.json(result);
     } catch (error) {
-      logError("ERREUR RECALCUL PROFITS MANUELS :", error);
+      console.error("ERREUR RECALCUL PROFITS MANUELS :", error);
 
       return res.status(500).json({
         ok: false,
@@ -22063,7 +21775,7 @@ app.get("/public/daily-tickets", async (req, res) => {
       editions: result.rows.map(serializeDailyTicketSnapshot),
     });
   } catch (error) {
-    logError("ERREUR LECTURE DAILY TICKETS :", error);
+    console.error("ERREUR LECTURE DAILY TICKETS :", error);
     return res.status(500).json({
       ok: false,
       editions: [],
@@ -22131,7 +21843,7 @@ app.get("/public/daily-tickets/history", async (req, res) => {
       },
     });
   } catch (error) {
-    logError("ERREUR HISTORIQUE DAILY TICKETS :", error);
+    console.error("ERREUR HISTORIQUE DAILY TICKETS :", error);
     return res.status(500).json({
       ok: false,
       history: [],
@@ -22161,7 +21873,7 @@ app.post("/internal/daily-tickets/generate", async (req, res) => {
 
     return res.json({ ok: true, ...result });
   } catch (error) {
-    logError("ERREUR GÉNÉRATION DAILY TICKET :", error);
+    console.error("ERREUR GÉNÉRATION DAILY TICKET :", error);
     return res.status(500).json({
       ok: false,
       error: error?.message || "Impossible de générer le ticket.",
@@ -22178,7 +21890,7 @@ app.post("/internal/daily-tickets/settle", async (req, res) => {
     });
     return res.json(result);
   } catch (error) {
-    logError("ERREUR RÈGLEMENT DAILY TICKETS :", error);
+    console.error("ERREUR RÈGLEMENT DAILY TICKETS :", error);
     return res.status(500).json({
       ok: false,
       error: error?.message || "Impossible de régler les tickets.",
@@ -22211,13 +21923,13 @@ async function checkDailyTicketSchedule() {
       });
 
       if (result.created) {
-        debugLog(`✅ Daily Ticket ${slot} créé pour ${paris.date}`);
+        console.log(`✅ Daily Ticket ${slot} créé pour ${paris.date}`);
       }
     }
 
     await settleDailyTicketSnapshots();
   } catch (error) {
-    logError("ERREUR SCHEDULER DAILY TICKET :", error);
+    console.error("ERREUR SCHEDULER DAILY TICKET :", error);
   } finally {
     dailyTicketSchedulerRunning = false;
   }
@@ -22225,21 +21937,21 @@ async function checkDailyTicketSchedule() {
 
 function startDailyTicketScheduler() {
   if (!AUTOMATIC_SCHEDULERS_ENABLED) {
-    debugLog("⏸️ Daily Ticket Scheduler désactivé avec les schedulers.");
+    console.log("⏸️ Daily Ticket Scheduler désactivé avec les schedulers.");
     return;
   }
 
   checkDailyTicketSchedule().catch((error) => {
-    logError("ERREUR PREMIÈRE VÉRIFICATION DAILY TICKET :", error);
+    console.error("ERREUR PREMIÈRE VÉRIFICATION DAILY TICKET :", error);
   });
 
   setInterval(() => {
     checkDailyTicketSchedule().catch((error) => {
-      logError("ERREUR INTERVAL DAILY TICKET :", error);
+      console.error("ERREUR INTERVAL DAILY TICKET :", error);
     });
   }, DAILY_TICKET_SCHEDULER_INTERVAL_MS);
 
-  debugLog("✅ Daily Ticket Scheduler : 12h, 18h et 21h (Europe/Paris)");
+  console.log("✅ Daily Ticket Scheduler : 12h, 18h et 21h (Europe/Paris)");
 }
 
 
@@ -22251,7 +21963,7 @@ const AUTOMATIC_CALIBRATION_FIRST_RUN_DELAY_MS =
 
 function startAutomaticCalibrationScheduler() {
   if (!AUTOMATIC_SCHEDULERS_ENABLED) {
-    debugLog(
+    console.log(
       "⏸️ Calibration automatique désactivée avec les schedulers."
     );
     return;
@@ -22261,7 +21973,7 @@ function startAutomaticCalibrationScheduler() {
     runAutomaticCalibrationCycle({
       source: "automatic-first-run",
     }).catch((error) => {
-      logError(
+      console.error(
         "ERREUR PREMIER CYCLE AUTOMATIQUE CALIBRATION :",
         error
       );
@@ -22272,25 +21984,25 @@ function startAutomaticCalibrationScheduler() {
     runAutomaticCalibrationCycle({
       source: "automatic-scheduler",
     }).catch((error) => {
-      logError(
+      console.error(
         "ERREUR SCHEDULER AUTOMATIQUE CALIBRATION :",
         error
       );
     });
   }, AUTOMATIC_CALIBRATION_INTERVAL_MS);
 
-  debugLog(
+  console.log(
     "✅ Calibration Center automatique : toutes les 6 heures"
   );
 }
 
 function startAutomaticSchedulers() {
   if (!AUTOMATIC_SCHEDULERS_ENABLED) {
-    debugLog(
+    console.log(
       "⏸️ Tous les schedulers automatiques sont désactivés."
     );
 
-    debugLog(
+    console.log(
       "ℹ️ Pour les réactiver : AUTOMATIC_SCHEDULERS_ENABLED=true"
     );
 
@@ -22298,10 +22010,10 @@ function startAutomaticSchedulers() {
   }
 
   if (!API_FOOTBALL_ENABLED) {
-    debugLog(
+    console.log(
       "⏸️ Schedulers non démarrés : API_FOOTBALL_ENABLED=false"
     );
-    debugLog(
+    console.log(
       "ℹ️ Le serveur, Learning, Calibration et les routes SQL restent accessibles."
     );
     return;
@@ -22332,7 +22044,7 @@ function startAutomaticSchedulers() {
     runAutomaticStudioScheduler({
       source: "startup",
     }).catch((error) => {
-      logError(
+      console.error(
         "ERREUR DÉMARRAGE BRAIN STUDIO SCHEDULER :",
         error
       );
@@ -22346,7 +22058,7 @@ function startAutomaticSchedulers() {
     runAutomaticStudioScheduler({
       source: "interval",
     }).catch((error) => {
-      logError(
+      console.error(
         "ERREUR INTERVAL BRAIN STUDIO SCHEDULER :",
         error
       );
@@ -22359,7 +22071,7 @@ function startAutomaticSchedulers() {
    */
   setInterval(() => {
     checkDailyFullAnalysisSchedule().catch((error) => {
-      logError(
+      console.error(
         "ERREUR PLANIFICATEUR ANALYSE QUOTIDIENNE :",
         error
       );
@@ -22370,21 +22082,21 @@ function startAutomaticSchedulers() {
    * Première vérification au démarrage.
    */
   checkDailyFullAnalysisSchedule().catch((error) => {
-    logError(
+    console.error(
       "ERREUR PREMIÈRE VÉRIFICATION QUOTIDIENNE :",
       error
     );
   });
 
-  debugLog(
+  console.log(
     "✅ Synchronisation des résultats : toutes les 15 minutes"
   );
 
-  debugLog(
+  console.log(
     "✅ Brain Studio Scheduler : toutes les 15 minutes"
   );
 
-  debugLog(
+  console.log(
     "✅ Planificateur quotidien : actif"
   );
 }
@@ -22837,7 +22549,7 @@ app.get("/public/statistics/dashboard", async (req, res) => {
       ticketStats,
     });
   } catch (error) {
-    logError("ERREUR /public/statistics/dashboard :", error);
+    console.error("ERREUR /public/statistics/dashboard :", error);
 
     return res.status(500).json({
       ok: false,
@@ -22848,1802 +22560,15 @@ app.get("/public/statistics/dashboard", async (req, res) => {
   }
 });
 
-/*
- * ============================================================
- * BET QUALIFICATION — CALIBRATION AUTOMATIQUE DES SEUILS
- * ============================================================
- * Mode initial : AUTO_PROPOSE.
- * Les propositions ne deviennent actives qu'après validation admin.
- */
-const DEFAULT_BET_QUALIFICATION_CONFIG = Object.freeze({
-  safe: {
-    minimumBetScore: 85,
-    minimumDecisionScore: 82,
-    minimumReliability: 65,
-    minimumConsensus: 55,
-    maximumRisk: 65,
-  },
-  value: {
-    minimumBetScore: 74,
-    minimumDecisionScore: 65,
-    minimumReliability: 55,
-    minimumValuePercent: 0,
-    maximumRisk: 75,
-    requireBookmakerOdd: true,
-  },
-  opportunity: {
-    minimumBetScore: 65,
-    minimumDecisionScore: 60,
-    minimumReliability: 50,
-    maximumRisk: 80,
-  },
-  blocking: {
-    minimumProbability: 20,
-    maximumProbability: 95,
-    minimumReliability: 25,
-    maximumRisk: 90,
-  },
-});
-
-function betCalibrationNumber(value, fallback = 0) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function betCalibrationClamp(value, min, max) {
-  return Math.max(min, Math.min(max, betCalibrationNumber(value)));
-}
-
-function betCalibrationRound(value, decimals = 2) {
-  const factor = 10 ** decimals;
-  return Math.round(betCalibrationNumber(value) * factor) / factor;
-}
-
-function cloneBetConfig(value) {
-  return JSON.parse(JSON.stringify(value || DEFAULT_BET_QUALIFICATION_CONFIG));
-}
-
-async function ensureBetQualificationCalibrationTables() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS qualified_bets (
-      id BIGSERIAL PRIMARY KEY,
-      fixture_id BIGINT NOT NULL,
-      market_key TEXT NOT NULL,
-      market_label TEXT,
-      category TEXT NOT NULL,
-      bet_score NUMERIC,
-      decision_score NUMERIC,
-      probability NUMERIC,
-      confidence NUMERIC,
-      consensus NUMERIC,
-      reliability NUMERIC,
-      risk NUMERIC,
-      value_percent NUMERIC,
-      bookmaker_odd NUMERIC,
-      qualification_version TEXT,
-      qualification_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      frozen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      kickoff TIMESTAMPTZ,
-      result_status TEXT NOT NULL DEFAULT 'PENDING',
-      won BOOLEAN,
-      profit_units NUMERIC,
-      roi_percent NUMERIC,
-      settled_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (fixture_id, market_key)
-    );
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_qualified_bets_calibration
-    ON qualified_bets(category, result_status, bet_score);
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bet_qualification_config (
-      id BIGSERIAL PRIMARY KEY,
-      version TEXT NOT NULL UNIQUE,
-      status TEXT NOT NULL DEFAULT 'INACTIVE',
-      mode TEXT NOT NULL DEFAULT 'AUTO_PROPOSE',
-      config JSONB NOT NULL,
-      source TEXT NOT NULL DEFAULT 'DEFAULT',
-      metrics_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      change_reason TEXT,
-      parent_config_id BIGINT REFERENCES bet_qualification_config(id),
-      active_from TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_bet_config
-    ON bet_qualification_config((status))
-    WHERE status = 'ACTIVE';
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bet_qualification_proposals (
-      id BIGSERIAL PRIMARY KEY,
-      status TEXT NOT NULL DEFAULT 'PROPOSED',
-      source TEXT NOT NULL DEFAULT 'AUTO_PROPOSE',
-      current_config_id BIGINT REFERENCES bet_qualification_config(id),
-      proposed_config JSONB NOT NULL,
-      metrics_before JSONB NOT NULL DEFAULT '{}'::jsonb,
-      metrics_after JSONB NOT NULL DEFAULT '{}'::jsonb,
-      impact JSONB NOT NULL DEFAULT '{}'::jsonb,
-      reason TEXT,
-      generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      reviewed_at TIMESTAMPTZ,
-      reviewed_by TEXT,
-      created_config_id BIGINT REFERENCES bet_qualification_config(id)
-    );
-  `);
-
-  const existing = await pool.query(`
-    SELECT id FROM bet_qualification_config
-    WHERE status = 'ACTIVE'
-    LIMIT 1
-  `);
-
-  if (existing.rows.length === 0) {
-    await pool.query(
-      `
-        INSERT INTO bet_qualification_config (
-          version, status, mode, config, source,
-          metrics_snapshot, change_reason, active_from
-        ) VALUES ($1, 'ACTIVE', 'AUTO_PROPOSE', $2::jsonb, 'DEFAULT', '{}'::jsonb, $3, NOW())
-        ON CONFLICT (version) DO NOTHING
-      `,
-      [
-        'bet-qualification-v1.0.0',
-        JSON.stringify(DEFAULT_BET_QUALIFICATION_CONFIG),
-        'Configuration initiale issue du BetQualificationEngine.',
-      ]
-    );
-  }
-}
-
-async function getActiveBetQualificationConfig() {
-  await ensureBetQualificationCalibrationTables();
-  const result = await pool.query(`
-    SELECT *
-    FROM bet_qualification_config
-    WHERE status = 'ACTIVE'
-    ORDER BY active_from DESC NULLS LAST, id DESC
-    LIMIT 1
-  `);
-
-  const row = result.rows[0];
-  return row
-    ? {
-        id: Number(row.id),
-        version: row.version,
-        status: row.status,
-        mode: row.mode,
-        config: row.config || cloneBetConfig(),
-        source: row.source,
-        metricsSnapshot: row.metrics_snapshot || {},
-        changeReason: row.change_reason,
-        activeFrom: row.active_from,
-        createdAt: row.created_at,
-      }
-    : null;
-}
-
-function evaluateBetRows(rows, config) {
-  const categories = ['SAFE', 'VALUE', 'OPPORTUNITY'];
-  const summary = {};
-
-  for (const category of categories) {
-    const key = category.toLowerCase();
-    const rules = config[key];
-    const selected = rows.filter((row) => {
-      const score = betCalibrationNumber(row.bet_score);
-      const decision = betCalibrationNumber(row.decision_score);
-      const reliability = betCalibrationNumber(row.reliability);
-      const consensus = betCalibrationNumber(row.consensus);
-      const risk = betCalibrationNumber(row.risk, 50);
-      const value = row.value_percent == null ? null : betCalibrationNumber(row.value_percent);
-      const odd = row.bookmaker_odd == null ? null : betCalibrationNumber(row.bookmaker_odd);
-
-      if (score < rules.minimumBetScore) return false;
-      if (decision < rules.minimumDecisionScore) return false;
-      if (reliability < rules.minimumReliability) return false;
-      if (risk > rules.maximumRisk) return false;
-      if (category === 'SAFE' && consensus < rules.minimumConsensus) return false;
-      if (category === 'VALUE') {
-        if (odd == null || odd <= 1) return false;
-        if (value == null || value < rules.minimumValuePercent) return false;
-      }
-      return true;
-    });
-
-    const settled = selected.filter((row) => ['WIN', 'LOSS', 'VOID'].includes(String(row.result_status || '').toUpperCase()));
-    const priced = settled.filter((row) => Number.isFinite(Number(row.profit_units)));
-    const wins = settled.filter((row) => row.won === true || String(row.result_status).toUpperCase() === 'WIN').length;
-    const profit = priced.reduce((sum, row) => sum + betCalibrationNumber(row.profit_units), 0);
-
-    summary[category] = {
-      volume: selected.length,
-      settled: settled.length,
-      priced: priced.length,
-      wins,
-      losses: settled.filter((row) => row.won === false || String(row.result_status).toUpperCase() === 'LOSS').length,
-      winRate: settled.length > 0 ? betCalibrationRound((wins / settled.length) * 100, 2) : null,
-      profitUnits: betCalibrationRound(profit, 2),
-      roi: priced.length > 0 ? betCalibrationRound((profit / priced.length) * 100, 2) : null,
-      averageOdd: priced.length > 0
-        ? betCalibrationRound(priced.reduce((sum, row) => sum + betCalibrationNumber(row.bookmaker_odd), 0) / priced.length, 2)
-        : null,
-      averageBetScore: selected.length > 0
-        ? betCalibrationRound(selected.reduce((sum, row) => sum + betCalibrationNumber(row.bet_score), 0) / selected.length, 2)
-        : null,
-    };
-  }
-
-  const pricedTotal = Object.values(summary).reduce((sum, item) => sum + item.priced, 0);
-  const profitTotal = Object.values(summary).reduce((sum, item) => sum + item.profitUnits, 0);
-
-  return {
-    categories: summary,
-    total: {
-      volume: Object.values(summary).reduce((sum, item) => sum + item.volume, 0),
-      settled: Object.values(summary).reduce((sum, item) => sum + item.settled, 0),
-      priced: pricedTotal,
-      profitUnits: betCalibrationRound(profitTotal, 2),
-      roi: pricedTotal > 0 ? betCalibrationRound((profitTotal / pricedTotal) * 100, 2) : null,
-    },
-  };
-}
-
-function generateCandidateConfigs(currentConfig) {
-  const candidates = [];
-  const deltas = [-2, -1, 0, 1, 2];
-
-  for (const category of ['safe', 'value', 'opportunity']) {
-    for (const delta of deltas) {
-      if (delta === 0) continue;
-      const candidate = cloneBetConfig(currentConfig);
-      candidate[category].minimumBetScore = betCalibrationClamp(
-        candidate[category].minimumBetScore + delta,
-        category === 'safe' ? 78 : category === 'value' ? 68 : 58,
-        95
-      );
-      candidates.push({
-        config: candidate,
-        category: category.toUpperCase(),
-        delta,
-        field: 'minimumBetScore',
-      });
-    }
-  }
-
-  return candidates;
-}
-
-function proposalScore(before, after) {
-  const beforeRoi = before.total.roi;
-  const afterRoi = after.total.roi;
-  if (beforeRoi == null || afterRoi == null) return -Infinity;
-
-  const volumeRatio = before.total.priced > 0
-    ? after.total.priced / before.total.priced
-    : 0;
-  if (after.total.priced < 30 || volumeRatio < 0.55) return -Infinity;
-
-  const roiGain = afterRoi - beforeRoi;
-  const profitGain = after.total.profitUnits - before.total.profitUnits;
-  return roiGain * 3 + profitGain * 0.15 + Math.min(1, volumeRatio) * 2;
-}
-
-async function buildBetQualificationProposal() {
-  await ensureBetQualificationCalibrationTables();
-  const active = await getActiveBetQualificationConfig();
-  const rowsResult = await pool.query(`
-    SELECT
-      category, bet_score, decision_score, probability,
-      confidence, consensus, reliability, risk,
-      value_percent, bookmaker_odd, result_status,
-      won, profit_units, roi_percent, frozen_at
-    FROM qualified_bets
-    WHERE frozen_at >= NOW() - INTERVAL '365 days'
-      AND result_status IN ('WIN', 'LOSS', 'VOID')
-    ORDER BY frozen_at DESC
-  `);
-  const rows = rowsResult.rows;
-  const before = evaluateBetRows(rows, active.config);
-
-  if (before.total.priced < 100) {
-    return {
-      created: false,
-      reason: 'INSUFFICIENT_SAMPLE',
-      minimumRequired: 100,
-      pricedSample: before.total.priced,
-      active,
-      metrics: before,
-    };
-  }
-
-  let best = null;
-  for (const candidate of generateCandidateConfigs(active.config)) {
-    const after = evaluateBetRows(rows, candidate.config);
-    const score = proposalScore(before, after);
-    if (!best || score > best.score) {
-      best = { ...candidate, after, score };
-    }
-  }
-
-  if (!best || !Number.isFinite(best.score)) {
-    return {
-      created: false,
-      reason: 'NO_SAFE_IMPROVEMENT',
-      active,
-      metrics: before,
-    };
-  }
-
-  const roiGain = betCalibrationRound((best.after.total.roi || 0) - (before.total.roi || 0), 2);
-  const volumeChange = before.total.priced > 0
-    ? betCalibrationRound(((best.after.total.priced - before.total.priced) / before.total.priced) * 100, 2)
-    : 0;
-
-  if (roiGain < 0.75) {
-    return {
-      created: false,
-      reason: 'IMPROVEMENT_TOO_SMALL',
-      estimatedRoiGain: roiGain,
-      active,
-      metrics: before,
-    };
-  }
-
-  const reason = `${best.category}: ${best.field} ${best.delta > 0 ? '+' : ''}${best.delta}. ROI simulé ${roiGain >= 0 ? '+' : ''}${roiGain} %, volume ${volumeChange >= 0 ? '+' : ''}${volumeChange} %.`;
-
-  const inserted = await pool.query(
-    `
-      INSERT INTO bet_qualification_proposals (
-        status, source, current_config_id, proposed_config,
-        metrics_before, metrics_after, impact, reason
-      ) VALUES ('PROPOSED', 'AUTO_PROPOSE', $1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb, $6)
-      RETURNING *
-    `,
-    [
-      active.id,
-      JSON.stringify(best.config),
-      JSON.stringify(before),
-      JSON.stringify(best.after),
-      JSON.stringify({
-        changedCategory: best.category,
-        changedField: best.field,
-        delta: best.delta,
-        estimatedRoiGain: roiGain,
-        estimatedVolumeChangePercent: volumeChange,
-        score: betCalibrationRound(best.score, 3),
-      }),
-      reason,
-    ]
-  );
-
-  return {
-    created: true,
-    proposal: inserted.rows[0],
-    active,
-  };
-}
-
-app.get('/public/bet-qualification/config', async (req, res) => {
-  try {
-    const active = await getActiveBetQualificationConfig();
-    return res.json({ ok: true, active });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de charger la configuration.' });
-  }
-});
-
-app.get('/internal/bet-qualification/calibration/dashboard', async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  try {
-    await ensureBetQualificationCalibrationTables();
-    const active = await getActiveBetQualificationConfig();
-    const rowsResult = await pool.query(`
-      SELECT * FROM qualified_bets
-      WHERE frozen_at >= NOW() - INTERVAL '365 days'
-      ORDER BY frozen_at DESC
-    `);
-    const proposalsResult = await pool.query(`
-      SELECT * FROM bet_qualification_proposals
-      ORDER BY generated_at DESC
-      LIMIT 30
-    `);
-    const configsResult = await pool.query(`
-      SELECT id, version, status, mode, source, change_reason, active_from, created_at, config, metrics_snapshot
-      FROM bet_qualification_config
-      ORDER BY created_at DESC
-      LIMIT 20
-    `);
-
-    return res.json({
-      ok: true,
-      mode: active?.mode || 'AUTO_PROPOSE',
-      active,
-      metrics: evaluateBetRows(rowsResult.rows, active.config),
-      proposals: proposalsResult.rows,
-      versions: configsResult.rows,
-    });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de charger la calibration des paris.' });
-  }
-});
-
-app.post('/internal/bet-qualification/calibration/proposals/generate', async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  try {
-    const result = await buildBetQualificationProposal();
-    return res.json({ ok: true, ...result });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de générer une proposition.' });
-  }
-});
-
-app.post('/internal/bet-qualification/calibration/proposals/:proposalId/approve', async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  const client = await pool.connect();
-  try {
-    await ensureBetQualificationCalibrationTables();
-    const proposalId = Number(req.params.proposalId);
-    if (!Number.isInteger(proposalId) || proposalId <= 0) {
-      return res.status(400).json({ ok: false, error: 'proposalId invalide.' });
-    }
-
-    await client.query('BEGIN');
-    const proposalResult = await client.query(
-      `SELECT * FROM bet_qualification_proposals WHERE id = $1 FOR UPDATE`,
-      [proposalId]
-    );
-    const proposal = proposalResult.rows[0];
-    if (!proposal) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ ok: false, error: 'Proposition introuvable.' });
-    }
-    if (proposal.status !== 'PROPOSED') {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ ok: false, error: 'Cette proposition a déjà été traitée.' });
-    }
-
-    await client.query(`UPDATE bet_qualification_config SET status = 'INACTIVE', updated_at = NOW() WHERE status = 'ACTIVE'`);
-    const version = `bet-qualification-auto-${Date.now()}`;
-    const configResult = await client.query(
-      `
-        INSERT INTO bet_qualification_config (
-          version, status, mode, config, source, metrics_snapshot,
-          change_reason, parent_config_id, active_from
-        ) VALUES ($1, 'ACTIVE', 'AUTO_PROPOSE', $2::jsonb, 'APPROVED_PROPOSAL', $3::jsonb, $4, $5, NOW())
-        RETURNING *
-      `,
-      [
-        version,
-        JSON.stringify(proposal.proposed_config),
-        JSON.stringify(proposal.metrics_after || {}),
-        proposal.reason,
-        proposal.current_config_id,
-      ]
-    );
-
-    await client.query(
-      `
-        UPDATE bet_qualification_proposals
-        SET status = 'APPROVED', reviewed_at = NOW(), reviewed_by = $2, created_config_id = $3
-        WHERE id = $1
-      `,
-      [proposalId, String(req.body?.reviewedBy || 'administrator').slice(0, 200), configResult.rows[0].id]
-    );
-    await client.query('COMMIT');
-    return res.json({ ok: true, active: configResult.rows[0] });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    return res.status(500).json({ ok: false, error: error?.message || 'Impossible d’approuver la proposition.' });
-  } finally {
-    client.release();
-  }
-});
-
-app.post('/internal/bet-qualification/calibration/proposals/:proposalId/reject', async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  try {
-    const proposalId = Number(req.params.proposalId);
-    const result = await pool.query(
-      `
-        UPDATE bet_qualification_proposals
-        SET status = 'REJECTED', reviewed_at = NOW(), reviewed_by = $2
-        WHERE id = $1 AND status = 'PROPOSED'
-        RETURNING *
-      `,
-      [proposalId, String(req.body?.reviewedBy || 'administrator').slice(0, 200)]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ ok: false, error: 'Proposition active introuvable.' });
-    }
-    return res.json({ ok: true, proposal: result.rows[0] });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de refuser la proposition.' });
-  }
-});
-
-app.post('/internal/bet-qualification/calibration/configs/:configId/rollback', async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  const client = await pool.connect();
-  try {
-    const configId = Number(req.params.configId);
-    await client.query('BEGIN');
-    const targetResult = await client.query(`SELECT * FROM bet_qualification_config WHERE id = $1 FOR UPDATE`, [configId]);
-    const target = targetResult.rows[0];
-    if (!target) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ ok: false, error: 'Version introuvable.' });
-    }
-    await client.query(`UPDATE bet_qualification_config SET status = 'INACTIVE', updated_at = NOW() WHERE status = 'ACTIVE'`);
-    const version = `bet-qualification-rollback-${Date.now()}`;
-    const restored = await client.query(
-      `
-        INSERT INTO bet_qualification_config (
-          version, status, mode, config, source, metrics_snapshot,
-          change_reason, parent_config_id, active_from
-        ) VALUES ($1, 'ACTIVE', 'AUTO_PROPOSE', $2::jsonb, 'ROLLBACK', $3::jsonb, $4, $5, NOW())
-        RETURNING *
-      `,
-      [version, JSON.stringify(target.config), JSON.stringify(target.metrics_snapshot || {}), `Retour à la version ${target.version}.`, target.id]
-    );
-    await client.query('COMMIT');
-    return res.json({ ok: true, active: restored.rows[0] });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de restaurer la version.' });
-  } finally {
-    client.release();
-  }
-});
-
-
-/* ========================================================================== */
-/* BILAN SÉPARÉ — IA COMPLET + RECOMMANDATIONS OFFICIELLES                    */
-/* ========================================================================== */
-
-function bilanPublicNumber(value, fallback = 0) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function bilanPublicRound(value, decimals = 2) {
-  const factor = 10 ** decimals;
-  return Math.round(bilanPublicNumber(value) * factor) / factor;
-}
-
-function getBilanSnapshotMarkets(snapshotValue) {
-  const snapshot = parseBilanSnapshot(snapshotValue);
-
-  if (Array.isArray(snapshot?.markets)) {
-    return snapshot.markets;
-  }
-
-  if (Array.isArray(snapshot?.studio?.markets)) {
-    return snapshot.studio.markets;
-  }
-
-  const fallbackMarket =
-    snapshot?.primaryMarket ||
-    snapshot?.bestDecision ||
-    null;
-
-  return fallbackMarket ? [fallbackMarket] : [];
-}
-
-function getBilanMarketKey(market = {}) {
-  return normalizeManualOddsMarketKey(
-    market?.key ||
-      market?.marketKey ||
-      market?.market_key ||
-      ""
-  );
-}
-
-function getBilanMarketLabel(market = {}, key = "") {
-  return (
-    market?.label ||
-    market?.marketLabel ||
-    market?.market_label ||
-    ({
-      HOME: "Victoire domicile",
-      DRAW: "Match nul",
-      AWAY: "Victoire extérieur",
-      OVER25: "Plus de 2,5 buts",
-      UNDER25: "Moins de 2,5 buts",
-      BTTS_YES: "Les deux équipes marquent",
-      BTTS_NO: "Les deux équipes ne marquent pas",
-    }[key] || key || "Marché inconnu")
-  );
-}
-
-app.get("/public/bilan/ia", async (req, res) => {
-  try {
-    await ensureStudioPredictionColumns();
-
-    const result = await pool.query(`
-      SELECT
-        fixture_id,
-        home_goals,
-        away_goals,
-        studio_snapshot
-      FROM predictions
-      WHERE result_status = 'COMPLETED'
-        AND studio_snapshot IS NOT NULL
-      ORDER BY fixture_date DESC NULLS LAST
-    `);
-
-    const byMarketMap = new Map();
-    let matches = 0;
-    let marketsAnalyzed = 0;
-    let wins = 0;
-    let losses = 0;
-
-    for (const prediction of result.rows) {
-      const markets = getBilanSnapshotMarkets(
-        prediction.studio_snapshot
-      );
-
-      let evaluatedForMatch = 0;
-
-      for (const market of markets) {
-        const marketKey = getBilanMarketKey(market);
-        if (!marketKey) continue;
-
-        const won = evaluateManualOddsMarketResult({
-          marketKey,
-          homeGoals: prediction.home_goals,
-          awayGoals: prediction.away_goals,
-        });
-
-        if (typeof won !== "boolean") continue;
-
-        evaluatedForMatch += 1;
-        marketsAnalyzed += 1;
-
-        if (won) wins += 1;
-        else losses += 1;
-
-        if (!byMarketMap.has(marketKey)) {
-          byMarketMap.set(marketKey, {
-            marketKey,
-            marketLabel: getBilanMarketLabel(market, marketKey),
-            evaluated: 0,
-            wins: 0,
-            losses: 0,
-          });
-        }
-
-        const stats = byMarketMap.get(marketKey);
-        stats.evaluated += 1;
-        if (won) stats.wins += 1;
-        else stats.losses += 1;
-      }
-
-      if (evaluatedForMatch > 0) {
-        matches += 1;
-      }
-    }
-
-    const byMarket = Array.from(byMarketMap.values()).map(
-      (stats) => ({
-        ...stats,
-        accuracy:
-          stats.evaluated > 0
-            ? bilanPublicRound(
-                (stats.wins / stats.evaluated) * 100,
-                2
-              )
-            : 0,
-      })
-    );
-
-    return res.json({
-      ok: true,
-      matches,
-      marketsAnalyzed,
-      wins,
-      losses,
-      accuracy:
-        marketsAnalyzed > 0
-          ? bilanPublicRound(
-              (wins / marketsAnalyzed) * 100,
-              2
-            )
-          : 0,
-      byMarket,
-      generatedAt: new Date().toISOString(),
-    });
-  } catch (error) {
-    logError("ERREUR /public/bilan/ia :", error);
-
-    return res.status(500).json({
-      ok: false,
-      error:
-        error?.message ||
-        "Impossible de charger /public/bilan/ia.",
-    });
-  }
-});
-
-function formatQualifiedBetForPublic(row = {}) {
-  const snapshot =
-    row.qualification_snapshot &&
-    typeof row.qualification_snapshot === "object"
-      ? row.qualification_snapshot
-      : {};
-
-  return {
-    id: row.id,
-    fixtureId: Number(row.fixture_id),
-    homeTeam:
-      row.home_team_name ||
-      snapshot?.match?.homeTeam ||
-      snapshot?.match?.home ||
-      "Domicile",
-    awayTeam:
-      row.away_team_name ||
-      snapshot?.match?.awayTeam ||
-      snapshot?.match?.away ||
-      "Extérieur",
-    competition:
-      row.league_name ||
-      snapshot?.match?.competition ||
-      snapshot?.match?.league ||
-      "Compétition inconnue",
-    kickoff: row.kickoff || row.fixture_date || null,
-    marketKey: row.market_key,
-    marketLabel: row.market_label || row.market_key,
-    category: String(row.category || "OPPORTUNITY").toUpperCase(),
-    betScore:
-      row.bet_score === null ? null : Number(row.bet_score),
-    decisionScore:
-      row.decision_score === null
-        ? null
-        : Number(row.decision_score),
-    probability:
-      row.probability === null ? null : Number(row.probability),
-    confidence:
-      row.confidence === null ? null : Number(row.confidence),
-    consensus:
-      row.consensus === null ? null : Number(row.consensus),
-    reliability:
-      row.reliability === null ? null : Number(row.reliability),
-    risk: row.risk === null ? null : Number(row.risk),
-    valuePercent:
-      row.value_percent === null
-        ? null
-        : Number(row.value_percent),
-    bookmakerOdd:
-      row.bookmaker_odd === null
-        ? null
-        : Number(row.bookmaker_odd),
-    resultStatus: row.result_status,
-    won:
-      row.won === null || row.won === undefined
-        ? null
-        : row.won === true,
-    profitUnits:
-      row.profit_units === null
-        ? null
-        : Number(row.profit_units),
-    roiPercent:
-      row.roi_percent === null
-        ? null
-        : Number(row.roi_percent),
-    frozenAt: row.frozen_at,
-    settledAt: row.settled_at,
-    qualificationVersion: row.qualification_version || null,
-  };
-}
-
-function summarizeQualifiedBetRows(rows = []) {
-  const volume = rows.length;
-  const settledRows = rows.filter((row) =>
-    ["WIN", "LOSS", "VOID"].includes(
-      String(row.result_status || "").toUpperCase()
-    )
-  );
-  const decisiveRows = settledRows.filter((row) =>
-    ["WIN", "LOSS"].includes(
-      String(row.result_status || "").toUpperCase()
-    )
-  );
-  const pricedRows = decisiveRows.filter(
-    (row) =>
-      Number(row.bookmaker_odd) > 1 &&
-      Number.isFinite(Number(row.profit_units))
-  );
-
-  const wins = decisiveRows.filter(
-    (row) => String(row.result_status).toUpperCase() === "WIN"
-  ).length;
-  const losses = decisiveRows.filter(
-    (row) => String(row.result_status).toUpperCase() === "LOSS"
-  ).length;
-  const voids = settledRows.filter(
-    (row) => String(row.result_status).toUpperCase() === "VOID"
-  ).length;
-  const profit = pricedRows.reduce(
-    (sum, row) => sum + bilanPublicNumber(row.profit_units),
-    0
-  );
-  const averageOdd =
-    pricedRows.length > 0
-      ? pricedRows.reduce(
-          (sum, row) => sum + bilanPublicNumber(row.bookmaker_odd),
-          0
-        ) / pricedRows.length
-      : null;
-
-  return {
-    volume,
-    settled: settledRows.length,
-    pending: Math.max(0, volume - settledRows.length),
-    wins,
-    losses,
-    voids,
-    priced: pricedRows.length,
-    accuracy:
-      decisiveRows.length > 0
-        ? bilanPublicRound((wins / decisiveRows.length) * 100, 2)
-        : 0,
-    profit: bilanPublicRound(profit, 2),
-    roi:
-      pricedRows.length > 0
-        ? bilanPublicRound((profit / pricedRows.length) * 100, 2)
-        : null,
-    averageOdd:
-      averageOdd === null
-        ? null
-        : bilanPublicRound(averageOdd, 2),
-  };
-}
-
-
-/*
- * ============================================================
- * DAILY BET PORTFOLIO ENGINE — IA PICKS + PREMIUM
- * ============================================================
- * Sélection relative quotidienne :
- * - conserve les catégories Premium SAFE / VALUE / OPPORTUNITY ;
- * - complète avec IA_PICK parmi les meilleurs candidats du jour ;
- * - un seul pari par match ;
- * - diversification par marché et compétition ;
- * - gel uniquement entre T-30 et T-10.
- */
-const DAILY_PORTFOLIO_VERSION = "daily-portfolio-v1.0.0";
-const DAILY_PORTFOLIO_MIN_TARGET = 3;
-const DAILY_PORTFOLIO_MAX_TARGET = 12;
-const DAILY_PORTFOLIO_SHARE = 0.14;
-const DAILY_PORTFOLIO_MAX_PER_MARKET = 3;
-const DAILY_PORTFOLIO_MAX_PER_LEAGUE = 3;
-
-function portfolioNumber(value, fallback = 0) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function portfolioNullableNumber(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function portfolioClamp(value, minimum = 0, maximum = 100) {
-  return Math.max(minimum, Math.min(maximum, portfolioNumber(value)));
-}
-
-function portfolioRound(value, decimals = 2) {
-  const factor = 10 ** decimals;
-  return Math.round(portfolioNumber(value) * factor) / factor;
-}
-
-function portfolioMarketKey(value) {
-  return normalizeManualOddsMarketKey(value || "");
-}
-
-function portfolioSnapshotMarkets(prediction = {}) {
-  const snapshot = prediction.studio_snapshot && typeof prediction.studio_snapshot === "object"
-    ? prediction.studio_snapshot
-    : {};
-  const markets = Array.isArray(snapshot.markets)
-    ? snapshot.markets
-    : Array.isArray(snapshot?.studio?.markets)
-      ? snapshot.studio.markets
-      : [];
-  if (markets.length > 0) return markets;
-  const fallback = snapshot.primaryMarket || snapshot.bestDecision;
-  if (fallback) return [fallback];
-  if (prediction.studio_market_key) {
-    return [{
-      key: prediction.studio_market_key,
-      label: prediction.studio_market_label,
-      probability: prediction.studio_probability,
-      decisionScore: prediction.studio_decision_score,
-    }];
-  }
-  return [];
-}
-
-function portfolioCandidateFromMarket(prediction, market) {
-  const marketKey = portfolioMarketKey(market?.key || market?.marketKey);
-  if (!isSupportedDailyTicketMarketKey(marketKey)) return null;
-
-  const qualification = market?.betQualification || market?.qualification || {};
-  const criteria = qualification?.criteria || {};
-  const decisionScore = portfolioClamp(
-    market?.decision?.score ?? market?.marketDecision?.score ?? market?.decisionScore ?? market?.score ?? prediction.studio_decision_score
-  );
-  const probability = portfolioClamp(
-    market?.fairOdds?.calibratedProbability ?? market?.calibratedProbability ?? market?.probability ?? prediction.studio_probability
-  );
-  const reliability = portfolioClamp(
-    criteria.reliability ?? market?.marketReliability?.score ?? market?.reliability?.score ?? market?.reliability ?? 50
-  );
-  const consensus = portfolioClamp(
-    criteria.consensus ?? market?.decision?.marketConsensus?.score ?? market?.consensusScore ?? 50
-  );
-  const risk = portfolioClamp(
-    criteria.risk ?? market?.decision?.risk ?? prediction.risk ?? 50
-  );
-  const confidence = portfolioClamp(
-    criteria.confidence ?? market?.decision?.confidence ?? prediction.confidence ?? 50
-  );
-  const oddData = getDailyTicketMarketOdd(market, prediction);
-  const valuePercent = portfolioNullableNumber(
-    criteria.valuePercent ?? market?.expectedValuePercent ?? market?.valueEdge
-  ) ?? (
-    oddData.odd && probability > 0
-      ? portfolioRound((probability / 100) * oddData.odd * 100 - 100, 2)
-      : null
-  );
-  const betScore = portfolioClamp(
-    qualification?.betScore ??
-      decisionScore * 0.35 +
-      probability * 0.12 +
-      confidence * 0.13 +
-      consensus * 0.12 +
-      reliability * 0.18 +
-      (100 - risk) * 0.10
-  );
-  const blockingReasons = Array.isArray(qualification?.blockingReasons)
-    ? qualification.blockingReasons.filter(Boolean)
-    : [];
-  const hardBlocked =
-    blockingReasons.length > 0 ||
-    decisionScore < 60 ||
-    betScore < 55 ||
-    reliability < 45 ||
-    risk > 82 ||
-    probability < 20 ||
-    probability > 95;
-
-  const valueQuality = valuePercent === null
-    ? 45
-    : portfolioClamp(50 + valuePercent * 2.5);
-  const missingOddPenalty = oddData.odd && oddData.odd > 1 ? 0 : 6;
-  const highRiskPenalty = Math.max(0, risk - 60) * 0.18;
-  const portfolioScore = portfolioClamp(
-    betScore * 0.35 +
-    decisionScore * 0.25 +
-    reliability * 0.15 +
-    consensus * 0.10 +
-    probability * 0.05 +
-    valueQuality * 0.10 -
-    missingOddPenalty -
-    highRiskPenalty
-  );
-
-  const premiumCategory = ["SAFE", "VALUE", "OPPORTUNITY"].includes(
-    String(qualification?.category || "").toUpperCase()
-  ) && qualification?.qualified === true
-    ? String(qualification.category).toUpperCase()
-    : null;
-
-  return {
-    fixtureId: Number(prediction.fixture_id),
-    kickoff: prediction.fixture_date,
-    leagueName: prediction.league_name || "Compétition inconnue",
-    homeTeam: prediction.home_team_name || "Domicile",
-    awayTeam: prediction.away_team_name || "Extérieur",
-    marketKey,
-    marketLabel: market?.label || market?.marketLabel || marketKey,
-    category: premiumCategory || "IA_PICK",
-    selectionSource: premiumCategory ? "PREMIUM" : "DAILY_PORTFOLIO",
-    portfolioScore: portfolioRound(portfolioScore, 1),
-    betScore: portfolioRound(betScore, 1),
-    decisionScore: portfolioRound(decisionScore, 1),
-    probability: portfolioRound(probability, 1),
-    confidence: portfolioRound(confidence, 1),
-    consensus: portfolioRound(consensus, 1),
-    reliability: portfolioRound(reliability, 1),
-    risk: portfolioRound(risk, 1),
-    valuePercent,
-    bookmakerOdd: oddData.odd,
-    bookmaker: oddData.bookmaker,
-    bookmakerSource: oddData.source,
-    qualificationVersion:
-      qualification?.version || qualification?.thresholdsVersion || DAILY_PORTFOLIO_VERSION,
-    qualificationSnapshot: {
-      originalQualification: qualification,
-      portfolio: {
-        version: DAILY_PORTFOLIO_VERSION,
-        portfolioScore: portfolioRound(portfolioScore, 1),
-        selectionSource: premiumCategory ? "PREMIUM" : "DAILY_PORTFOLIO",
-        safetyFloor: {
-          minimumDecisionScore: 60,
-          minimumBetScore: 55,
-          minimumReliability: 45,
-          maximumRisk: 82,
-          probabilityRange: [20, 95],
-        },
-      },
-    },
-    hardBlocked,
-    blockingReasons,
-  };
-}
-
-function buildDailyPortfolio(candidates = [], matchCount = 0) {
-  const target = Math.max(
-    DAILY_PORTFOLIO_MIN_TARGET,
-    Math.min(
-      DAILY_PORTFOLIO_MAX_TARGET,
-      Math.round(Math.max(1, matchCount) * DAILY_PORTFOLIO_SHARE)
-    )
-  );
-  const ranked = candidates
-    .filter((candidate) => candidate && !candidate.hardBlocked)
-    .sort((a, b) =>
-      Number(Boolean(b.bookmakerOdd)) - Number(Boolean(a.bookmakerOdd)) ||
-      b.portfolioScore - a.portfolioScore ||
-      b.betScore - a.betScore ||
-      b.decisionScore - a.decisionScore
-    );
-
-  const selected = [];
-  const usedFixtures = new Set();
-  const marketCounts = new Map();
-  const leagueCounts = new Map();
-
-  for (const candidate of ranked) {
-    if (selected.length >= target) break;
-    if (usedFixtures.has(candidate.fixtureId)) continue;
-    const marketCount = marketCounts.get(candidate.marketKey) || 0;
-    const leagueCount = leagueCounts.get(candidate.leagueName) || 0;
-    if (marketCount >= DAILY_PORTFOLIO_MAX_PER_MARKET) continue;
-    if (leagueCount >= DAILY_PORTFOLIO_MAX_PER_LEAGUE) continue;
-
-    selected.push({
-      ...candidate,
-      dailyRank: selected.length + 1,
-      targetSize: target,
-    });
-    usedFixtures.add(candidate.fixtureId);
-    marketCounts.set(candidate.marketKey, marketCount + 1);
-    leagueCounts.set(candidate.leagueName, leagueCount + 1);
-  }
-
-  return { target, rankedCount: ranked.length, selected };
-}
-
-async function ensureDailyPortfolioColumns() {
-  await ensureBetQualificationCalibrationTables();
-  await pool.query(`
-    ALTER TABLE qualified_bets
-      ADD COLUMN IF NOT EXISTS selection_source TEXT,
-      ADD COLUMN IF NOT EXISTS portfolio_score NUMERIC,
-      ADD COLUMN IF NOT EXISTS daily_rank INTEGER,
-      ADD COLUMN IF NOT EXISTS portfolio_date DATE,
-      ADD COLUMN IF NOT EXISTS bookmaker TEXT,
-      ADD COLUMN IF NOT EXISTS bookmaker_source TEXT;
-  `);
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_qualified_bets_portfolio_date
-    ON qualified_bets(portfolio_date, daily_rank);
-  `);
-}
-
-async function loadDailyPortfolio(date = null) {
-  await ensureDailyPortfolioColumns();
-  const portfolioDate = date || new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Paris",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(new Date());
-
-  const result = await pool.query(
-    `
-      SELECT *
-      FROM predictions
-      WHERE (fixture_date AT TIME ZONE 'Europe/Paris')::date = $1::date
-        AND fixture_date > NOW()
-        AND studio_snapshot IS NOT NULL
-      ORDER BY fixture_date ASC, fixture_id ASC
-    `,
-    [portfolioDate]
-  );
-  const candidates = [];
-  const automaticOddsMap = await oddsSyncService.getCurrentOddsMap(
-    result.rows.map((prediction) => prediction.fixture_id)
-  );
-
-  for (const prediction of result.rows) {
-    for (const rawMarket of portfolioSnapshotMarkets(prediction)) {
-      const market = oddsSyncService.applyOddsToMarket(
-        prediction.fixture_id,
-        rawMarket,
-        automaticOddsMap
-      );
-      const candidate = portfolioCandidateFromMarket(prediction, market);
-      if (candidate) candidates.push(candidate);
-    }
-  }
-  const portfolio = buildDailyPortfolio(candidates, result.rows.length);
-  return {
-    date: portfolioDate,
-    sourceMatches: result.rows.length,
-    analyzedMarkets: candidates.length,
-    ...portfolio,
-  };
-}
-
-async function freezeDailyPortfolioSelections() {
-  const portfolio = await loadDailyPortfolio();
-  const now = Date.now();
-  let frozen = 0;
-  let skipped = 0;
-
-  for (const candidate of portfolio.selected) {
-    const kickoff = new Date(candidate.kickoff);
-    if (Number.isNaN(kickoff.getTime())) {
-      skipped += 1;
-      continue;
-    }
-    const minutesBefore = (kickoff.getTime() - now) / 60000;
-    if (minutesBefore > 30 || minutesBefore < 10) continue;
-
-    const result = await pool.query(
-      `
-        INSERT INTO qualified_bets (
-          fixture_id, market_key, market_label, category,
-          bet_score, decision_score, probability, confidence,
-          consensus, reliability, risk, value_percent,
-          bookmaker_odd, bookmaker, bookmaker_source,
-          qualification_version, qualification_snapshot,
-          selection_source, portfolio_score, daily_rank,
-          portfolio_date, frozen_at, kickoff,
-          result_status, updated_at
-        ) VALUES (
-          $1, $2, $3, $4,
-          $5, $6, $7, $8,
-          $9, $10, $11, $12,
-          $13, $14, $15,
-          $16, $17::jsonb,
-          $18, $19, $20,
-          $21::date, NOW(), $22,
-          'PENDING', NOW()
-        )
-        ON CONFLICT (fixture_id, market_key) DO NOTHING
-        RETURNING id
-      `,
-      [
-        candidate.fixtureId,
-        candidate.marketKey,
-        candidate.marketLabel,
-        candidate.category,
-        candidate.betScore,
-        candidate.decisionScore,
-        candidate.probability,
-        candidate.confidence,
-        candidate.consensus,
-        candidate.reliability,
-        candidate.risk,
-        candidate.valuePercent,
-        candidate.bookmakerOdd,
-        candidate.bookmaker,
-        candidate.bookmakerSource,
-        candidate.qualificationVersion,
-        JSON.stringify(candidate.qualificationSnapshot),
-        candidate.selectionSource,
-        candidate.portfolioScore,
-        candidate.dailyRank,
-        portfolio.date,
-        kickoff.toISOString(),
-      ]
-    );
-    if (result.rows.length > 0) frozen += 1;
-    else skipped += 1;
-  }
-
-  return { ...portfolio, frozen, skipped, checkedAt: new Date().toISOString() };
-}
-
-function settlePortfolioMarket(marketKey, homeGoals, awayGoals) {
-  const key = portfolioMarketKey(marketKey);
-  const total = homeGoals + awayGoals;
-  if (key === "HOME") return homeGoals > awayGoals;
-  if (key === "DRAW") return homeGoals === awayGoals;
-  if (key === "AWAY") return awayGoals > homeGoals;
-  if (key === "OVER25") return total >= 3;
-  if (key === "UNDER25") return total <= 2;
-  if (key === "BTTS_YES") return homeGoals > 0 && awayGoals > 0;
-  if (key === "BTTS_NO") return homeGoals === 0 || awayGoals === 0;
-  return null;
-}
-
-async function settleDailyPortfolioBets() {
-  await ensureDailyPortfolioColumns();
-  const result = await pool.query(`
-    SELECT qb.id, qb.market_key, qb.bookmaker_odd,
-           p.home_goals, p.away_goals, p.result_status
-    FROM qualified_bets qb
-    JOIN predictions p ON p.fixture_id = qb.fixture_id
-    WHERE qb.result_status = 'PENDING'
-      AND UPPER(COALESCE(p.result_status, '')) IN ('FT','AET','PEN','FINISHED','COMPLETED')
-      AND p.home_goals IS NOT NULL
-      AND p.away_goals IS NOT NULL
-  `);
-  let settled = 0;
-  for (const row of result.rows) {
-    const won = settlePortfolioMarket(
-      row.market_key,
-      Number(row.home_goals),
-      Number(row.away_goals)
-    );
-    if (won === null) continue;
-    const odd = portfolioNullableNumber(row.bookmaker_odd);
-    const profit = odd && odd > 1 ? (won ? odd - 1 : -1) : null;
-    await pool.query(
-      `
-        UPDATE qualified_bets
-        SET result_status = $2,
-            won = $3,
-            profit_units = $4,
-            roi_percent = $5,
-            settled_at = NOW(),
-            updated_at = NOW()
-        WHERE id = $1
-      `,
-      [row.id, won ? "WIN" : "LOSS", won, profit, profit === null ? null : profit * 100]
-    );
-    settled += 1;
-  }
-  return { settled, checked: result.rows.length, settledAt: new Date().toISOString() };
-}
-
-app.get("/public/bet-portfolio/daily", async (req, res) => {
-  try {
-    const portfolio = await loadDailyPortfolio(req.query.date || null);
-    return res.json({ ok: true, version: DAILY_PORTFOLIO_VERSION, ...portfolio });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || "Impossible de charger le portefeuille IA." });
-  }
-});
-
-app.post("/internal/bet-portfolio/freeze", async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  try {
-    return res.json({ ok: true, ...(await freezeDailyPortfolioSelections()) });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || "Impossible de figer le portefeuille IA." });
-  }
-});
-
-app.post("/internal/bet-portfolio/settle", async (req, res) => {
-  if (!requireOptionalAdminKey(req, res)) return;
-  try {
-    return res.json({ ok: true, ...(await settleDailyPortfolioBets()) });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error?.message || "Impossible de régler le portefeuille IA." });
-  }
-});
-
-if (AUTOMATIC_SCHEDULERS_ENABLED) {
-  setTimeout(() => {
-    freezeDailyPortfolioSelections().catch((error) =>
-      logError("DAILY PORTFOLIO FREEZE INIT :", error)
-    );
-    settleDailyPortfolioBets().catch((error) =>
-      logError("DAILY PORTFOLIO SETTLE INIT :", error)
-    );
-  }, 90 * 1000);
-
-  setInterval(() => {
-    freezeDailyPortfolioSelections().catch((error) =>
-      logError("DAILY PORTFOLIO FREEZE :", error)
-    );
-  }, 60 * 1000);
-
-  setInterval(() => {
-    settleDailyPortfolioBets().catch((error) =>
-      logError("DAILY PORTFOLIO SETTLE :", error)
-    );
-  }, 5 * 60 * 1000);
-}
-
-
-
-/*
- * ============================================================
- * BILAN DÉTAILLÉ — DERNIER MARCHÉ PRINCIPAL PAR MATCH
- * ============================================================
- * Ce bilan est strictement analytique :
- * - un seul marché principal par match terminé ;
- * - résultat correct / incorrect ;
- * - cote observée au moment du snapshot ou dernière cote stockée ;
- * - aucun calcul de mise, profit ou ROI.
- */
-
-function detailedBilanNormalizeMarketKey(value = "") {
-  const compact = String(value || "")
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
-
-  if (["HOME", "HOMEWIN", "1"].includes(compact)) return "HOME";
-  if (["DRAW", "X", "N"].includes(compact)) return "DRAW";
-  if (["AWAY", "AWAYWIN", "2"].includes(compact)) return "AWAY";
-  if (["BTTS", "BTTSYES", "GG"].includes(compact)) return "BTTS_YES";
-  if (["NOBTTS", "BTTSNO", "NG"].includes(compact)) return "BTTS_NO";
-  if (["OVER25", "OVER250", "PLUS25"].includes(compact)) return "OVER25";
-  if (["UNDER25", "UNDER250", "MOINS25"].includes(compact)) return "UNDER25";
-
-  return compact || null;
-}
-
-function detailedBilanMarketLabel(key, fallback = null) {
-  return (
-    {
-      HOME: "Victoire domicile",
-      DRAW: "Match nul",
-      AWAY: "Victoire extérieur",
-      BTTS_YES: "Les deux équipes marquent",
-      BTTS_NO: "Les deux équipes ne marquent pas",
-      OVER25: "Plus de 2,5 buts",
-      UNDER25: "Moins de 2,5 buts",
-    }[key] ||
-    fallback ||
-    key ||
-    "Marché inconnu"
-  );
-}
-
-function detailedBilanEvaluateMarket(marketKey, homeGoals, awayGoals) {
-  const key = detailedBilanNormalizeMarketKey(marketKey);
-  const home = Number(homeGoals);
-  const away = Number(awayGoals);
-
-  if (!Number.isFinite(home) || !Number.isFinite(away)) {
-    return null;
-  }
-
-  if (key === "HOME") return home > away;
-  if (key === "DRAW") return home === away;
-  if (key === "AWAY") return away > home;
-  if (key === "BTTS_YES") return home > 0 && away > 0;
-  if (key === "BTTS_NO") return home === 0 || away === 0;
-  if (key === "OVER25") return home + away >= 3;
-  if (key === "UNDER25") return home + away <= 2;
-
-  return null;
-}
-
-function detailedBilanNumberOrNull(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function detailedBilanExtractSnapshotMarket(prediction = {}) {
-  const snapshot =
-    prediction.studio_snapshot &&
-    typeof prediction.studio_snapshot === "object"
-      ? prediction.studio_snapshot
-      : {};
-
-  const primary =
-    snapshot.primaryMarket ||
-    snapshot.bestDecision ||
-    snapshot.studio?.primaryMarket ||
-    null;
-
-  const marketKey = detailedBilanNormalizeMarketKey(
-    prediction.studio_market_key ||
-      primary?.key ||
-      primary?.marketKey ||
-      ""
-  );
-
-  const marketLabel =
-    prediction.studio_market_label ||
-    primary?.label ||
-    primary?.marketLabel ||
-    detailedBilanMarketLabel(marketKey);
-
-  const probability = detailedBilanNumberOrNull(
-    prediction.studio_probability ??
-      primary?.fairOdds?.calibratedProbability ??
-      primary?.calibratedProbability ??
-      primary?.probability
-  );
-
-  const decisionScore = detailedBilanNumberOrNull(
-    prediction.studio_decision_score ??
-      primary?.decision?.score ??
-      primary?.marketDecision?.score ??
-      primary?.decisionScore ??
-      primary?.score
-  );
-
-  const snapshotOdd = detailedBilanNumberOrNull(
-    primary?.fairOdds?.bookmakerOdds ??
-      primary?.oddsMetrics?.bookmakerOdds ??
-      primary?.bookmakerOdds ??
-      snapshot?.bookmakerOdd
-  );
-
-  const snapshotBookmaker =
-    primary?.fairOdds?.bookmaker ||
-    primary?.oddsMetrics?.bookmaker ||
-    primary?.bookmaker ||
-    snapshot?.bookmaker ||
-    null;
-
-  const snapshotSource =
-    primary?.fairOdds?.bookmakerSource ||
-    primary?.oddsMetrics?.bookmakerSource ||
-    primary?.bookmakerSource ||
-    snapshot?.bookmakerOddSource ||
-    null;
-
-  return {
-    marketKey,
-    marketLabel,
-    probability,
-    decisionScore,
-    snapshotOdd,
-    snapshotBookmaker,
-    snapshotSource,
-  };
-}
-
-app.get("/public/bilan/detaille", async (req, res) => {
-  try {
-    await ensureStudioPredictionColumns();
-
-    /*
-     * Aucun plafond arbitraire ici :
-     * la route doit rendre disponible tout l'historique des matchs terminés.
-     * L'interface limite seulement le nombre de cartes visibles et permet
-     * d'en charger davantage par blocs de 50.
-     */
-    const result = await pool.query(
-      `
-        SELECT DISTINCT ON (p.fixture_id)
-          p.fixture_id,
-          p.fixture_date,
-          p.home_team_name,
-          p.away_team_name,
-          p.league_name,
-          p.home_goals,
-          p.away_goals,
-          p.result_status,
-          p.studio_market_key,
-          p.studio_market_label,
-          p.studio_probability,
-          p.studio_decision_score,
-          p.studio_snapshot,
-          p.studio_saved_at,
-          p.manual_market_key,
-          p.manual_market_odd,
-          p.manual_odd_source,
-          p.manual_odd_updated_at
-        FROM predictions p
-        WHERE UPPER(COALESCE(p.result_status, '')) IN (
-          'FT', 'AET', 'PEN', 'FINISHED', 'COMPLETED'
-        )
-          AND p.home_goals IS NOT NULL
-          AND p.away_goals IS NOT NULL
-          AND (
-            p.studio_snapshot IS NOT NULL
-            OR NULLIF(BTRIM(COALESCE(p.studio_market_key, '')), '') IS NOT NULL
-          )
-        ORDER BY
-          p.fixture_id,
-          p.updated_at DESC NULLS LAST,
-          p.id DESC
-      `
-    );
-
-    const fixtureIds = result.rows
-      .map((row) => Number(row.fixture_id))
-      .filter((fixtureId) => Number.isInteger(fixtureId));
-
-    let oddsMap = new Map();
-
-    if (fixtureIds.length > 0) {
-      const oddsResult = await pool.query(
-        `
-          SELECT DISTINCT ON (fixture_id, market_key)
-            fixture_id,
-            market_key,
-            odd,
-            bookmaker_name,
-            source,
-            captured_at
-          FROM market_odds
-          WHERE fixture_id = ANY($1::bigint[])
-          ORDER BY
-            fixture_id,
-            market_key,
-            captured_at DESC,
-            id DESC
-        `,
-        [fixtureIds]
-      );
-
-      oddsMap = new Map(
-        oddsResult.rows.map((row) => [
-          `${Number(row.fixture_id)}:${detailedBilanNormalizeMarketKey(
-            row.market_key
-          )}`,
-          row,
-        ])
-      );
-    }
-
-    const analyses = [];
-
-    for (const prediction of result.rows) {
-      const primary = detailedBilanExtractSnapshotMarket(prediction);
-
-      if (!primary.marketKey) continue;
-
-      const won = detailedBilanEvaluateMarket(
-        primary.marketKey,
-        prediction.home_goals,
-        prediction.away_goals
-      );
-
-      if (won === null) continue;
-
-      const manualKey = detailedBilanNormalizeMarketKey(
-        prediction.manual_market_key
-      );
-      const manualOdd =
-        manualKey === primary.marketKey
-          ? detailedBilanNumberOrNull(prediction.manual_market_odd)
-          : null;
-
-      const automaticOdd = oddsMap.get(
-        `${Number(prediction.fixture_id)}:${primary.marketKey}`
-      );
-
-      const bookmakerOdd =
-        manualOdd && manualOdd > 1
-          ? manualOdd
-          : primary.snapshotOdd && primary.snapshotOdd > 1
-            ? primary.snapshotOdd
-            : detailedBilanNumberOrNull(automaticOdd?.odd);
-
-      const bookmaker =
-        manualOdd && manualOdd > 1
-          ? prediction.manual_odd_source || "Admin Football AI Pro"
-          : primary.snapshotOdd && primary.snapshotOdd > 1
-            ? primary.snapshotBookmaker
-            : automaticOdd?.bookmaker_name || null;
-
-      const bookmakerSource =
-        manualOdd && manualOdd > 1
-          ? "MANUAL_ADMIN"
-          : primary.snapshotOdd && primary.snapshotOdd > 1
-            ? primary.snapshotSource || "STUDIO_SNAPSHOT"
-            : automaticOdd?.source || null;
-
-      analyses.push({
-        fixtureId: Number(prediction.fixture_id),
-        kickoff: prediction.fixture_date,
-        homeTeam: prediction.home_team_name || "Domicile",
-        awayTeam: prediction.away_team_name || "Extérieur",
-        competition:
-          prediction.league_name || "Compétition inconnue",
-        homeGoals: Number(prediction.home_goals),
-        awayGoals: Number(prediction.away_goals),
-        finalScore: `${Number(prediction.home_goals)}-${Number(
-          prediction.away_goals
-        )}`,
-        marketKey: primary.marketKey,
-        marketLabel: detailedBilanMarketLabel(
-          primary.marketKey,
-          primary.marketLabel
-        ),
-        probability: primary.probability,
-        decisionScore: primary.decisionScore,
-        bookmakerOdd:
-          bookmakerOdd && bookmakerOdd > 1 ? bookmakerOdd : null,
-        bookmaker,
-        bookmakerSource,
-        correct: won,
-        result: won ? "CORRECT" : "INCORRECT",
-        analyzedAt: prediction.studio_saved_at || null,
-      });
-    }
-
-    analyses.sort(
-      (first, second) =>
-        new Date(second.kickoff || 0).getTime() -
-        new Date(first.kickoff || 0).getTime()
-    );
-
-    const correct = analyses.filter((item) => item.correct === true).length;
-    const incorrect = analyses.filter((item) => item.correct === false).length;
-
-    return res.json({
-      ok: true,
-      summary: {
-        matches: analyses.length,
-        correct,
-        incorrect,
-        accuracy:
-          analyses.length > 0
-            ? Math.round((correct / analyses.length) * 10000) / 100
-            : 0,
-        withOdds: analyses.filter(
-          (item) => Number(item.bookmakerOdd) > 1
-        ).length,
-      },
-      recent: analyses,
-      generatedAt: new Date().toISOString(),
-    });
-  } catch (error) {
-    logError("ERREUR /public/bilan/detaille :", error);
-
-    return res.status(500).json({
-      ok: false,
-      error:
-        error?.message ||
-        "Impossible de charger le Bilan détaillé.",
-    });
-  }
-});
-
-
-app.get("/public/bilan/paris", async (req, res) => {
-  try {
-    await ensureBetQualificationCalibrationTables();
-
-    const result = await pool.query(`
-      SELECT
-        qb.*,
-        p.fixture_date,
-        p.home_team_name,
-        p.away_team_name,
-        p.league_name
-      FROM qualified_bets qb
-      LEFT JOIN predictions p
-        ON p.fixture_id = qb.fixture_id
-      ORDER BY qb.frozen_at DESC, qb.id DESC
-      LIMIT 1000
-    `);
-
-    const rows = result.rows;
-    const categories = {};
-
-    for (const category of ["SAFE", "VALUE", "OPPORTUNITY", "IA_PICK"]) {
-      categories[category] = summarizeQualifiedBetRows(
-        rows.filter(
-          (row) =>
-            String(row.category || "").toUpperCase() === category
-        )
-      );
-    }
-
-    const trackingStartedAt =
-      rows.length > 0
-        ? rows.reduce((oldest, row) => {
-            const current = row.frozen_at
-              ? new Date(row.frozen_at)
-              : null;
-            if (!current || Number.isNaN(current.getTime())) {
-              return oldest;
-            }
-            if (!oldest || current < oldest) return current;
-            return oldest;
-          }, null)?.toISOString() || null
-        : null;
-
-    return res.json({
-      ok: true,
-      overall: summarizeQualifiedBetRows(rows),
-      categories,
-      recent: rows.slice(0, 250).map(formatQualifiedBetForPublic),
-      trackingStartedAt,
-      freezeRule: {
-        normalFreezeMinutesBeforeKickoff: 30,
-        latestFreezeMinutesBeforeKickoff: 10,
-      },
-      generatedAt: new Date().toISOString(),
-    });
-  } catch (error) {
-    logError("ERREUR /public/bilan/paris :", error);
-
-    return res.status(500).json({
-      ok: false,
-      error:
-        error?.message ||
-        "Impossible de charger /public/bilan/paris.",
-    });
-  }
-});
-
-
-/*
- * Gestionnaire de dernier recours pour les erreurs transmises à Express.
- * Il doit rester placé après toutes les routes et avant app.listen().
- */
-app.use((error, req, res, next) => {
-  logError(
-    "ERREUR EXPRESS NON GÉRÉE :",
-    {
-      method: req.method,
-      path: req.path,
-      status:
-        error?.status ||
-        error?.statusCode ||
-        500,
-    },
-    error
-  );
-
-  if (res.headersSent) {
-    return next(error);
-  }
-
-  const status = Number(
-    error?.status ||
-    error?.statusCode ||
-    500
-  );
-
-  return res
-    .status(
-      status >= 400 &&
-      status <= 599
-        ? status
-        : 500
-    )
-    .json({
-      ok: false,
-      error:
-        status >= 500
-          ? "Erreur interne du serveur."
-          : (
-              error?.message ||
-              "Requête invalide."
-            ),
-    });
-});
-
 app.listen(
   PORT,
   "0.0.0.0",
   () => {
-    debugLog(
+    console.log(
       `FootballBrain API running on 0.0.0.0:${PORT}`
     );
 
-    debugLog(
+    console.log(
       `API-Football : ${
         API_FOOTBALL_ENABLED
           ? "✅ autorisée"
@@ -24651,7 +22576,7 @@ app.listen(
       }`
     );
 
-    debugLog(
+    console.log(
       `Schedulers automatiques : ${
         AUTOMATIC_SCHEDULERS_ENABLED
           ? "✅ actifs"
@@ -24659,9 +22584,21 @@ app.listen(
       }`
     );
 
+    console.log(
+      `Learning / Calibration : ${
+        CALIBRATION_APPLY_ENABLED
+          ? "✅ ajustements contrôlés actifs"
+          : "👁️ observation uniquement"
+      }`
+    );
+
+    console.log(
+      `Garde-fous Learning : activation à ${CALIBRATION_AUTO_ACTIVATION_MIN_SAMPLES} échantillons, écart ≥ ${CALIBRATION_AUTO_ACTIVATION_MIN_GAP} pts, pas max ${CALIBRATION_MAX_ADJUSTMENT_STEP} pt/cycle`
+    );
+
     ensureStudioPredictionColumns()
       .catch((error) => {
-        logError(
+        console.error(
           "ERREUR COLONNES STUDIO :",
           error
         );
@@ -24670,7 +22607,7 @@ app.listen(
     aiEventEngine
       .ensureTables()
       .catch((error) => {
-        logError(
+        console.error(
           "ERREUR TABLE AI_EVENTS :",
           error
         );
@@ -24678,7 +22615,7 @@ app.listen(
 
     ensureLeagueManagerTables()
       .catch((error) => {
-        logError(
+        console.error(
           "ERREUR TABLE LEAGUE MANAGER :",
           error
         );
@@ -24686,17 +22623,8 @@ app.listen(
 
     ensureLearningEngineTables()
       .catch((error) => {
-        logError(
+        console.error(
           "ERREUR TABLES LEARNING ENGINE :",
-          error
-        );
-      });
-
-    engineLearningCore
-      .ensureTables()
-      .catch((error) => {
-        logError(
-          "ERREUR TABLES ENGINE LEARNING CORE :",
           error
         );
       });
@@ -24704,7 +22632,7 @@ app.listen(
 
     ensureCalibrationDecisionTables()
       .catch((error) => {
-        logError(
+        console.error(
           "ERREUR TABLES CALIBRATION CENTER :",
           error
         );
@@ -24712,17 +22640,8 @@ app.listen(
 
     ensureDailyTicketTables()
       .catch((error) => {
-        logError(
+        console.error(
           "ERREUR TABLE DAILY TICKETS :",
-          error
-        );
-      });
-
-    oddsSyncService
-      .ensureTables()
-      .catch((error) => {
-        logError(
-          "ERREUR TABLES ODDS SYNC :",
           error
         );
       });
@@ -24732,8 +22651,6 @@ app.listen(
      * Seules les tâches consommatrices d'API
      * dépendent de l'interrupteur.
      */
-    oddsSyncService.startScheduler();
-    engineLearningCore.startScheduler();
     startAutomaticCalibrationScheduler();
     startDailyTicketScheduler();
     startAutomaticSchedulers();
