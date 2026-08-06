@@ -61,9 +61,45 @@ const {
   createMarketExplainability,
 } = require("./core/explainability/decisionExplainability");
 const app = express();
+const ALLOWED_ORIGINS = new Set([
+  "https://footballaipro.fr",
+  "https://www.footballaipro.fr",
+  "https://footballaipro.base44.app",
+
+  // Développement local uniquement
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+]);
+
 app.use(
   cors({
-    origin: true,
+    origin(origin, callback) {
+      /*
+       * Les requêtes serveur-à-serveur, les tâches Railway
+       * et certains outils techniques n'envoient pas d'Origin.
+       */
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (ALLOWED_ORIGINS.has(origin)) {
+        return callback(null, true);
+      }
+
+      console.warn(
+        "CORS : origine refusée",
+        origin
+      );
+
+      const error = new Error(
+        "Origine non autorisée."
+      );
+
+      error.status = 403;
+
+      return callback(error);
+    },
+
     methods: [
       "GET",
       "POST",
@@ -72,11 +108,16 @@ app.use(
       "DELETE",
       "OPTIONS",
     ],
+
     allowedHeaders: [
       "Content-Type",
       "Authorization",
       "X-Admin-Key",
     ],
+
+    credentials: false,
+
+    maxAge: 86400,
   })
 );
 // Les snapshots Brain Studio contiennent tous les marchés et peuvent
