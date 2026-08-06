@@ -949,39 +949,56 @@ function createOddsSyncService({
           WHERE mo.fixture_id = p.fixture_id
             AND mo.is_current = TRUE
             AND mo.odd > 1
-            AND mo.odd <= ${AUTO_ODDS_ABSOLUTE_MAX}
-            AND (
-              mo.bookmaker_id IN (4, 8, 16)
-              OR ${allowedSql}
-            )
-            AND ${oddsMarketSql} = ${predictionMarketSql}
+AND mo.odd <= ${AUTO_ODDS_ABSOLUTE_MAX}
 
-            /*
-             * Contrôle de cohérence par rapport à la probabilité du marché
-             * principal. Exemple : une cote 4.00 sur un marché évalué à 74 %
-             * est rejetée comme anomalie ou mauvais appariement.
-             */
-            AND (
-              p.studio_probability IS NULL
-              OR p.studio_probability <= 0
-              OR (
-                mo.odd >=
-                  (100.0 / p.studio_probability) *
-                  ${AUTO_ODDS_MIN_FAIR_MULTIPLIER}
-                AND mo.odd <=
-                  (100.0 / p.studio_probability) *
-                  ${AUTO_ODDS_MAX_FAIR_MULTIPLIER}
-              )
-            )
+AND COALESCE(
+  LOWER(mo.raw_payload->>'suspended'),
+  'false'
+) NOT IN ('true', '1', 'yes')
 
-          ORDER BY
-            mo.odd DESC,
-            mo.captured_at DESC,
-            ${bookmakerPrioritySql(
-              "mo.bookmaker_name",
-              "mo.bookmaker_id"
-            )} ASC
-          LIMIT 1
+AND (
+  mo.bookmaker_id IN (4, 8, 16)
+  OR ${allowedSql}
+)
+
+AND ${oddsMarketSql} = ${predictionMarketSql}
+
+AND (
+  p.studio_probability IS NULL
+  OR p.studio_probability <= 0
+  OR (
+    mo.odd >=
+      (100.0 / p.studio_probability) *
+      ${AUTO_ODDS_MIN_FAIR_MULTIPLIER}
+
+    AND mo.odd <=
+      (100.0 / p.studio_probability) *
+      ${AUTO_ODDS_MAX_FAIR_MULTIPLIER}
+  )
+)
+
+ORDER BY
+  CASE
+    WHEN LOWER(
+      COALESCE(
+        mo.raw_payload->>'main',
+        'false'
+      )
+    ) IN ('true', '1', 'yes')
+    THEN 0
+    ELSE 1
+  END ASC,
+
+  mo.captured_at DESC,
+
+  ${bookmakerPrioritySql(
+    "mo.bookmaker_name",
+    "mo.bookmaker_id"
+  )} ASC,
+
+  mo.odd DESC
+
+LIMIT 1
         ) best_odd ON TRUE
 
         WHERE NULLIF(
