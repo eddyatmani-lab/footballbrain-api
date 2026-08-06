@@ -20348,7 +20348,10 @@ async function ensureBilanV3Columns() {
   `);
 }
 
-function requireOptionalAdminKey(req, res) {
+function requireOptionalAdminKey(
+  req,
+  res
+) {
   const configuredKey = String(
     process.env.ADMIN_API_KEY || ""
   ).trim();
@@ -20361,9 +20364,10 @@ function requireOptionalAdminKey(req, res) {
     req.headers["x-admin-key"] || ""
   ).trim();
 
-  const authorizationHeader = String(
-    req.headers.authorization || ""
-  ).trim();
+  const authorizationHeader =
+    String(
+      req.headers.authorization || ""
+    ).trim();
 
   const bearerKey =
     authorizationHeader
@@ -20374,8 +20378,14 @@ function requireOptionalAdminKey(req, res) {
           .trim()
       : "";
 
+  const queryKey = String(
+    req.query?.__admin_key || ""
+  ).trim();
+
   const receivedKey =
-    headerKey || bearerKey;
+    headerKey ||
+    bearerKey ||
+    queryKey;
 
   if (receivedKey === configuredKey) {
     return true;
@@ -20386,10 +20396,12 @@ function requireOptionalAdminKey(req, res) {
     {
       configuredLength:
         configuredKey.length,
-      xAdminKeyLength:
+      headerLength:
         headerKey.length,
-      bearerKeyLength:
+      bearerLength:
         bearerKey.length,
+      queryLength:
+        queryKey.length,
       receivedPresent:
         Boolean(receivedKey),
     }
