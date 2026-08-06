@@ -63,6 +63,115 @@ const {
   createMarketExplainability,
 } = require("./core/explainability/decisionExplainability");
 const app = express();
+
+const IS_PRODUCTION =
+  process.env.NODE_ENV === "production";
+
+const SENSITIVE_LOG_KEY_PATTERN =
+  /authorization|cookie|token|secret|password|api[-_]?key|x-admin-key|x-apisports-key/i;
+
+function sanitizeLogValue(
+  value,
+  depth = 0,
+  seen = new WeakSet()
+) {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      code: value.code || null,
+      status:
+        value.status ||
+        value.response?.status ||
+        null,
+      stack:
+        IS_PRODUCTION
+          ? undefined
+          : value.stack,
+    };
+  }
+
+  if (depth >= 4) {
+    return "[profondeur limitée]";
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 100)
+      .map((item) =>
+        sanitizeLogValue(
+          item,
+          depth + 1,
+          seen
+        )
+      );
+  }
+
+  if (typeof value === "object") {
+    if (seen.has(value)) {
+      return "[référence circulaire]";
+    }
+
+    seen.add(value);
+
+    const sanitized = {};
+
+    for (const [
+      key,
+      nestedValue,
+    ] of Object.entries(value)) {
+      sanitized[key] =
+        SENSITIVE_LOG_KEY_PATTERN.test(key)
+          ? "[REDACTED]"
+          : sanitizeLogValue(
+              nestedValue,
+              depth + 1,
+              seen
+            );
+    }
+
+    return sanitized;
+  }
+
+  return String(value);
+}
+
+function debugLog(...values) {
+  if (!IS_PRODUCTION) {
+    console.log(
+      ...values.map((value) =>
+        sanitizeLogValue(value)
+      )
+    );
+  }
+}
+
+function logWarning(...values) {
+  console.warn(
+    ...values.map((value) =>
+      sanitizeLogValue(value)
+    )
+  );
+}
+
+function logError(...values) {
+  console.error(
+    ...values.map((value) =>
+      sanitizeLogValue(value)
+    )
+  );
+}
+
     app.disable("x-powered-by");
 
 app.use(
@@ -72,7 +181,36 @@ app.use(
     },
   })
 );
-    const publicApiLimiter = rateLimit({
+    
+
+/*
+ * En production, aucune réponse HTTP 500 ne doit exposer
+ * un message SQL, une stack ou les détails d'un fournisseur externe.
+ * Les détails restent disponibles dans les logs Railway nettoyés.
+ */
+app.use((req, res, next) => {
+  const originalJson =
+    res.json.bind(res);
+
+  res.json = (payload) => {
+    if (
+      IS_PRODUCTION &&
+      res.statusCode >= 500
+    ) {
+      return originalJson({
+        ok: false,
+        error:
+          "Erreur interne du serveur.",
+      });
+    }
+
+    return originalJson(payload);
+  };
+
+  next();
+});
+
+const publicApiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
   standardHeaders: true,
@@ -171,7 +309,7 @@ app.use(
         return callback(null, true);
       }
 
-      console.warn(
+      logWarning(
         "CORS : origine refusée",
         origin
       );
@@ -342,7 +480,7 @@ async function executeQueuedApiFootballRequest(endpoint, params = {}) {
           ? getRetryAfterMilliseconds(error, attempt)
           : Math.min(30000, 2000 * (2 ** attempt));
 
-      console.warn("API-FOOTBALL : nouvelle tentative", {
+      logWarning("API-FOOTBALL : nouvelle tentative", {
         endpoint,
         status,
         attempt: attempt + 1,
@@ -641,7 +779,7 @@ app.post("/internal/fixture-competitions", async (req, res) => {
       competitions,
     });
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR /internal/fixture-competitions :",
       error
     );
@@ -674,7 +812,7 @@ app.get(
    
 
 } catch (error) {
-  console.error("ERREUR ANALYSE COMPLÈTE :", error);
+  logError("ERREUR ANALYSE COMPLÈTE :", error);
 
   return res
     .status(error.response?.status || 500)
@@ -1233,7 +1371,7 @@ app.get(
         })),
       });
     } catch (error) {
-      console.error("ERREUR LEAGUE MANAGER LISTE :", error);
+      logError("ERREUR LEAGUE MANAGER LISTE :", error);
 
       return res.status(500).json({
         ok: false,
@@ -1265,7 +1403,7 @@ app.post(
         ...result,
       });
     } catch (error) {
-      console.error("ERREUR SYNCHRONISATION LIGUES :", error);
+      logError("ERREUR SYNCHRONISATION LIGUES :", error);
 
       return res
         .status(error?.status || error?.response?.status || 500)
@@ -1358,7 +1496,7 @@ app.patch(
         },
       });
     } catch (error) {
-      console.error("ERREUR MISE À JOUR LIGUE :", error);
+      logError("ERREUR MISE À JOUR LIGUE :", error);
 
       return res.status(500).json({
         ok: false,
@@ -1423,7 +1561,7 @@ app.post(
         updated: result.rowCount,
       });
     } catch (error) {
-      console.error("ERREUR MISE À JOUR GROUPÉE LIGUES :", error);
+      logError("ERREUR MISE À JOUR GROUPÉE LIGUES :", error);
 
       return res.status(500).json({
         ok: false,
@@ -1707,7 +1845,7 @@ const headToHead = h2hMatches.map((item) => ({
 
 
 } catch (error) {
-  console.error("DEBUG CATCH ANALYSE :", error);
+  logError("DEBUG CATCH ANALYSE :", error);
 
   return res.status(error.response?.status || 500).json({
     ok: false,
@@ -2300,7 +2438,7 @@ return res.json({
 });
 
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR /internal/analyze :",
       error
     );
@@ -2979,7 +3117,7 @@ function readPredictionHistory() {
 
     return content ? JSON.parse(content) : [];
   } catch (error) {
-    console.error("Erreur lecture historique :", error.message);
+    logError("Erreur lecture historique :", error.message);
     return [];
   }
 }
@@ -3592,7 +3730,7 @@ app.get("/internal/db-test", async (req, res) => {
       time: result.rows[0].current_time,
     });
   } catch (error) {
-    console.error("ERREUR DB TEST :", error);
+    logError("ERREUR DB TEST :", error);
 
     return res.status(500).json({
       ok: false,
@@ -4859,7 +4997,7 @@ async function synchronizeFinishedPredictionsByDate() {
           "Erreur API-Football",
       });
 
-      console.error(
+      logError(
         `RESULT SYNC : erreur pour la date ${date}`,
         error?.message || error
       );
@@ -5086,7 +5224,7 @@ async function synchronizeFinishedPredictionsByDate() {
           fixture
         );
       } catch (eloError) {
-        console.warn(
+        logWarning(
           `RESULT SYNC : ELO non mis à jour pour ${fixtureId}`,
           eloError?.message ||
             eloError
@@ -5111,7 +5249,7 @@ async function synchronizeFinishedPredictionsByDate() {
           "Erreur de règlement",
       });
 
-      console.error(
+      logError(
         `RESULT SYNC : erreur fixture ${fixtureId}`,
         error?.message || error
       );
@@ -5148,7 +5286,7 @@ app.get(
         summary,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR RESULT SYNC :",
         error
       );
@@ -5748,7 +5886,7 @@ app.get(
    
 
 } catch (error) {
-  console.error("ERREUR ANALYSE COMPLÈTE :", error);
+  logError("ERREUR ANALYSE COMPLÈTE :", error);
 
   return res
     .status(error.response?.status || 500)
@@ -6190,7 +6328,7 @@ const headToHead = h2hMatches.map((item) => ({
 
 
 } catch (error) {
-  console.error("DEBUG CATCH ANALYSE :", error);
+  logError("DEBUG CATCH ANALYSE :", error);
 
   return res.status(error.response?.status || 500).json({
     ok: false,
@@ -6404,7 +6542,7 @@ function readPredictionHistory() {
 
     return content ? JSON.parse(content) : [];
   } catch (error) {
-    console.error("Erreur lecture historique :", error.message);
+    logError("Erreur lecture historique :", error.message);
     return [];
   }
 }
@@ -7033,7 +7171,7 @@ app.get("/internal/db-test", async (req, res) => {
       time: result.rows[0].current_time,
     });
   } catch (error) {
-    console.error("ERREUR DB TEST :", error);
+    logError("ERREUR DB TEST :", error);
 
     return res.status(500).json({
       ok: false,
@@ -8424,7 +8562,7 @@ const fixture =
         error.message,
     });
 
-    console.warn(
+    logWarning(
       [
         "⚠️ Quota API-Football atteint.",
         "Arrêt immédiat de la synchronisation.",
@@ -8453,7 +8591,7 @@ const fixture =
       error.message,
   });
 
-  console.error(
+  logError(
     `Erreur de règlement du match ${prediction.fixture_id} :`,
     error.message
   );
@@ -9303,7 +9441,7 @@ app.get("/internal/db-columns", async (req, res) => {
       columns: result.rows,
     });
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR DB COLUMNS :",
       error
     );
@@ -9358,7 +9496,7 @@ app.get("/internal/db-migrate-xg", async (req, res) => {
         "Migration xG/explicabilité appliquée",
     });
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR MIGRATION XG :",
       error
     );
@@ -9926,7 +10064,7 @@ monteCarloModel:
           prediction.updated_at,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR PUBLIC AI LAB :",
         error
       );
@@ -9956,7 +10094,7 @@ app.get(
           "Colonne monte_carlo_model créée",
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR MIGRATION MONTE CARLO :",
         error
       );
@@ -10381,7 +10519,7 @@ const fixtures = rawFixtures
         matches,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR /public/daily-picks :",
         error
       );
@@ -10765,7 +10903,7 @@ const response = await fetch(
         results,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR REBUILD DAILY ANALYSIS :",
         error
       );
@@ -10785,7 +10923,7 @@ async function runAutomaticDailyAnalysis({
   date = getParisDateString(),
 } = {}) {
   if (dailyAnalysisJobRunning) {
-    console.log(
+    debugLog(
       "ANALYSE QUOTIDIENNE : tâche déjà en cours"
     );
 
@@ -10805,7 +10943,7 @@ async function runAutomaticDailyAnalysis({
       `?date=${encodeURIComponent(date)}` +
       `&limit=8`;
 
-    console.log(
+    debugLog(
       `ANALYSE QUOTIDIENNE : démarrage ${date}`
     );
 
@@ -10824,14 +10962,14 @@ async function runAutomaticDailyAnalysis({
       );
     }
 
-    console.log(
+    debugLog(
       "ANALYSE QUOTIDIENNE : terminée",
       data.summary
     );
 
     return data;
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR ANALYSE QUOTIDIENNE :",
       error.message
     );
@@ -10997,7 +11135,7 @@ app.get(
         incomplete,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR DAILY ANALYSIS STATUS :",
         error
       );
@@ -11027,7 +11165,7 @@ app.get(
           "Colonne analysis_context créée",
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR MIGRATION CONTEXT :",
         error
       );
@@ -11192,7 +11330,7 @@ function wait(milliseconds) {
 
 async function runLineupWatcher() {
   if (lineupWatcherRunning) {
-    console.log(
+    debugLog(
       "LINEUP WATCHER : contrôle déjà en cours"
     );
 
@@ -11205,7 +11343,7 @@ async function runLineupWatcher() {
     const date =
       getParisDateString();
 
-    console.log(
+    debugLog(
       `LINEUP WATCHER : contrôle du ${date}`
     );
 
@@ -11368,7 +11506,7 @@ async function runLineupWatcher() {
           continue;
         }
 
-        console.log(
+        debugLog(
           "LINEUP WATCHER : compositions détectées",
           {
             fixtureId,
@@ -11441,7 +11579,7 @@ async function runLineupWatcher() {
          * on attend avant le match suivant.
          */
         if (status === 429) {
-          console.warn(
+          logWarning(
             "LINEUP WATCHER : limite API, pause de 60 secondes"
           );
 
@@ -11450,7 +11588,7 @@ async function runLineupWatcher() {
       }
     }
 
-    console.log(
+    debugLog(
       "LINEUP WATCHER : terminé",
       {
         checked:
@@ -11479,7 +11617,7 @@ async function runLineupWatcher() {
       }
     );
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR LINEUP WATCHER :",
       error.message
     );
@@ -11492,7 +11630,7 @@ let lineupWatcherSchedulerStarted = false;
 
 function startLineupWatcherScheduler() {
   if (lineupWatcherSchedulerStarted) {
-    console.log(
+    debugLog(
       "⏭️ Lineup Watcher Scheduler déjà démarré."
     );
     return;
@@ -11506,7 +11644,7 @@ function startLineupWatcherScheduler() {
    */
   setTimeout(() => {
     runLineupWatcher().catch((error) => {
-      console.error(
+      logError(
         "ERREUR PREMIER LINEUP WATCHER :",
         error
       );
@@ -11518,14 +11656,14 @@ function startLineupWatcherScheduler() {
    */
   setInterval(() => {
     runLineupWatcher().catch((error) => {
-      console.error(
+      logError(
         "ERREUR INTERVAL LINEUP WATCHER :",
         error
       );
     });
   }, 10 * 60 * 1000);
 
-  console.log(
+  debugLog(
     "✅ Lineup Watcher Scheduler : toutes les 10 minutes"
   );
 }
@@ -11630,7 +11768,7 @@ function getSelectedProbability(
 
 async function runHourlyOddsWatcher() {
   if (hourlyOddsWatcherRunning) {
-    console.log(
+    debugLog(
       "ODDS WATCHER : contrôle déjà en cours"
     );
     return;
@@ -11650,7 +11788,7 @@ async function runHourlyOddsWatcher() {
     const date =
       getParisDateString();
 
-    console.log(
+    debugLog(
       `ODDS WATCHER : contrôle du ${date}`
     );
 
@@ -11781,7 +11919,7 @@ async function runHourlyOddsWatcher() {
         if (
           movementPercent >= 10
         ) {
-          console.log(
+          debugLog(
             "ODDS WATCHER : mouvement important",
             {
               fixtureId,
@@ -11841,7 +11979,7 @@ async function runHourlyOddsWatcher() {
       } catch (error) {
         summary.failed += 1;
 
-        console.error(
+        logError(
           "ODDS WATCHER : erreur",
           {
             fixtureId,
@@ -11855,12 +11993,12 @@ async function runHourlyOddsWatcher() {
       }
     }
 
-    console.log(
+    debugLog(
       "ODDS WATCHER : terminé",
       summary
     );
   } catch (error) {
-    console.error(
+    logError(
       "ODDS WATCHER : erreur générale",
       error.message
     );
@@ -11954,7 +12092,7 @@ async function checkDailyFullAnalysisSchedule() {
 
   lastDailyFullAnalysisAttemptAt = now;
 
-  console.log(
+  debugLog(
     `ANALYSE COMPLÈTE : contrôle/rattrapage ${paris.date}`
   );
 
@@ -11998,16 +12136,16 @@ async function checkDailyFullAnalysisSchedule() {
       lastDailyFullAnalysisDate =
         paris.date;
 
-      console.log(
+      debugLog(
         `ANALYSE COMPLÈTE : journée ${paris.date} couverte (${covered}/${fixturesFound})`
       );
     } else {
-      console.warn(
+      logWarning(
         `ANALYSE COMPLÈTE : journée incomplète (${covered}/${fixturesFound}, ${failed} échec(s)). Nouveau lot dans environ 3 minutes.`
       );
     }
   } catch (error) {
-    console.error(
+    logError(
       "ANALYSE COMPLÈTE : erreur",
       error.message
     );
@@ -12155,7 +12293,7 @@ app.get(
         reports,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR /public/bilan/reports :",
         error
       );
@@ -12312,7 +12450,7 @@ OFFSET $2
     result.rows,
 });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR /public/learning/finished :",
         error
       );
@@ -12333,7 +12471,7 @@ let automaticResultSyncRunning =
 
 async function runAutomaticResultSync() {
   if (automaticResultSyncRunning) {
-    console.log(
+    debugLog(
       "RESULT SYNC : cycle déjà actif"
     );
 
@@ -12355,7 +12493,7 @@ async function runAutomaticResultSync() {
     summary.manualOddsRefresh =
       manualOddsRefresh;
 
-    console.log(
+    debugLog(
       "RESULT SYNC TERMINÉ :",
       {
         apiCalls:
@@ -12380,7 +12518,7 @@ async function runAutomaticResultSync() {
 
     return summary;
   } catch (error) {
-    console.error(
+    logError(
       "RESULT SYNC ERREUR :",
       error
     );
@@ -12474,7 +12612,7 @@ async function runAutomaticResultSync() {
     WHERE analysis_status IS NULL;
   `);
 
-  console.log(
+  debugLog(
     "✅ Colonnes Brain Studio vérifiées"
   );
 }
@@ -13114,7 +13252,7 @@ async function saveStudioSnapshot({
         },
       });
   } catch (learningError) {
-    console.warn(
+    logWarning(
       "ENGINE LEARNING LOG IGNORÉ :",
       learningError?.message ||
         learningError
@@ -13393,7 +13531,7 @@ app.post(
           saved,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR STUDIO SNAPSHOT :",
         error
       );
@@ -13647,7 +13785,7 @@ app.get(
         matches,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR /public/studio/upcoming :",
         error
       );
@@ -14133,7 +14271,7 @@ if (
           null,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR LECTURE STUDIO SNAPSHOT :",
         error
       );
@@ -14795,7 +14933,7 @@ app.get(
         })),
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR LISTE RECONSTRUCTION STUDIO :",
         error
       );
@@ -14944,7 +15082,7 @@ app.post(
         prediction: saved,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR FORCE STUDIO SNAPSHOT :",
         error
       );
@@ -15436,7 +15574,7 @@ manualSnapshotRebuildRunning =
         ...result,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR REBUILD BRAIN STUDIO :",
         error
       );
@@ -15697,7 +15835,7 @@ async function runAutomaticStudioScheduler({
     STUDIO_SCHEDULER_MAX_MATCHES,
 } = {}) {
   if (studioSchedulerRunning) {
-    console.log(
+    debugLog(
       "BRAIN STUDIO SCHEDULER : cycle déjà actif"
     );
 
@@ -15847,7 +15985,7 @@ async function runAutomaticStudioScheduler({
     summary.fixturesFound =
       fixtures.length;
 
-    console.log(
+    debugLog(
       "BRAIN STUDIO SCHEDULER : démarrage",
       {
         source,
@@ -15937,7 +16075,7 @@ async function runAutomaticStudioScheduler({
       summary.attempted += 1;
 
       try {
-        console.log(
+        debugLog(
           `BRAIN STUDIO SCHEDULER : analyse ${index + 1}/${fixtures.length}`,
           {
             fixtureId,
@@ -16035,7 +16173,7 @@ async function runAutomaticStudioScheduler({
             "Erreur inconnue",
         });
 
-        console.error(
+        logError(
           `BRAIN STUDIO SCHEDULER : erreur fixture ${fixtureId}`,
           error
         );
@@ -16064,7 +16202,7 @@ async function runAutomaticStudioScheduler({
     studioSchedulerLastSummary =
       summary;
 
-    console.log(
+    debugLog(
       "BRAIN STUDIO SCHEDULER : terminé",
       {
         fixturesFound:
@@ -16100,7 +16238,7 @@ async function runAutomaticStudioScheduler({
     studioSchedulerLastSummary =
       summary;
 
-    console.error(
+    logError(
       "BRAIN STUDIO SCHEDULER : erreur générale",
       error
     );
@@ -16522,7 +16660,7 @@ async function ensureLearningEngineTables() {
       WHERE result_status = 'COMPLETED' AND won IS NOT NULL;
   `);
 
-  console.log("✅ Tables Calibration Engine V1 vérifiées");
+  debugLog("✅ Tables Calibration Engine V1 vérifiées");
 }
 
 function learningProbabilitySql() {
@@ -16695,7 +16833,7 @@ async function getAdaptiveLearningAdjustment({
       },
     };
   } catch (error) {
-    console.warn(
+    logWarning(
       "CALIBRATION ENGINE V1 : ajustement ignoré",
       error?.message || error
     );
@@ -17039,7 +17177,7 @@ async function rebuildLearningEngine({
       ).catch(() => null);
     }
 
-    console.error("ERREUR CALIBRATION ENGINE V1 :", error);
+    logError("ERREUR CALIBRATION ENGINE V1 :", error);
     return {
       ok: false,
       source,
@@ -18433,7 +18571,7 @@ async function evaluateActiveCalibrations({
           error: error?.message || "Erreur inconnue",
         });
 
-        console.error(
+        logError(
           "ERREUR AUTO-ÉVALUATION CALIBRATION :",
           recommendation.recommendation_key,
           error
@@ -18446,7 +18584,7 @@ async function evaluateActiveCalibrations({
     summary.finishedAt = new Date().toISOString();
     return summary;
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR MOTEUR AUTO-ÉVALUATION CALIBRATION :",
       error
     );
@@ -18503,7 +18641,7 @@ async function runAutomaticCalibrationCycle({
       evaluation,
     };
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR CYCLE AUTOMATIQUE CALIBRATION :",
       error
     );
@@ -18534,7 +18672,7 @@ app.post(
 
       return res.status(result.ok ? 200 : 500).json(result);
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR GÉNÉRATION CALIBRATIONS :",
         error
       );
@@ -18675,7 +18813,7 @@ app.get(
         recommendations: result.rows,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR LISTE CALIBRATIONS :",
         error
       );
@@ -18867,7 +19005,7 @@ app.get("/public/calibration/summary", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(error);
+    logError(error);
 
     res.status(500).json({
       ok: false,
@@ -19277,7 +19415,7 @@ app.get("/public/bilan/stats", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("ERREUR /public/bilan/stats :", error);
+    logError("ERREUR /public/bilan/stats :", error);
     return res.status(500).json({
       ok: false,
       error: error.message || "Impossible de calculer les statistiques globales du Bilan.",
@@ -19514,7 +19652,7 @@ manual_odd_updated_at,
       }),
     });
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR /internal/admin/brainstudio/rebuild-needed :",
       error
     );
@@ -19694,7 +19832,7 @@ adminStudioRebuildRunning = true;
       results,
     });
   } catch (error) {
-    console.error(
+    logError(
       "ERREUR /internal/admin/brainstudio/rebuild-missing :",
       error
     );
@@ -20024,7 +20162,7 @@ app.get("/internal/admin/bilan/markets", async (req, res) => {
       markets: rows,
     });
   } catch (error) {
-    console.error("ERREUR /internal/admin/bilan/markets :", error);
+    logError("ERREUR /internal/admin/bilan/markets :", error);
     return res.status(500).json({
       ok: false,
       error: error.message,
@@ -20261,7 +20399,7 @@ app.get("/internal/admin/manual-odds", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("ERREUR LISTE COTES MANUELLES :", error);
+    logError("ERREUR LISTE COTES MANUELLES :", error);
 
     return res.status(500).json({
       ok: false,
@@ -20452,7 +20590,7 @@ app.get(
             : null,
       });
     } catch (error) {
-      console.error(
+      logError(
         "ERREUR PERFORMANCE FINANCIÈRE RÉELLE :",
         error
       );
@@ -20663,7 +20801,7 @@ async function saveOrUpdateManualOdd(req, res) {
       prediction: result.rows[0],
     });
   } catch (error) {
-    console.error("ERREUR ENREGISTREMENT COTE MANUELLE :", error);
+    logError("ERREUR ENREGISTREMENT COTE MANUELLE :", error);
 
     return res.status(500).json({
       ok: false,
@@ -20746,7 +20884,7 @@ app.delete(
         fixtureId,
       });
     } catch (error) {
-      console.error("ERREUR SUPPRESSION COTE MANUELLE :", error);
+      logError("ERREUR SUPPRESSION COTE MANUELLE :", error);
 
       return res.status(500).json({
         ok: false,
@@ -20767,7 +20905,7 @@ app.post(
       const result = await refreshManualOddsProfits();
       return res.json(result);
     } catch (error) {
-      console.error("ERREUR RECALCUL PROFITS MANUELS :", error);
+      logError("ERREUR RECALCUL PROFITS MANUELS :", error);
 
       return res.status(500).json({
         ok: false,
@@ -21774,7 +21912,7 @@ app.get("/public/daily-tickets", async (req, res) => {
       editions: result.rows.map(serializeDailyTicketSnapshot),
     });
   } catch (error) {
-    console.error("ERREUR LECTURE DAILY TICKETS :", error);
+    logError("ERREUR LECTURE DAILY TICKETS :", error);
     return res.status(500).json({
       ok: false,
       editions: [],
@@ -21842,7 +21980,7 @@ app.get("/public/daily-tickets/history", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("ERREUR HISTORIQUE DAILY TICKETS :", error);
+    logError("ERREUR HISTORIQUE DAILY TICKETS :", error);
     return res.status(500).json({
       ok: false,
       history: [],
@@ -21872,7 +22010,7 @@ app.post("/internal/daily-tickets/generate", async (req, res) => {
 
     return res.json({ ok: true, ...result });
   } catch (error) {
-    console.error("ERREUR GÉNÉRATION DAILY TICKET :", error);
+    logError("ERREUR GÉNÉRATION DAILY TICKET :", error);
     return res.status(500).json({
       ok: false,
       error: error?.message || "Impossible de générer le ticket.",
@@ -21889,7 +22027,7 @@ app.post("/internal/daily-tickets/settle", async (req, res) => {
     });
     return res.json(result);
   } catch (error) {
-    console.error("ERREUR RÈGLEMENT DAILY TICKETS :", error);
+    logError("ERREUR RÈGLEMENT DAILY TICKETS :", error);
     return res.status(500).json({
       ok: false,
       error: error?.message || "Impossible de régler les tickets.",
@@ -21922,13 +22060,13 @@ async function checkDailyTicketSchedule() {
       });
 
       if (result.created) {
-        console.log(`✅ Daily Ticket ${slot} créé pour ${paris.date}`);
+        debugLog(`✅ Daily Ticket ${slot} créé pour ${paris.date}`);
       }
     }
 
     await settleDailyTicketSnapshots();
   } catch (error) {
-    console.error("ERREUR SCHEDULER DAILY TICKET :", error);
+    logError("ERREUR SCHEDULER DAILY TICKET :", error);
   } finally {
     dailyTicketSchedulerRunning = false;
   }
@@ -21936,21 +22074,21 @@ async function checkDailyTicketSchedule() {
 
 function startDailyTicketScheduler() {
   if (!AUTOMATIC_SCHEDULERS_ENABLED) {
-    console.log("⏸️ Daily Ticket Scheduler désactivé avec les schedulers.");
+    debugLog("⏸️ Daily Ticket Scheduler désactivé avec les schedulers.");
     return;
   }
 
   checkDailyTicketSchedule().catch((error) => {
-    console.error("ERREUR PREMIÈRE VÉRIFICATION DAILY TICKET :", error);
+    logError("ERREUR PREMIÈRE VÉRIFICATION DAILY TICKET :", error);
   });
 
   setInterval(() => {
     checkDailyTicketSchedule().catch((error) => {
-      console.error("ERREUR INTERVAL DAILY TICKET :", error);
+      logError("ERREUR INTERVAL DAILY TICKET :", error);
     });
   }, DAILY_TICKET_SCHEDULER_INTERVAL_MS);
 
-  console.log("✅ Daily Ticket Scheduler : 12h, 18h et 21h (Europe/Paris)");
+  debugLog("✅ Daily Ticket Scheduler : 12h, 18h et 21h (Europe/Paris)");
 }
 
 
@@ -21962,7 +22100,7 @@ const AUTOMATIC_CALIBRATION_FIRST_RUN_DELAY_MS =
 
 function startAutomaticCalibrationScheduler() {
   if (!AUTOMATIC_SCHEDULERS_ENABLED) {
-    console.log(
+    debugLog(
       "⏸️ Calibration automatique désactivée avec les schedulers."
     );
     return;
@@ -21972,7 +22110,7 @@ function startAutomaticCalibrationScheduler() {
     runAutomaticCalibrationCycle({
       source: "automatic-first-run",
     }).catch((error) => {
-      console.error(
+      logError(
         "ERREUR PREMIER CYCLE AUTOMATIQUE CALIBRATION :",
         error
       );
@@ -21983,25 +22121,25 @@ function startAutomaticCalibrationScheduler() {
     runAutomaticCalibrationCycle({
       source: "automatic-scheduler",
     }).catch((error) => {
-      console.error(
+      logError(
         "ERREUR SCHEDULER AUTOMATIQUE CALIBRATION :",
         error
       );
     });
   }, AUTOMATIC_CALIBRATION_INTERVAL_MS);
 
-  console.log(
+  debugLog(
     "✅ Calibration Center automatique : toutes les 6 heures"
   );
 }
 
 function startAutomaticSchedulers() {
   if (!AUTOMATIC_SCHEDULERS_ENABLED) {
-    console.log(
+    debugLog(
       "⏸️ Tous les schedulers automatiques sont désactivés."
     );
 
-    console.log(
+    debugLog(
       "ℹ️ Pour les réactiver : AUTOMATIC_SCHEDULERS_ENABLED=true"
     );
 
@@ -22009,10 +22147,10 @@ function startAutomaticSchedulers() {
   }
 
   if (!API_FOOTBALL_ENABLED) {
-    console.log(
+    debugLog(
       "⏸️ Schedulers non démarrés : API_FOOTBALL_ENABLED=false"
     );
-    console.log(
+    debugLog(
       "ℹ️ Le serveur, Learning, Calibration et les routes SQL restent accessibles."
     );
     return;
@@ -22043,7 +22181,7 @@ function startAutomaticSchedulers() {
     runAutomaticStudioScheduler({
       source: "startup",
     }).catch((error) => {
-      console.error(
+      logError(
         "ERREUR DÉMARRAGE BRAIN STUDIO SCHEDULER :",
         error
       );
@@ -22057,7 +22195,7 @@ function startAutomaticSchedulers() {
     runAutomaticStudioScheduler({
       source: "interval",
     }).catch((error) => {
-      console.error(
+      logError(
         "ERREUR INTERVAL BRAIN STUDIO SCHEDULER :",
         error
       );
@@ -22070,7 +22208,7 @@ function startAutomaticSchedulers() {
    */
   setInterval(() => {
     checkDailyFullAnalysisSchedule().catch((error) => {
-      console.error(
+      logError(
         "ERREUR PLANIFICATEUR ANALYSE QUOTIDIENNE :",
         error
       );
@@ -22081,21 +22219,21 @@ function startAutomaticSchedulers() {
    * Première vérification au démarrage.
    */
   checkDailyFullAnalysisSchedule().catch((error) => {
-    console.error(
+    logError(
       "ERREUR PREMIÈRE VÉRIFICATION QUOTIDIENNE :",
       error
     );
   });
 
-  console.log(
+  debugLog(
     "✅ Synchronisation des résultats : toutes les 15 minutes"
   );
 
-  console.log(
+  debugLog(
     "✅ Brain Studio Scheduler : toutes les 15 minutes"
   );
 
-  console.log(
+  debugLog(
     "✅ Planificateur quotidien : actif"
   );
 }
@@ -22548,7 +22686,7 @@ app.get("/public/statistics/dashboard", async (req, res) => {
       ticketStats,
     });
   } catch (error) {
-    console.error("ERREUR /public/statistics/dashboard :", error);
+    logError("ERREUR /public/statistics/dashboard :", error);
 
     return res.status(500).json({
       ok: false,
@@ -23274,7 +23412,7 @@ app.get("/public/bilan/ia", async (req, res) => {
       generatedAt: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("ERREUR /public/bilan/ia :", error);
+    logError("ERREUR /public/bilan/ia :", error);
 
     return res.status(500).json({
       ok: false,
@@ -23863,22 +24001,22 @@ app.post("/internal/bet-portfolio/settle", async (req, res) => {
 if (AUTOMATIC_SCHEDULERS_ENABLED) {
   setTimeout(() => {
     freezeDailyPortfolioSelections().catch((error) =>
-      console.error("DAILY PORTFOLIO FREEZE INIT :", error)
+      logError("DAILY PORTFOLIO FREEZE INIT :", error)
     );
     settleDailyPortfolioBets().catch((error) =>
-      console.error("DAILY PORTFOLIO SETTLE INIT :", error)
+      logError("DAILY PORTFOLIO SETTLE INIT :", error)
     );
   }, 90 * 1000);
 
   setInterval(() => {
     freezeDailyPortfolioSelections().catch((error) =>
-      console.error("DAILY PORTFOLIO FREEZE :", error)
+      logError("DAILY PORTFOLIO FREEZE :", error)
     );
   }, 60 * 1000);
 
   setInterval(() => {
     settleDailyPortfolioBets().catch((error) =>
-      console.error("DAILY PORTFOLIO SETTLE :", error)
+      logError("DAILY PORTFOLIO SETTLE :", error)
     );
   }, 5 * 60 * 1000);
 }
@@ -24218,7 +24356,7 @@ app.get("/public/bilan/detaille", async (req, res) => {
       generatedAt: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("ERREUR /public/bilan/detaille :", error);
+    logError("ERREUR /public/bilan/detaille :", error);
 
     return res.status(500).json({
       ok: false,
@@ -24287,7 +24425,7 @@ app.get("/public/bilan/paris", async (req, res) => {
       generatedAt: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("ERREUR /public/bilan/paris :", error);
+    logError("ERREUR /public/bilan/paris :", error);
 
     return res.status(500).json({
       ok: false,
@@ -24298,15 +24436,63 @@ app.get("/public/bilan/paris", async (req, res) => {
   }
 });
 
+
+/*
+ * Gestionnaire de dernier recours pour les erreurs transmises à Express.
+ * Il doit rester placé après toutes les routes et avant app.listen().
+ */
+app.use((error, req, res, next) => {
+  logError(
+    "ERREUR EXPRESS NON GÉRÉE :",
+    {
+      method: req.method,
+      path: req.path,
+      status:
+        error?.status ||
+        error?.statusCode ||
+        500,
+    },
+    error
+  );
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  const status = Number(
+    error?.status ||
+    error?.statusCode ||
+    500
+  );
+
+  return res
+    .status(
+      status >= 400 &&
+      status <= 599
+        ? status
+        : 500
+    )
+    .json({
+      ok: false,
+      error:
+        status >= 500
+          ? "Erreur interne du serveur."
+          : (
+              error?.message ||
+              "Requête invalide."
+            ),
+    });
+});
+
 app.listen(
   PORT,
   "0.0.0.0",
   () => {
-    console.log(
+    debugLog(
       `FootballBrain API running on 0.0.0.0:${PORT}`
     );
 
-    console.log(
+    debugLog(
       `API-Football : ${
         API_FOOTBALL_ENABLED
           ? "✅ autorisée"
@@ -24314,7 +24500,7 @@ app.listen(
       }`
     );
 
-    console.log(
+    debugLog(
       `Schedulers automatiques : ${
         AUTOMATIC_SCHEDULERS_ENABLED
           ? "✅ actifs"
@@ -24324,7 +24510,7 @@ app.listen(
 
     ensureStudioPredictionColumns()
       .catch((error) => {
-        console.error(
+        logError(
           "ERREUR COLONNES STUDIO :",
           error
         );
@@ -24333,7 +24519,7 @@ app.listen(
     aiEventEngine
       .ensureTables()
       .catch((error) => {
-        console.error(
+        logError(
           "ERREUR TABLE AI_EVENTS :",
           error
         );
@@ -24341,7 +24527,7 @@ app.listen(
 
     ensureLeagueManagerTables()
       .catch((error) => {
-        console.error(
+        logError(
           "ERREUR TABLE LEAGUE MANAGER :",
           error
         );
@@ -24349,7 +24535,7 @@ app.listen(
 
     ensureLearningEngineTables()
       .catch((error) => {
-        console.error(
+        logError(
           "ERREUR TABLES LEARNING ENGINE :",
           error
         );
@@ -24358,7 +24544,7 @@ app.listen(
     engineLearningCore
       .ensureTables()
       .catch((error) => {
-        console.error(
+        logError(
           "ERREUR TABLES ENGINE LEARNING CORE :",
           error
         );
@@ -24367,7 +24553,7 @@ app.listen(
 
     ensureCalibrationDecisionTables()
       .catch((error) => {
-        console.error(
+        logError(
           "ERREUR TABLES CALIBRATION CENTER :",
           error
         );
@@ -24375,7 +24561,7 @@ app.listen(
 
     ensureDailyTicketTables()
       .catch((error) => {
-        console.error(
+        logError(
           "ERREUR TABLE DAILY TICKETS :",
           error
         );
@@ -24384,7 +24570,7 @@ app.listen(
     oddsSyncService
       .ensureTables()
       .catch((error) => {
-        console.error(
+        logError(
           "ERREUR TABLES ODDS SYNC :",
           error
         );
