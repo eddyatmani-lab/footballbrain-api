@@ -47,6 +47,8 @@ const {
   createEngineLearningCore,
 } = require("./src/learning");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const {
   FootballMonteCarlo,
 } = require("./FootballMonteCarlo");
@@ -61,6 +63,38 @@ const {
   createMarketExplainability,
 } = require("./core/explainability/decisionExplainability");
 const app = express();
+    app.disable("x-powered-by");
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: {
+      policy: "cross-origin",
+    },
+  })
+);
+    const publicApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    ok: false,
+    error:
+      "Trop de requêtes. Réessayez dans quelques minutes.",
+  },
+});
+
+const adminApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    ok: false,
+    error:
+      "Trop de requêtes administrateur. Réessayez dans quelques minutes.",
+  },
+});
 function requireAdminKey(req, res) {
   const adminKey = req.get("x-admin-key");
 
@@ -175,7 +209,7 @@ app.use(
 // dépasser la limite Express par défaut de 100 Ko.
 app.use(
   express.json({
-    limit: "10mb",
+    limit: "10mb", 
   })
 );
 
@@ -185,6 +219,12 @@ app.use(
     limit: "10mb",
   })
 );
+app.use("/internal/admin", adminApiLimiter);
+app.use("/internal/league-manager", adminApiLimiter);
+app.use("/internal/learning", adminApiLimiter);
+app.use("/internal/odds", adminApiLimiter);
+
+app.use(publicApiLimiter);
 const analysisCache = new Map();
 const ANALYSIS_CACHE_TTL = 60 * 60 * 1000;
 const FINISHED_FIXTURE_STATUSES = new Set([
