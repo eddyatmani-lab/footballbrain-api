@@ -24391,6 +24391,1183 @@ app.post('/internal/bet-qualification/calibration/configs/:configId/rollback', a
   }
 });
 
+function bilanPublicNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function bilanPublicRound(value, decimals = 2) {
+  const factor = 10 ** decimals;
+  return Math.round(bilanPublicNumber(value) * factor) / factor;
+}
+
+function getBilanSnapshotMarkets(snapshotValue) {
+  const snapshot = parseBilanSnapshot(snapshotValue);
+
+  if (Array.isArray(snapshot?.markets)) {
+    return snapshot.markets;
+  }
+
+  if (Array.isArray(snapshot?.studio?.markets)) {
+    return snapshot.studio.markets;
+  }
+
+  const fallbackMarket =
+    snapshot?.primaryMarket ||
+    snapshot?.bestDecision ||
+    null;
+
+  return fallbackMarket ? [fallbackMarket] : [];
+}
+
+function getBilanMarketKey(market = {}) {
+  return normalizeManualOddsMarketKey(
+    market?.key ||
+      market?.marketKey ||
+      market?.market_key ||
+      ""
+  );
+}
+
+function getBilanMarketLabel(market = {}, key = "") {
+  return (
+    market?.label ||
+    market?.marketLabel ||
+    market?.market_label ||
+    ({
+      HOME: "Victoire domicile",
+      DRAW: "Match nul",
+      AWAY: "Victoire extérieur",
+      OVER25: "Plus de 2,5 buts",
+      UNDER25: "Moins de 2,5 buts",
+      BTTS_YES: "Les deux équipes marquent",
+      BTTS_NO: "Les deux équipes ne marquent pas",
+    }[key] || key || "Marché inconnu")
+  );
+}
+
+app.get("/public/bilan/ia", async (req, res) => {
+  try {
+    await ensureStudioPredictionColumns();
+
+    const result = await pool.query(`
+      SELECT
+        fixture_id,
+        home_goals,
+        away_goals,
+        studio_snapshot
+      FROM predictions
+      WHERE result_status = 'COMPLETED'
+        AND studio_snapshot IS NOT NULL
+      ORDER BY fixture_date DESC NULLS LAST
+    `);
+
+    const byMarketMap = new Map();
+    let matches = 0;
+    let marketsAnalyzed = 0;
+    let wins = 0;
+    let losses = 0;
+
+    for (const prediction of result.rows) {
+      const markets = getBilanSnapshotMarkets(
+        prediction.studio_snapshot
+      );
+
+      let evaluatedForMatch = 0;
+
+      for (const market of markets) {
+        const marketKey = getBilanMarketKey(market);
+        if (!marketKey) continue;
+
+        const won = evaluateManualOddsMarketResult({
+          marketKey,
+          homeGoals: prediction.home_goals,
+          awayGoals: prediction.away_goals,
+        });
+
+        if (typeof won !== "boolean") continue;
+
+        evaluatedForMatch += 1;
+        marketsAnalyzed += 1;
+
+        if (won) wins += 1;
+        else losses += 1;
+
+        if (!byMarketMap.has(marketKey)) {
+          byMarketMap.set(marketKey, {
+            marketKey,
+            marketLabel: getBilanMarketLabel(market, marketKey),
+            evaluated: 0,
+            wins: 0,
+            losses: 0,
+          });
+        }
+
+        const stats = byMarketMap.get(marketKey);
+        stats.evaluated += 1;
+        if (won) stats.wins += 1;
+        else stats.losses += 1;
+      }
+
+      if (evaluatedForMatch > 0) {
+        matches += 1;
+      }
+    }
+
+    const byMarket = Array.from(byMarketMap.values()).map(
+      (stats) => ({
+        ...stats,
+        accuracy:
+          stats.evaluated > 0
+            ? bilanPublicRound(
+                (stats.wins / stats.evaluated) * 100,
+                2
+              )
+            : 0,
+      })
+    );
+
+    return res.json({
+      ok: true,
+      matches,
+      marketsAnalyzed,
+      wins,
+      losses,
+      accuracy:
+        marketsAnalyzed > 0
+          ? bilanPublicRound(
+              (wins / marketsAnalyzed) * 100,
+              2
+            )
+          : 0,
+      byMarket,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("ERREUR /public/bilan/ia :", error);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Impossible de charger /public/bilan/ia.",
+    });
+  }
+});
+
+function formatQualifiedBetForPublic(row = {}) {
+  const snapshot =
+    row.qualification_snapshot &&
+    typeof row.qualification_snapshot === "object"
+      ? row.qualification_snapshot
+      : {};
+
+  return {
+    id: row.id,
+    fixtureId: Number(row.fixture_id),
+    homeTeam:
+      row.home_team_name ||
+      snapshot?.match?.homeTeam ||
+      snapshot?.match?.home ||
+      "Domicile",
+    awayTeam:
+      row.away_team_name ||
+      snapshot?.match?.awayTeam ||
+      snapshot?.match?.away ||
+      "Extérieur",
+    competition:
+      row.league_name ||
+      snapshot?.match?.competition ||
+      snapshot?.match?.league ||
+      "Compétition inconnue",
+    kickoff: row.kickoff || row.fixture_date || null,
+    marketKey: row.market_key,
+    marketLabel: row.market_label || row.market_key,
+    category: String(row.category || "OPPORTUNITY").toUpperCase(),
+    betScore:
+      row.bet_score === null ? null : Number(row.bet_score),
+    decisionScore:
+      row.decision_score === null
+        ? null
+        : Number(row.decision_score),
+    probability:
+      row.probability === null ? null : Number(row.probability),
+    confidence:
+      row.confidence === null ? null : Number(row.confidence),
+    consensus:
+      row.consensus === null ? null : Number(row.consensus),
+    reliability:
+      row.reliability === null ? null : Number(row.reliability),
+    risk: row.risk === null ? null : Number(row.risk),
+    valuePercent:
+      row.value_percent === null
+        ? null
+        : Number(row.value_percent),
+    bookmakerOdd:
+      row.bookmaker_odd === null
+        ? null
+        : Number(row.bookmaker_odd),
+    resultStatus: row.result_status,
+    won:
+      row.won === null || row.won === undefined
+        ? null
+        : row.won === true,
+    profitUnits:
+      row.profit_units === null
+        ? null
+        : Number(row.profit_units),
+    roiPercent:
+      row.roi_percent === null
+        ? null
+        : Number(row.roi_percent),
+    frozenAt: row.frozen_at,
+    settledAt: row.settled_at,
+    qualificationVersion: row.qualification_version || null,
+  };
+}
+
+function summarizeQualifiedBetRows(rows = []) {
+  const volume = rows.length;
+  const settledRows = rows.filter((row) =>
+    ["WIN", "LOSS", "VOID"].includes(
+      String(row.result_status || "").toUpperCase()
+    )
+  );
+  const decisiveRows = settledRows.filter((row) =>
+    ["WIN", "LOSS"].includes(
+      String(row.result_status || "").toUpperCase()
+    )
+  );
+  const pricedRows = decisiveRows.filter(
+    (row) =>
+      Number(row.bookmaker_odd) > 1 &&
+      Number.isFinite(Number(row.profit_units))
+  );
+
+  const wins = decisiveRows.filter(
+    (row) => String(row.result_status).toUpperCase() === "WIN"
+  ).length;
+  const losses = decisiveRows.filter(
+    (row) => String(row.result_status).toUpperCase() === "LOSS"
+  ).length;
+  const voids = settledRows.filter(
+    (row) => String(row.result_status).toUpperCase() === "VOID"
+  ).length;
+  const profit = pricedRows.reduce(
+    (sum, row) => sum + bilanPublicNumber(row.profit_units),
+    0
+  );
+  const averageOdd =
+    pricedRows.length > 0
+      ? pricedRows.reduce(
+          (sum, row) => sum + bilanPublicNumber(row.bookmaker_odd),
+          0
+        ) / pricedRows.length
+      : null;
+
+  return {
+    volume,
+    settled: settledRows.length,
+    pending: Math.max(0, volume - settledRows.length),
+    wins,
+    losses,
+    voids,
+    priced: pricedRows.length,
+    accuracy:
+      decisiveRows.length > 0
+        ? bilanPublicRound((wins / decisiveRows.length) * 100, 2)
+        : 0,
+    profit: bilanPublicRound(profit, 2),
+    roi:
+      pricedRows.length > 0
+        ? bilanPublicRound((profit / pricedRows.length) * 100, 2)
+        : null,
+    averageOdd:
+      averageOdd === null
+        ? null
+        : bilanPublicRound(averageOdd, 2),
+  };
+}
+
+
+/*
+ * ============================================================
+ * DAILY BET PORTFOLIO ENGINE — IA PICKS + PREMIUM
+ * ============================================================
+ * Sélection relative quotidienne :
+ * - conserve les catégories Premium SAFE / VALUE / OPPORTUNITY ;
+ * - complète avec IA_PICK parmi les meilleurs candidats du jour ;
+ * - un seul pari par match ;
+ * - diversification par marché et compétition ;
+ * - gel uniquement entre T-30 et T-10.
+ */
+const DAILY_PORTFOLIO_VERSION = "daily-portfolio-v1.0.0";
+const DAILY_PORTFOLIO_MIN_TARGET = 3;
+const DAILY_PORTFOLIO_MAX_TARGET = 12;
+const DAILY_PORTFOLIO_SHARE = 0.14;
+const DAILY_PORTFOLIO_MAX_PER_MARKET = 3;
+const DAILY_PORTFOLIO_MAX_PER_LEAGUE = 3;
+
+function portfolioNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function portfolioNullableNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function portfolioClamp(value, minimum = 0, maximum = 100) {
+  return Math.max(minimum, Math.min(maximum, portfolioNumber(value)));
+}
+
+function portfolioRound(value, decimals = 2) {
+  const factor = 10 ** decimals;
+  return Math.round(portfolioNumber(value) * factor) / factor;
+}
+
+function portfolioMarketKey(value) {
+  return normalizeManualOddsMarketKey(value || "");
+}
+
+function portfolioSnapshotMarkets(prediction = {}) {
+  const snapshot = prediction.studio_snapshot && typeof prediction.studio_snapshot === "object"
+    ? prediction.studio_snapshot
+    : {};
+  const markets = Array.isArray(snapshot.markets)
+    ? snapshot.markets
+    : Array.isArray(snapshot?.studio?.markets)
+      ? snapshot.studio.markets
+      : [];
+  if (markets.length > 0) return markets;
+  const fallback = snapshot.primaryMarket || snapshot.bestDecision;
+  if (fallback) return [fallback];
+  if (prediction.studio_market_key) {
+    return [{
+      key: prediction.studio_market_key,
+      label: prediction.studio_market_label,
+      probability: prediction.studio_probability,
+      decisionScore: prediction.studio_decision_score,
+    }];
+  }
+  return [];
+}
+
+function portfolioCandidateFromMarket(prediction, market) {
+  const marketKey = portfolioMarketKey(market?.key || market?.marketKey);
+  if (!isSupportedDailyTicketMarketKey(marketKey)) return null;
+
+  const qualification = market?.betQualification || market?.qualification || {};
+  const criteria = qualification?.criteria || {};
+  const decisionScore = portfolioClamp(
+    market?.decision?.score ?? market?.marketDecision?.score ?? market?.decisionScore ?? market?.score ?? prediction.studio_decision_score
+  );
+  const probability = portfolioClamp(
+    market?.fairOdds?.calibratedProbability ?? market?.calibratedProbability ?? market?.probability ?? prediction.studio_probability
+  );
+  const reliability = portfolioClamp(
+    criteria.reliability ?? market?.marketReliability?.score ?? market?.reliability?.score ?? market?.reliability ?? 50
+  );
+  const consensus = portfolioClamp(
+    criteria.consensus ?? market?.decision?.marketConsensus?.score ?? market?.consensusScore ?? 50
+  );
+  const risk = portfolioClamp(
+    criteria.risk ?? market?.decision?.risk ?? prediction.risk ?? 50
+  );
+  const confidence = portfolioClamp(
+    criteria.confidence ?? market?.decision?.confidence ?? prediction.confidence ?? 50
+  );
+  const oddData = getDailyTicketMarketOdd(market, prediction);
+  const valuePercent = portfolioNullableNumber(
+    criteria.valuePercent ?? market?.expectedValuePercent ?? market?.valueEdge
+  ) ?? (
+    oddData.odd && probability > 0
+      ? portfolioRound((probability / 100) * oddData.odd * 100 - 100, 2)
+      : null
+  );
+  const betScore = portfolioClamp(
+    qualification?.betScore ??
+      decisionScore * 0.35 +
+      probability * 0.12 +
+      confidence * 0.13 +
+      consensus * 0.12 +
+      reliability * 0.18 +
+      (100 - risk) * 0.10
+  );
+  const blockingReasons = Array.isArray(qualification?.blockingReasons)
+    ? qualification.blockingReasons.filter(Boolean)
+    : [];
+  const hardBlocked =
+    blockingReasons.length > 0 ||
+    decisionScore < 60 ||
+    betScore < 55 ||
+    reliability < 45 ||
+    risk > 82 ||
+    probability < 20 ||
+    probability > 95;
+
+  const valueQuality = valuePercent === null
+    ? 45
+    : portfolioClamp(50 + valuePercent * 2.5);
+  const missingOddPenalty = oddData.odd && oddData.odd > 1 ? 0 : 6;
+  const highRiskPenalty = Math.max(0, risk - 60) * 0.18;
+  const portfolioScore = portfolioClamp(
+    betScore * 0.35 +
+    decisionScore * 0.25 +
+    reliability * 0.15 +
+    consensus * 0.10 +
+    probability * 0.05 +
+    valueQuality * 0.10 -
+    missingOddPenalty -
+    highRiskPenalty
+  );
+
+  const premiumCategory = ["SAFE", "VALUE", "OPPORTUNITY"].includes(
+    String(qualification?.category || "").toUpperCase()
+  ) && qualification?.qualified === true
+    ? String(qualification.category).toUpperCase()
+    : null;
+
+  return {
+    fixtureId: Number(prediction.fixture_id),
+    kickoff: prediction.fixture_date,
+    leagueName: prediction.league_name || "Compétition inconnue",
+    homeTeam: prediction.home_team_name || "Domicile",
+    awayTeam: prediction.away_team_name || "Extérieur",
+    marketKey,
+    marketLabel: market?.label || market?.marketLabel || marketKey,
+    category: premiumCategory || "IA_PICK",
+    selectionSource: premiumCategory ? "PREMIUM" : "DAILY_PORTFOLIO",
+    portfolioScore: portfolioRound(portfolioScore, 1),
+    betScore: portfolioRound(betScore, 1),
+    decisionScore: portfolioRound(decisionScore, 1),
+    probability: portfolioRound(probability, 1),
+    confidence: portfolioRound(confidence, 1),
+    consensus: portfolioRound(consensus, 1),
+    reliability: portfolioRound(reliability, 1),
+    risk: portfolioRound(risk, 1),
+    valuePercent,
+    bookmakerOdd: oddData.odd,
+    bookmaker: oddData.bookmaker,
+    bookmakerSource: oddData.source,
+    qualificationVersion:
+      qualification?.version || qualification?.thresholdsVersion || DAILY_PORTFOLIO_VERSION,
+    qualificationSnapshot: {
+      originalQualification: qualification,
+      portfolio: {
+        version: DAILY_PORTFOLIO_VERSION,
+        portfolioScore: portfolioRound(portfolioScore, 1),
+        selectionSource: premiumCategory ? "PREMIUM" : "DAILY_PORTFOLIO",
+        safetyFloor: {
+          minimumDecisionScore: 60,
+          minimumBetScore: 55,
+          minimumReliability: 45,
+          maximumRisk: 82,
+          probabilityRange: [20, 95],
+        },
+      },
+    },
+    hardBlocked,
+    blockingReasons,
+  };
+}
+
+function buildDailyPortfolio(candidates = [], matchCount = 0) {
+  const target = Math.max(
+    DAILY_PORTFOLIO_MIN_TARGET,
+    Math.min(
+      DAILY_PORTFOLIO_MAX_TARGET,
+      Math.round(Math.max(1, matchCount) * DAILY_PORTFOLIO_SHARE)
+    )
+  );
+  const ranked = candidates
+    .filter((candidate) => candidate && !candidate.hardBlocked)
+    .sort((a, b) =>
+      Number(Boolean(b.bookmakerOdd)) - Number(Boolean(a.bookmakerOdd)) ||
+      b.portfolioScore - a.portfolioScore ||
+      b.betScore - a.betScore ||
+      b.decisionScore - a.decisionScore
+    );
+
+  const selected = [];
+  const usedFixtures = new Set();
+  const marketCounts = new Map();
+  const leagueCounts = new Map();
+
+  for (const candidate of ranked) {
+    if (selected.length >= target) break;
+    if (usedFixtures.has(candidate.fixtureId)) continue;
+    const marketCount = marketCounts.get(candidate.marketKey) || 0;
+    const leagueCount = leagueCounts.get(candidate.leagueName) || 0;
+    if (marketCount >= DAILY_PORTFOLIO_MAX_PER_MARKET) continue;
+    if (leagueCount >= DAILY_PORTFOLIO_MAX_PER_LEAGUE) continue;
+
+    selected.push({
+      ...candidate,
+      dailyRank: selected.length + 1,
+      targetSize: target,
+    });
+    usedFixtures.add(candidate.fixtureId);
+    marketCounts.set(candidate.marketKey, marketCount + 1);
+    leagueCounts.set(candidate.leagueName, leagueCount + 1);
+  }
+
+  return { target, rankedCount: ranked.length, selected };
+}
+
+async function ensureDailyPortfolioColumns() {
+  await ensureBetQualificationCalibrationTables();
+  await pool.query(`
+    ALTER TABLE qualified_bets
+      ADD COLUMN IF NOT EXISTS selection_source TEXT,
+      ADD COLUMN IF NOT EXISTS portfolio_score NUMERIC,
+      ADD COLUMN IF NOT EXISTS daily_rank INTEGER,
+      ADD COLUMN IF NOT EXISTS portfolio_date DATE,
+      ADD COLUMN IF NOT EXISTS bookmaker TEXT,
+      ADD COLUMN IF NOT EXISTS bookmaker_source TEXT;
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_qualified_bets_portfolio_date
+    ON qualified_bets(portfolio_date, daily_rank);
+  `);
+}
+
+async function loadDailyPortfolio(date = null) {
+  await ensureDailyPortfolioColumns();
+  const portfolioDate = date || new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Paris",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+
+  const result = await pool.query(
+    `
+      SELECT *
+      FROM predictions
+      WHERE (fixture_date AT TIME ZONE 'Europe/Paris')::date = $1::date
+        AND fixture_date > NOW()
+        AND studio_snapshot IS NOT NULL
+      ORDER BY fixture_date ASC, fixture_id ASC
+    `,
+    [portfolioDate]
+  );
+  const candidates = [];
+  const automaticOddsMap = await oddsSyncService.getCurrentOddsMap(
+    result.rows.map((prediction) => prediction.fixture_id)
+  );
+
+  for (const prediction of result.rows) {
+    for (const rawMarket of portfolioSnapshotMarkets(prediction)) {
+      const market = oddsSyncService.applyOddsToMarket(
+        prediction.fixture_id,
+        rawMarket,
+        automaticOddsMap
+      );
+      const candidate = portfolioCandidateFromMarket(prediction, market);
+      if (candidate) candidates.push(candidate);
+    }
+  }
+  const portfolio = buildDailyPortfolio(candidates, result.rows.length);
+  return {
+    date: portfolioDate,
+    sourceMatches: result.rows.length,
+    analyzedMarkets: candidates.length,
+    ...portfolio,
+  };
+}
+
+async function freezeDailyPortfolioSelections() {
+  const portfolio = await loadDailyPortfolio();
+  const now = Date.now();
+  let frozen = 0;
+  let skipped = 0;
+
+  for (const candidate of portfolio.selected) {
+    const kickoff = new Date(candidate.kickoff);
+    if (Number.isNaN(kickoff.getTime())) {
+      skipped += 1;
+      continue;
+    }
+    const minutesBefore = (kickoff.getTime() - now) / 60000;
+    if (minutesBefore > 30 || minutesBefore < 10) continue;
+
+    const result = await pool.query(
+      `
+        INSERT INTO qualified_bets (
+          fixture_id, market_key, market_label, category,
+          bet_score, decision_score, probability, confidence,
+          consensus, reliability, risk, value_percent,
+          bookmaker_odd, bookmaker, bookmaker_source,
+          qualification_version, qualification_snapshot,
+          selection_source, portfolio_score, daily_rank,
+          portfolio_date, frozen_at, kickoff,
+          result_status, updated_at
+        ) VALUES (
+          $1, $2, $3, $4,
+          $5, $6, $7, $8,
+          $9, $10, $11, $12,
+          $13, $14, $15,
+          $16, $17::jsonb,
+          $18, $19, $20,
+          $21::date, NOW(), $22,
+          'PENDING', NOW()
+        )
+        ON CONFLICT (fixture_id, market_key) DO NOTHING
+        RETURNING id
+      `,
+      [
+        candidate.fixtureId,
+        candidate.marketKey,
+        candidate.marketLabel,
+        candidate.category,
+        candidate.betScore,
+        candidate.decisionScore,
+        candidate.probability,
+        candidate.confidence,
+        candidate.consensus,
+        candidate.reliability,
+        candidate.risk,
+        candidate.valuePercent,
+        candidate.bookmakerOdd,
+        candidate.bookmaker,
+        candidate.bookmakerSource,
+        candidate.qualificationVersion,
+        JSON.stringify(candidate.qualificationSnapshot),
+        candidate.selectionSource,
+        candidate.portfolioScore,
+        candidate.dailyRank,
+        portfolio.date,
+        kickoff.toISOString(),
+      ]
+    );
+    if (result.rows.length > 0) frozen += 1;
+    else skipped += 1;
+  }
+
+  return { ...portfolio, frozen, skipped, checkedAt: new Date().toISOString() };
+}
+
+function settlePortfolioMarket(marketKey, homeGoals, awayGoals) {
+  const key = portfolioMarketKey(marketKey);
+  const total = homeGoals + awayGoals;
+  if (key === "HOME") return homeGoals > awayGoals;
+  if (key === "DRAW") return homeGoals === awayGoals;
+  if (key === "AWAY") return awayGoals > homeGoals;
+  if (key === "OVER25") return total >= 3;
+  if (key === "UNDER25") return total <= 2;
+  if (key === "BTTS_YES") return homeGoals > 0 && awayGoals > 0;
+  if (key === "BTTS_NO") return homeGoals === 0 || awayGoals === 0;
+  return null;
+}
+
+async function settleDailyPortfolioBets() {
+  await ensureDailyPortfolioColumns();
+  const result = await pool.query(`
+    SELECT qb.id, qb.market_key, qb.bookmaker_odd,
+           p.home_goals, p.away_goals, p.result_status
+    FROM qualified_bets qb
+    JOIN predictions p ON p.fixture_id = qb.fixture_id
+    WHERE qb.result_status = 'PENDING'
+      AND UPPER(COALESCE(p.result_status, '')) IN ('FT','AET','PEN','FINISHED','COMPLETED')
+      AND p.home_goals IS NOT NULL
+      AND p.away_goals IS NOT NULL
+  `);
+  let settled = 0;
+  for (const row of result.rows) {
+    const won = settlePortfolioMarket(
+      row.market_key,
+      Number(row.home_goals),
+      Number(row.away_goals)
+    );
+    if (won === null) continue;
+    const odd = portfolioNullableNumber(row.bookmaker_odd);
+    const profit = odd && odd > 1 ? (won ? odd - 1 : -1) : null;
+    await pool.query(
+      `
+        UPDATE qualified_bets
+        SET result_status = $2,
+            won = $3,
+            profit_units = $4,
+            roi_percent = $5,
+            settled_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $1
+      `,
+      [row.id, won ? "WIN" : "LOSS", won, profit, profit === null ? null : profit * 100]
+    );
+    settled += 1;
+  }
+  return { settled, checked: result.rows.length, settledAt: new Date().toISOString() };
+}
+
+app.get("/public/bet-portfolio/daily", async (req, res) => {
+  try {
+    const portfolio = await loadDailyPortfolio(req.query.date || null);
+    return res.json({ ok: true, version: DAILY_PORTFOLIO_VERSION, ...portfolio });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error?.message || "Impossible de charger le portefeuille IA." });
+  }
+});
+
+app.post("/internal/bet-portfolio/freeze", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  try {
+    return res.json({ ok: true, ...(await freezeDailyPortfolioSelections()) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error?.message || "Impossible de figer le portefeuille IA." });
+  }
+});
+
+app.post("/internal/bet-portfolio/settle", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  try {
+    return res.json({ ok: true, ...(await settleDailyPortfolioBets()) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error?.message || "Impossible de régler le portefeuille IA." });
+  }
+});
+
+if (AUTOMATIC_SCHEDULERS_ENABLED) {
+  setTimeout(() => {
+    freezeDailyPortfolioSelections().catch((error) =>
+      console.error("DAILY PORTFOLIO FREEZE INIT :", error)
+    );
+    settleDailyPortfolioBets().catch((error) =>
+      console.error("DAILY PORTFOLIO SETTLE INIT :", error)
+    );
+  }, 90 * 1000);
+
+  setInterval(() => {
+    freezeDailyPortfolioSelections().catch((error) =>
+      console.error("DAILY PORTFOLIO FREEZE :", error)
+    );
+  }, 60 * 1000);
+
+  setInterval(() => {
+    settleDailyPortfolioBets().catch((error) =>
+      console.error("DAILY PORTFOLIO SETTLE :", error)
+    );
+  }, 5 * 60 * 1000);
+}
+
+
+
+/*
+ * ============================================================
+ * BILAN DÉTAILLÉ — DERNIER MARCHÉ PRINCIPAL PAR MATCH
+ * ============================================================
+ * Ce bilan est strictement analytique :
+ * - un seul marché principal par match terminé ;
+ * - résultat correct / incorrect ;
+ * - cote observée au moment du snapshot ou dernière cote stockée ;
+ * - aucun calcul de mise, profit ou ROI.
+ */
+
+function detailedBilanNormalizeMarketKey(value = "") {
+  const compact = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
+  if (["HOME", "HOMEWIN", "1"].includes(compact)) return "HOME";
+  if (["DRAW", "X", "N"].includes(compact)) return "DRAW";
+  if (["AWAY", "AWAYWIN", "2"].includes(compact)) return "AWAY";
+  if (["BTTS", "BTTSYES", "GG"].includes(compact)) return "BTTS_YES";
+  if (["NOBTTS", "BTTSNO", "NG"].includes(compact)) return "BTTS_NO";
+  if (["OVER25", "OVER250", "PLUS25"].includes(compact)) return "OVER25";
+  if (["UNDER25", "UNDER250", "MOINS25"].includes(compact)) return "UNDER25";
+
+  return compact || null;
+}
+
+function detailedBilanMarketLabel(key, fallback = null) {
+  return (
+    {
+      HOME: "Victoire domicile",
+      DRAW: "Match nul",
+      AWAY: "Victoire extérieur",
+      BTTS_YES: "Les deux équipes marquent",
+      BTTS_NO: "Les deux équipes ne marquent pas",
+      OVER25: "Plus de 2,5 buts",
+      UNDER25: "Moins de 2,5 buts",
+    }[key] ||
+    fallback ||
+    key ||
+    "Marché inconnu"
+  );
+}
+
+function detailedBilanEvaluateMarket(marketKey, homeGoals, awayGoals) {
+  const key = detailedBilanNormalizeMarketKey(marketKey);
+  const home = Number(homeGoals);
+  const away = Number(awayGoals);
+
+  if (!Number.isFinite(home) || !Number.isFinite(away)) {
+    return null;
+  }
+
+  if (key === "HOME") return home > away;
+  if (key === "DRAW") return home === away;
+  if (key === "AWAY") return away > home;
+  if (key === "BTTS_YES") return home > 0 && away > 0;
+  if (key === "BTTS_NO") return home === 0 || away === 0;
+  if (key === "OVER25") return home + away >= 3;
+  if (key === "UNDER25") return home + away <= 2;
+
+  return null;
+}
+
+function detailedBilanNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function detailedBilanExtractSnapshotMarket(prediction = {}) {
+  const snapshot =
+    prediction.studio_snapshot &&
+    typeof prediction.studio_snapshot === "object"
+      ? prediction.studio_snapshot
+      : {};
+
+  const primary =
+    snapshot.primaryMarket ||
+    snapshot.bestDecision ||
+    snapshot.studio?.primaryMarket ||
+    null;
+
+  const marketKey = detailedBilanNormalizeMarketKey(
+    prediction.studio_market_key ||
+      primary?.key ||
+      primary?.marketKey ||
+      ""
+  );
+
+  const marketLabel =
+    prediction.studio_market_label ||
+    primary?.label ||
+    primary?.marketLabel ||
+    detailedBilanMarketLabel(marketKey);
+
+  const probability = detailedBilanNumberOrNull(
+    prediction.studio_probability ??
+      primary?.fairOdds?.calibratedProbability ??
+      primary?.calibratedProbability ??
+      primary?.probability
+  );
+
+  const decisionScore = detailedBilanNumberOrNull(
+    prediction.studio_decision_score ??
+      primary?.decision?.score ??
+      primary?.marketDecision?.score ??
+      primary?.decisionScore ??
+      primary?.score
+  );
+
+  const snapshotOdd = detailedBilanNumberOrNull(
+    primary?.fairOdds?.bookmakerOdds ??
+      primary?.oddsMetrics?.bookmakerOdds ??
+      primary?.bookmakerOdds ??
+      snapshot?.bookmakerOdd
+  );
+
+  const snapshotBookmaker =
+    primary?.fairOdds?.bookmaker ||
+    primary?.oddsMetrics?.bookmaker ||
+    primary?.bookmaker ||
+    snapshot?.bookmaker ||
+    null;
+
+  const snapshotSource =
+    primary?.fairOdds?.bookmakerSource ||
+    primary?.oddsMetrics?.bookmakerSource ||
+    primary?.bookmakerSource ||
+    snapshot?.bookmakerOddSource ||
+    null;
+
+  return {
+    marketKey,
+    marketLabel,
+    probability,
+    decisionScore,
+    snapshotOdd,
+    snapshotBookmaker,
+    snapshotSource,
+  };
+}
+
+app.get("/public/bilan/detaille", async (req, res) => {
+  try {
+    await ensureStudioPredictionColumns();
+
+    /*
+     * Aucun plafond arbitraire ici :
+     * la route doit rendre disponible tout l'historique des matchs terminés.
+     * L'interface limite seulement le nombre de cartes visibles et permet
+     * d'en charger davantage par blocs de 50.
+     */
+    const result = await pool.query(
+      `
+        SELECT DISTINCT ON (p.fixture_id)
+          p.fixture_id,
+          p.fixture_date,
+          p.home_team_name,
+          p.away_team_name,
+          p.league_name,
+          p.home_goals,
+          p.away_goals,
+          p.result_status,
+          p.studio_market_key,
+          p.studio_market_label,
+          p.studio_probability,
+          p.studio_decision_score,
+          p.studio_snapshot,
+          p.studio_saved_at,
+          p.manual_market_key,
+          p.manual_market_odd,
+          p.manual_odd_source,
+          p.manual_odd_updated_at
+        FROM predictions p
+        WHERE UPPER(COALESCE(p.result_status, '')) IN (
+          'FT', 'AET', 'PEN', 'FINISHED', 'COMPLETED'
+        )
+          AND p.home_goals IS NOT NULL
+          AND p.away_goals IS NOT NULL
+          AND (
+            p.studio_snapshot IS NOT NULL
+            OR NULLIF(BTRIM(COALESCE(p.studio_market_key, '')), '') IS NOT NULL
+          )
+        ORDER BY
+          p.fixture_id,
+          p.updated_at DESC NULLS LAST,
+          p.id DESC
+      `
+    );
+
+    const fixtureIds = result.rows
+      .map((row) => Number(row.fixture_id))
+      .filter((fixtureId) => Number.isInteger(fixtureId));
+
+    let oddsMap = new Map();
+
+    if (fixtureIds.length > 0) {
+      const oddsResult = await pool.query(
+        `
+          SELECT DISTINCT ON (fixture_id, market_key)
+            fixture_id,
+            market_key,
+            odd,
+            bookmaker_name,
+            source,
+            captured_at
+          FROM market_odds
+          WHERE fixture_id = ANY($1::bigint[])
+          ORDER BY
+            fixture_id,
+            market_key,
+            captured_at DESC,
+            id DESC
+        `,
+        [fixtureIds]
+      );
+
+      oddsMap = new Map(
+        oddsResult.rows.map((row) => [
+          `${Number(row.fixture_id)}:${detailedBilanNormalizeMarketKey(
+            row.market_key
+          )}`,
+          row,
+        ])
+      );
+    }
+
+    const analyses = [];
+
+    for (const prediction of result.rows) {
+      const primary = detailedBilanExtractSnapshotMarket(prediction);
+
+      if (!primary.marketKey) continue;
+
+      const won = detailedBilanEvaluateMarket(
+        primary.marketKey,
+        prediction.home_goals,
+        prediction.away_goals
+      );
+
+      if (won === null) continue;
+
+      const manualKey = detailedBilanNormalizeMarketKey(
+        prediction.manual_market_key
+      );
+      const manualOdd =
+        manualKey === primary.marketKey
+          ? detailedBilanNumberOrNull(prediction.manual_market_odd)
+          : null;
+
+      const automaticOdd = oddsMap.get(
+        `${Number(prediction.fixture_id)}:${primary.marketKey}`
+      );
+
+      const bookmakerOdd =
+        manualOdd && manualOdd > 1
+          ? manualOdd
+          : primary.snapshotOdd && primary.snapshotOdd > 1
+            ? primary.snapshotOdd
+            : detailedBilanNumberOrNull(automaticOdd?.odd);
+
+      const bookmaker =
+        manualOdd && manualOdd > 1
+          ? prediction.manual_odd_source || "Admin Football AI Pro"
+          : primary.snapshotOdd && primary.snapshotOdd > 1
+            ? primary.snapshotBookmaker
+            : automaticOdd?.bookmaker_name || null;
+
+      const bookmakerSource =
+        manualOdd && manualOdd > 1
+          ? "MANUAL_ADMIN"
+          : primary.snapshotOdd && primary.snapshotOdd > 1
+            ? primary.snapshotSource || "STUDIO_SNAPSHOT"
+            : automaticOdd?.source || null;
+
+      analyses.push({
+        fixtureId: Number(prediction.fixture_id),
+        kickoff: prediction.fixture_date,
+        homeTeam: prediction.home_team_name || "Domicile",
+        awayTeam: prediction.away_team_name || "Extérieur",
+        competition:
+          prediction.league_name || "Compétition inconnue",
+        homeGoals: Number(prediction.home_goals),
+        awayGoals: Number(prediction.away_goals),
+        finalScore: `${Number(prediction.home_goals)}-${Number(
+          prediction.away_goals
+        )}`,
+        marketKey: primary.marketKey,
+        marketLabel: detailedBilanMarketLabel(
+          primary.marketKey,
+          primary.marketLabel
+        ),
+        probability: primary.probability,
+        decisionScore: primary.decisionScore,
+        bookmakerOdd:
+          bookmakerOdd && bookmakerOdd > 1 ? bookmakerOdd : null,
+        bookmaker,
+        bookmakerSource,
+        correct: won,
+        result: won ? "CORRECT" : "INCORRECT",
+        analyzedAt: prediction.studio_saved_at || null,
+      });
+    }
+
+    analyses.sort(
+      (first, second) =>
+        new Date(second.kickoff || 0).getTime() -
+        new Date(first.kickoff || 0).getTime()
+    );
+
+    const correct = analyses.filter((item) => item.correct === true).length;
+    const incorrect = analyses.filter((item) => item.correct === false).length;
+
+    return res.json({
+      ok: true,
+      summary: {
+        matches: analyses.length,
+        correct,
+        incorrect,
+        accuracy:
+          analyses.length > 0
+            ? Math.round((correct / analyses.length) * 10000) / 100
+            : 0,
+        withOdds: analyses.filter(
+          (item) => Number(item.bookmakerOdd) > 1
+        ).length,
+      },
+      recent: analyses,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("ERREUR /public/bilan/detaille :", error);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Impossible de charger le Bilan détaillé.",
+    });
+  }
+});
+
+
+app.get("/public/bilan/paris", async (req, res) => {
+  try {
+    await ensureBetQualificationCalibrationTables();
+
+    const result = await pool.query(`
+      SELECT
+        qb.*,
+        p.fixture_date,
+        p.home_team_name,
+        p.away_team_name,
+        p.league_name
+      FROM qualified_bets qb
+      LEFT JOIN predictions p
+        ON p.fixture_id = qb.fixture_id
+      ORDER BY qb.frozen_at DESC, qb.id DESC
+      LIMIT 1000
+    `);
+
+    const rows = result.rows;
+    const categories = {};
+
+    for (const category of ["SAFE", "VALUE", "OPPORTUNITY", "IA_PICK"]) {
+      categories[category] = summarizeQualifiedBetRows(
+        rows.filter(
+          (row) =>
+            String(row.category || "").toUpperCase() === category
+        )
+      );
+    }
+
+    const trackingStartedAt =
+      rows.length > 0
+        ? rows.reduce((oldest, row) => {
+            const current = row.frozen_at
+              ? new Date(row.frozen_at)
+              : null;
+            if (!current || Number.isNaN(current.getTime())) {
+              return oldest;
+            }
+            if (!oldest || current < oldest) return current;
+            return oldest;
+          }, null)?.toISOString() || null
+        : null;
+
+    return res.json({
+      ok: true,
+      overall: summarizeQualifiedBetRows(rows),
+      categories,
+      recent: rows.slice(0, 250).map(formatQualifiedBetForPublic),
+      trackingStartedAt,
+      freezeRule: {
+        normalFreezeMinutesBeforeKickoff: 30,
+        latestFreezeMinutesBeforeKickoff: 10,
+      },
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("ERREUR /public/bilan/paris :", error);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Impossible de charger /public/bilan/paris.",
+    });
+  }
+});
+
 app.listen(
   PORT,
   "0.0.0.0",
