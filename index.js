@@ -20349,24 +20349,40 @@ async function ensureBilanV3Columns() {
 }
 
 function requireOptionalAdminKey(req, res) {
-  const configuredKey = String(process.env.ADMIN_API_KEY || "").trim();
-  if (!configuredKey) return true;
+  const configuredKey = String(
+    process.env.ADMIN_API_KEY || ""
+  ).trim();
 
-  const receivedKey = String(req.headers["x-admin-key"] || "").trim();
-    console.log("ADMIN KEY DEBUG", {
-  configuredLength: configuredKey.length,
-  receivedLength: receivedKey.length,
-  receivedPresent: Boolean(receivedKey),
-});
-  if (receivedKey === configuredKey) return true;
+  if (!configuredKey) {
+    return true;
+  }
+
+  const receivedKey = String(
+    req.headers["x-admin-key"] || ""
+  ).trim();
+
+  if (receivedKey === configuredKey) {
+    return true;
+  }
+
+  console.error("ADMIN KEY MISMATCH", {
+    configuredLength: configuredKey.length,
+    receivedLength: receivedKey.length,
+    receivedPresent: Boolean(receivedKey),
+  });
 
   res.status(401).json({
     ok: false,
     error: "Clé administrateur invalide.",
+    debug: {
+      configuredLength: configuredKey.length,
+      receivedLength: receivedKey.length,
+      receivedPresent: Boolean(receivedKey),
+    },
   });
+
   return false;
 }
-
 function parseBilanSnapshot(value) {
   if (value && typeof value === "object") return value;
   if (typeof value === "string") {
