@@ -20353,6 +20353,11 @@ function requireOptionalAdminKey(req, res) {
   if (!configuredKey) return true;
 
   const receivedKey = String(req.headers["x-admin-key"] || "").trim();
+    console.log("ADMIN KEY DEBUG", {
+  configuredLength: configuredKey.length,
+  receivedLength: receivedKey.length,
+  receivedPresent: Boolean(receivedKey),
+});
   if (receivedKey === configuredKey) return true;
 
   res.status(401).json({
