@@ -25134,26 +25134,28 @@ app.post("/internal/bet-portfolio/settle", async (req, res) => {
     return res.status(500).json({ ok: false, error: error?.message || "Impossible de régler le portefeuille IA." });
   }
 });
-
+/*
+ * Ticket / portefeuille du jour désactivé pour le lancement.
+ *
+ * Les routes manuelles restent disponibles, mais aucun scheduler
+ * automatique n'appelle freezeDailyPortfolioSelections().
+ */
 if (AUTOMATIC_SCHEDULERS_ENABLED) {
   setTimeout(() => {
-    freezeDailyPortfolioSelections().catch((error) =>
-      console.error("DAILY PORTFOLIO FREEZE INIT :", error)
-    );
     settleDailyPortfolioBets().catch((error) =>
-      console.error("DAILY PORTFOLIO SETTLE INIT :", error)
+      console.error(
+        "DAILY PORTFOLIO SETTLE INIT :",
+        error
+      )
     );
   }, 90 * 1000);
 
   setInterval(() => {
-    freezeDailyPortfolioSelections().catch((error) =>
-      console.error("DAILY PORTFOLIO FREEZE :", error)
-    );
-  }, 60 * 1000);
-
-  setInterval(() => {
     settleDailyPortfolioBets().catch((error) =>
-      console.error("DAILY PORTFOLIO SETTLE :", error)
+      console.error(
+        "DAILY PORTFOLIO SETTLE :",
+        error
+      )
     );
   }, 5 * 60 * 1000);
 }
