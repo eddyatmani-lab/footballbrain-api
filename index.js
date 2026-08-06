@@ -17112,7 +17112,8 @@ async function calibrationStatusHandler(req, res) {
       return res.json({
         ok: true,
         engine: "CALIBRATION_ENGINE",
-        running: learningEngineRunning,
+        running: true,
+        calculating: learningEngineRunning,
         engineVersion: LEARNING_ENGINE_VERSION,
         modelVersion: LEARNING_MODEL_VERSION,
         applyEnabled: CALIBRATION_APPLY_ENABLED,
@@ -19370,6 +19371,201 @@ app.get(
           "Impossible de charger les poids moteurs.",
       });
     }
+  }
+);
+
+
+/*
+ * Compatibilité avec le tableau de bord Admin historique.
+ * Ces routes exposent les données du nouveau Learning vivant
+ * avec la forme attendue par l'interface existante.
+ */
+app.get(
+  "/internal/learning/engines/status",
+  async (req, res) => {
+    try {
+      await ensureLivingEngineWeightTables();
+      await loadLivingEngineWeightProfile();
+
+      const profile =
+        livingEngineWeightProfile;
+
+      const sampleSize =
+        Number(profile?.sampleSize) || 0;
+
+      return res.json({
+        ok: true,
+        mode:
+          ENGINE_WEIGHT_LEARNING_ENABLED
+            ? "ACTIVE"
+            : "SHADOW",
+        version:
+          "engine-learning-living-v2",
+        logs: sampleSize,
+        settlements: sampleSize,
+        performanceGroups:
+          profile ? 3 : 0,
+        running: true,
+        enabled:
+          ENGINE_WEIGHT_LEARNING_ENABLED,
+        profile,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de charger le statut Learning.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/internal/learning/engines/performance",
+  async (req, res) => {
+    try {
+      await ensureLivingEngineWeightTables();
+      await loadLivingEngineWeightProfile();
+
+      const profile =
+        livingEngineWeightProfile;
+
+      if (!profile) {
+        return res.json({
+          ok: true,
+          stats: [],
+          engineSummaries: [],
+        });
+      }
+
+      const engines = [
+        {
+          engine_name: "Form Engine",
+          engine_key: "form",
+          weight:
+            Number(profile.formWeight) || 0,
+          brier:
+            profile.formBrier,
+        },
+        {
+          engine_name: "Market Engine",
+          engine_key: "market",
+          weight:
+            Number(profile.marketWeight) || 0,
+          brier:
+            profile.marketBrier,
+        },
+        {
+          engine_name: "Monte Carlo Engine",
+          engine_key: "monteCarlo",
+          weight:
+            Number(
+              profile.monteCarloWeight
+            ) || 0,
+          brier:
+            profile.monteCarloBrier,
+        },
+      ];
+
+      const mapEngine = (engine) => ({
+        ...engine,
+        sample_size:
+          Number(profile.sampleSize) || 0,
+        selection_groups: 1,
+        engine_versions:
+          `profile-v${profile.version || 1}`,
+        accuracy: null,
+        average_probability: null,
+        calibration_gap: null,
+        brier_score:
+          engine.brier,
+        reliability_level:
+          Number(profile.sampleSize) >=
+          ENGINE_WEIGHT_MIN_SAMPLES
+            ? "RELIABLE"
+            : "INSUFFICIENT_DATA",
+        current_weight:
+          Number(
+            (
+              engine.weight * 100
+            ).toFixed(2)
+          ),
+        status:
+          profile.status,
+      });
+
+      const summaries =
+        engines.map(mapEngine);
+
+      return res.json({
+        ok: true,
+        stats: summaries,
+        engineSummaries: summaries,
+        profile,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de charger les performances des moteurs.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/internal/learning/engines/settle",
+  async (req, res) => {
+    try {
+      const result =
+        await rebuildLivingEngineWeights({
+          source:
+            "admin-compat-settle",
+        });
+
+      return res.status(
+        result.ok ? 200 : 500
+      ).json({
+        ...result,
+        found:
+          Number(
+            result.sampleSize
+          ) || 0,
+        settled:
+          Number(
+            result.sampleSize
+          ) || 0,
+        skipped: 0,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de régler les prédictions moteurs.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/internal/learning/engines/rebuild-performance",
+  async (req, res) => {
+    const result =
+      await rebuildLivingEngineWeights({
+        source:
+          "admin-compat-performance",
+      });
+
+    return res.status(
+      result.ok ? 200 : 500
+    ).json({
+      ...result,
+      groups:
+        result.profile ? 3 : 0,
+    });
   }
 );
 
@@ -23658,6 +23854,556 @@ app.get("/public/statistics/dashboard", async (req, res) => {
   }
 });
 
+const DEFAULT_BET_QUALIFICATION_CONFIG = Object.freeze({
+  safe: {
+    minimumBetScore: 85,
+    minimumDecisionScore: 82,
+    minimumReliability: 65,
+    minimumConsensus: 55,
+    maximumRisk: 65,
+  },
+  value: {
+    minimumBetScore: 74,
+    minimumDecisionScore: 65,
+    minimumReliability: 55,
+    minimumValuePercent: 0,
+    maximumRisk: 75,
+    requireBookmakerOdd: true,
+  },
+  opportunity: {
+    minimumBetScore: 65,
+    minimumDecisionScore: 60,
+    minimumReliability: 50,
+    maximumRisk: 80,
+  },
+  blocking: {
+    minimumProbability: 20,
+    maximumProbability: 95,
+    minimumReliability: 25,
+    maximumRisk: 90,
+  },
+});
+
+function betCalibrationNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function betCalibrationClamp(value, min, max) {
+  return Math.max(min, Math.min(max, betCalibrationNumber(value)));
+}
+
+function betCalibrationRound(value, decimals = 2) {
+  const factor = 10 ** decimals;
+  return Math.round(betCalibrationNumber(value) * factor) / factor;
+}
+
+function cloneBetConfig(value) {
+  return JSON.parse(JSON.stringify(value || DEFAULT_BET_QUALIFICATION_CONFIG));
+}
+
+async function ensureBetQualificationCalibrationTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qualified_bets (
+      id BIGSERIAL PRIMARY KEY,
+      fixture_id BIGINT NOT NULL,
+      market_key TEXT NOT NULL,
+      market_label TEXT,
+      category TEXT NOT NULL,
+      bet_score NUMERIC,
+      decision_score NUMERIC,
+      probability NUMERIC,
+      confidence NUMERIC,
+      consensus NUMERIC,
+      reliability NUMERIC,
+      risk NUMERIC,
+      value_percent NUMERIC,
+      bookmaker_odd NUMERIC,
+      qualification_version TEXT,
+      qualification_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      frozen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      kickoff TIMESTAMPTZ,
+      result_status TEXT NOT NULL DEFAULT 'PENDING',
+      won BOOLEAN,
+      profit_units NUMERIC,
+      roi_percent NUMERIC,
+      settled_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (fixture_id, market_key)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_qualified_bets_calibration
+    ON qualified_bets(category, result_status, bet_score);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bet_qualification_config (
+      id BIGSERIAL PRIMARY KEY,
+      version TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'INACTIVE',
+      mode TEXT NOT NULL DEFAULT 'AUTO_PROPOSE',
+      config JSONB NOT NULL,
+      source TEXT NOT NULL DEFAULT 'DEFAULT',
+      metrics_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      change_reason TEXT,
+      parent_config_id BIGINT REFERENCES bet_qualification_config(id),
+      active_from TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_bet_config
+    ON bet_qualification_config((status))
+    WHERE status = 'ACTIVE';
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bet_qualification_proposals (
+      id BIGSERIAL PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'PROPOSED',
+      source TEXT NOT NULL DEFAULT 'AUTO_PROPOSE',
+      current_config_id BIGINT REFERENCES bet_qualification_config(id),
+      proposed_config JSONB NOT NULL,
+      metrics_before JSONB NOT NULL DEFAULT '{}'::jsonb,
+      metrics_after JSONB NOT NULL DEFAULT '{}'::jsonb,
+      impact JSONB NOT NULL DEFAULT '{}'::jsonb,
+      reason TEXT,
+      generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_at TIMESTAMPTZ,
+      reviewed_by TEXT,
+      created_config_id BIGINT REFERENCES bet_qualification_config(id)
+    );
+  `);
+
+  const existing = await pool.query(`
+    SELECT id FROM bet_qualification_config
+    WHERE status = 'ACTIVE'
+    LIMIT 1
+  `);
+
+  if (existing.rows.length === 0) {
+    await pool.query(
+      `
+        INSERT INTO bet_qualification_config (
+          version, status, mode, config, source,
+          metrics_snapshot, change_reason, active_from
+        ) VALUES ($1, 'ACTIVE', 'AUTO_PROPOSE', $2::jsonb, 'DEFAULT', '{}'::jsonb, $3, NOW())
+        ON CONFLICT (version) DO NOTHING
+      `,
+      [
+        'bet-qualification-v1.0.0',
+        JSON.stringify(DEFAULT_BET_QUALIFICATION_CONFIG),
+        'Configuration initiale issue du BetQualificationEngine.',
+      ]
+    );
+  }
+}
+
+async function getActiveBetQualificationConfig() {
+  await ensureBetQualificationCalibrationTables();
+  const result = await pool.query(`
+    SELECT *
+    FROM bet_qualification_config
+    WHERE status = 'ACTIVE'
+    ORDER BY active_from DESC NULLS LAST, id DESC
+    LIMIT 1
+  `);
+
+  const row = result.rows[0];
+  return row
+    ? {
+        id: Number(row.id),
+        version: row.version,
+        status: row.status,
+        mode: row.mode,
+        config: row.config || cloneBetConfig(),
+        source: row.source,
+        metricsSnapshot: row.metrics_snapshot || {},
+        changeReason: row.change_reason,
+        activeFrom: row.active_from,
+        createdAt: row.created_at,
+      }
+    : null;
+}
+
+function evaluateBetRows(rows, config) {
+  const categories = ['SAFE', 'VALUE', 'OPPORTUNITY'];
+  const summary = {};
+
+  for (const category of categories) {
+    const key = category.toLowerCase();
+    const rules = config[key];
+    const selected = rows.filter((row) => {
+      const score = betCalibrationNumber(row.bet_score);
+      const decision = betCalibrationNumber(row.decision_score);
+      const reliability = betCalibrationNumber(row.reliability);
+      const consensus = betCalibrationNumber(row.consensus);
+      const risk = betCalibrationNumber(row.risk, 50);
+      const value = row.value_percent == null ? null : betCalibrationNumber(row.value_percent);
+      const odd = row.bookmaker_odd == null ? null : betCalibrationNumber(row.bookmaker_odd);
+
+      if (score < rules.minimumBetScore) return false;
+      if (decision < rules.minimumDecisionScore) return false;
+      if (reliability < rules.minimumReliability) return false;
+      if (risk > rules.maximumRisk) return false;
+      if (category === 'SAFE' && consensus < rules.minimumConsensus) return false;
+      if (category === 'VALUE') {
+        if (odd == null || odd <= 1) return false;
+        if (value == null || value < rules.minimumValuePercent) return false;
+      }
+      return true;
+    });
+
+    const settled = selected.filter((row) => ['WIN', 'LOSS', 'VOID'].includes(String(row.result_status || '').toUpperCase()));
+    const priced = settled.filter((row) => Number.isFinite(Number(row.profit_units)));
+    const wins = settled.filter((row) => row.won === true || String(row.result_status).toUpperCase() === 'WIN').length;
+    const profit = priced.reduce((sum, row) => sum + betCalibrationNumber(row.profit_units), 0);
+
+    summary[category] = {
+      volume: selected.length,
+      settled: settled.length,
+      priced: priced.length,
+      wins,
+      losses: settled.filter((row) => row.won === false || String(row.result_status).toUpperCase() === 'LOSS').length,
+      winRate: settled.length > 0 ? betCalibrationRound((wins / settled.length) * 100, 2) : null,
+      profitUnits: betCalibrationRound(profit, 2),
+      roi: priced.length > 0 ? betCalibrationRound((profit / priced.length) * 100, 2) : null,
+      averageOdd: priced.length > 0
+        ? betCalibrationRound(priced.reduce((sum, row) => sum + betCalibrationNumber(row.bookmaker_odd), 0) / priced.length, 2)
+        : null,
+      averageBetScore: selected.length > 0
+        ? betCalibrationRound(selected.reduce((sum, row) => sum + betCalibrationNumber(row.bet_score), 0) / selected.length, 2)
+        : null,
+    };
+  }
+
+  const pricedTotal = Object.values(summary).reduce((sum, item) => sum + item.priced, 0);
+  const profitTotal = Object.values(summary).reduce((sum, item) => sum + item.profitUnits, 0);
+
+  return {
+    categories: summary,
+    total: {
+      volume: Object.values(summary).reduce((sum, item) => sum + item.volume, 0),
+      settled: Object.values(summary).reduce((sum, item) => sum + item.settled, 0),
+      priced: pricedTotal,
+      profitUnits: betCalibrationRound(profitTotal, 2),
+      roi: pricedTotal > 0 ? betCalibrationRound((profitTotal / pricedTotal) * 100, 2) : null,
+    },
+  };
+}
+
+function generateCandidateConfigs(currentConfig) {
+  const candidates = [];
+  const deltas = [-2, -1, 0, 1, 2];
+
+  for (const category of ['safe', 'value', 'opportunity']) {
+    for (const delta of deltas) {
+      if (delta === 0) continue;
+      const candidate = cloneBetConfig(currentConfig);
+      candidate[category].minimumBetScore = betCalibrationClamp(
+        candidate[category].minimumBetScore + delta,
+        category === 'safe' ? 78 : category === 'value' ? 68 : 58,
+        95
+      );
+      candidates.push({
+        config: candidate,
+        category: category.toUpperCase(),
+        delta,
+        field: 'minimumBetScore',
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function proposalScore(before, after) {
+  const beforeRoi = before.total.roi;
+  const afterRoi = after.total.roi;
+  if (beforeRoi == null || afterRoi == null) return -Infinity;
+
+  const volumeRatio = before.total.priced > 0
+    ? after.total.priced / before.total.priced
+    : 0;
+  if (after.total.priced < 30 || volumeRatio < 0.55) return -Infinity;
+
+  const roiGain = afterRoi - beforeRoi;
+  const profitGain = after.total.profitUnits - before.total.profitUnits;
+  return roiGain * 3 + profitGain * 0.15 + Math.min(1, volumeRatio) * 2;
+}
+
+async function buildBetQualificationProposal() {
+  await ensureBetQualificationCalibrationTables();
+  const active = await getActiveBetQualificationConfig();
+  const rowsResult = await pool.query(`
+    SELECT
+      category, bet_score, decision_score, probability,
+      confidence, consensus, reliability, risk,
+      value_percent, bookmaker_odd, result_status,
+      won, profit_units, roi_percent, frozen_at
+    FROM qualified_bets
+    WHERE frozen_at >= NOW() - INTERVAL '365 days'
+      AND result_status IN ('WIN', 'LOSS', 'VOID')
+    ORDER BY frozen_at DESC
+  `);
+  const rows = rowsResult.rows;
+  const before = evaluateBetRows(rows, active.config);
+
+  if (before.total.priced < 100) {
+    return {
+      created: false,
+      reason: 'INSUFFICIENT_SAMPLE',
+      minimumRequired: 100,
+      pricedSample: before.total.priced,
+      active,
+      metrics: before,
+    };
+  }
+
+  let best = null;
+  for (const candidate of generateCandidateConfigs(active.config)) {
+    const after = evaluateBetRows(rows, candidate.config);
+    const score = proposalScore(before, after);
+    if (!best || score > best.score) {
+      best = { ...candidate, after, score };
+    }
+  }
+
+  if (!best || !Number.isFinite(best.score)) {
+    return {
+      created: false,
+      reason: 'NO_SAFE_IMPROVEMENT',
+      active,
+      metrics: before,
+    };
+  }
+
+  const roiGain = betCalibrationRound((best.after.total.roi || 0) - (before.total.roi || 0), 2);
+  const volumeChange = before.total.priced > 0
+    ? betCalibrationRound(((best.after.total.priced - before.total.priced) / before.total.priced) * 100, 2)
+    : 0;
+
+  if (roiGain < 0.75) {
+    return {
+      created: false,
+      reason: 'IMPROVEMENT_TOO_SMALL',
+      estimatedRoiGain: roiGain,
+      active,
+      metrics: before,
+    };
+  }
+
+  const reason = `${best.category}: ${best.field} ${best.delta > 0 ? '+' : ''}${best.delta}. ROI simulé ${roiGain >= 0 ? '+' : ''}${roiGain} %, volume ${volumeChange >= 0 ? '+' : ''}${volumeChange} %.`;
+
+  const inserted = await pool.query(
+    `
+      INSERT INTO bet_qualification_proposals (
+        status, source, current_config_id, proposed_config,
+        metrics_before, metrics_after, impact, reason
+      ) VALUES ('PROPOSED', 'AUTO_PROPOSE', $1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb, $6)
+      RETURNING *
+    `,
+    [
+      active.id,
+      JSON.stringify(best.config),
+      JSON.stringify(before),
+      JSON.stringify(best.after),
+      JSON.stringify({
+        changedCategory: best.category,
+        changedField: best.field,
+        delta: best.delta,
+        estimatedRoiGain: roiGain,
+        estimatedVolumeChangePercent: volumeChange,
+        score: betCalibrationRound(best.score, 3),
+      }),
+      reason,
+    ]
+  );
+
+  return {
+    created: true,
+    proposal: inserted.rows[0],
+    active,
+  };
+}
+
+app.get('/public/bet-qualification/config', async (req, res) => {
+  try {
+    const active = await getActiveBetQualificationConfig();
+    return res.json({ ok: true, active });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de charger la configuration.' });
+  }
+});
+
+app.get('/internal/bet-qualification/calibration/dashboard', async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  try {
+    await ensureBetQualificationCalibrationTables();
+    const active = await getActiveBetQualificationConfig();
+    const rowsResult = await pool.query(`
+      SELECT * FROM qualified_bets
+      WHERE frozen_at >= NOW() - INTERVAL '365 days'
+      ORDER BY frozen_at DESC
+    `);
+    const proposalsResult = await pool.query(`
+      SELECT * FROM bet_qualification_proposals
+      ORDER BY generated_at DESC
+      LIMIT 30
+    `);
+    const configsResult = await pool.query(`
+      SELECT id, version, status, mode, source, change_reason, active_from, created_at, config, metrics_snapshot
+      FROM bet_qualification_config
+      ORDER BY created_at DESC
+      LIMIT 20
+    `);
+
+    return res.json({
+      ok: true,
+      mode: active?.mode || 'AUTO_PROPOSE',
+      active,
+      metrics: evaluateBetRows(rowsResult.rows, active.config),
+      proposals: proposalsResult.rows,
+      versions: configsResult.rows,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de charger la calibration des paris.' });
+  }
+});
+
+app.post('/internal/bet-qualification/calibration/proposals/generate', async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  try {
+    const result = await buildBetQualificationProposal();
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de générer une proposition.' });
+  }
+});
+
+app.post('/internal/bet-qualification/calibration/proposals/:proposalId/approve', async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  const client = await pool.connect();
+  try {
+    await ensureBetQualificationCalibrationTables();
+    const proposalId = Number(req.params.proposalId);
+    if (!Number.isInteger(proposalId) || proposalId <= 0) {
+      return res.status(400).json({ ok: false, error: 'proposalId invalide.' });
+    }
+
+    await client.query('BEGIN');
+    const proposalResult = await client.query(
+      `SELECT * FROM bet_qualification_proposals WHERE id = $1 FOR UPDATE`,
+      [proposalId]
+    );
+    const proposal = proposalResult.rows[0];
+    if (!proposal) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'Proposition introuvable.' });
+    }
+    if (proposal.status !== 'PROPOSED') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ ok: false, error: 'Cette proposition a déjà été traitée.' });
+    }
+
+    await client.query(`UPDATE bet_qualification_config SET status = 'INACTIVE', updated_at = NOW() WHERE status = 'ACTIVE'`);
+    const version = `bet-qualification-auto-${Date.now()}`;
+    const configResult = await client.query(
+      `
+        INSERT INTO bet_qualification_config (
+          version, status, mode, config, source, metrics_snapshot,
+          change_reason, parent_config_id, active_from
+        ) VALUES ($1, 'ACTIVE', 'AUTO_PROPOSE', $2::jsonb, 'APPROVED_PROPOSAL', $3::jsonb, $4, $5, NOW())
+        RETURNING *
+      `,
+      [
+        version,
+        JSON.stringify(proposal.proposed_config),
+        JSON.stringify(proposal.metrics_after || {}),
+        proposal.reason,
+        proposal.current_config_id,
+      ]
+    );
+
+    await client.query(
+      `
+        UPDATE bet_qualification_proposals
+        SET status = 'APPROVED', reviewed_at = NOW(), reviewed_by = $2, created_config_id = $3
+        WHERE id = $1
+      `,
+      [proposalId, String(req.body?.reviewedBy || 'administrator').slice(0, 200), configResult.rows[0].id]
+    );
+    await client.query('COMMIT');
+    return res.json({ ok: true, active: configResult.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ ok: false, error: error?.message || 'Impossible d’approuver la proposition.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/internal/bet-qualification/calibration/proposals/:proposalId/reject', async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  try {
+    const proposalId = Number(req.params.proposalId);
+    const result = await pool.query(
+      `
+        UPDATE bet_qualification_proposals
+        SET status = 'REJECTED', reviewed_at = NOW(), reviewed_by = $2
+        WHERE id = $1 AND status = 'PROPOSED'
+        RETURNING *
+      `,
+      [proposalId, String(req.body?.reviewedBy || 'administrator').slice(0, 200)]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Proposition active introuvable.' });
+    }
+    return res.json({ ok: true, proposal: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de refuser la proposition.' });
+  }
+});
+
+app.post('/internal/bet-qualification/calibration/configs/:configId/rollback', async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  const client = await pool.connect();
+  try {
+    const configId = Number(req.params.configId);
+    await client.query('BEGIN');
+    const targetResult = await client.query(`SELECT * FROM bet_qualification_config WHERE id = $1 FOR UPDATE`, [configId]);
+    const target = targetResult.rows[0];
+    if (!target) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'Version introuvable.' });
+    }
+    await client.query(`UPDATE bet_qualification_config SET status = 'INACTIVE', updated_at = NOW() WHERE status = 'ACTIVE'`);
+    const version = `bet-qualification-rollback-${Date.now()}`;
+    const restored = await client.query(
+      `
+        INSERT INTO bet_qualification_config (
+          version, status, mode, config, source, metrics_snapshot,
+          change_reason, parent_config_id, active_from
+        ) VALUES ($1, 'ACTIVE', 'AUTO_PROPOSE', $2::jsonb, 'ROLLBACK', $3::jsonb, $4, $5, NOW())
+        RETURNING *
+      `,
+      [version, JSON.stringify(target.config), JSON.stringify(target.metrics_snapshot || {}), `Retour à la version ${target.version}.`, target.id]
+    );
+    await client.query('COMMIT');
+    return res.json({ ok: true, active: restored.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ ok: false, error: error?.message || 'Impossible de restaurer la version.' });
+  } finally {
+    client.release();
+  }
+});
+
 app.listen(
   PORT,
   "0.0.0.0",
@@ -23742,6 +24488,14 @@ app.listen(
       .catch((error) => {
         console.error(
           "ERREUR TABLES POIDS MOTEURS :",
+          error
+        );
+      });
+
+    ensureBetQualificationCalibrationTables()
+      .catch((error) => {
+        console.error(
+          "ERREUR TABLES CALIBRATION DES PARIS :",
           error
         );
       });
