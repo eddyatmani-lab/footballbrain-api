@@ -371,10 +371,63 @@ function collectEngineCandidates(snapshot = {}) {
     );
   }
 
-  return candidates.filter(
-    (candidate) =>
-      SUPPORTED_ENGINES.includes(candidate.engineName)
-  );
+  /*
+   * Ne pas limiter l'affichage aux dix moteurs historiques.
+   * Tout moteur présent dans le snapshot Brain Studio est journalisé.
+   */
+  const alreadyCollected =
+    new Set(
+      candidates.map(
+        (candidate) =>
+          candidate.engineName
+      )
+    );
+
+  for (
+    const [
+      rawEngineName,
+      rawOutput,
+    ] of Object.entries(engines)
+  ) {
+    if (
+      !rawEngineName ||
+      !rawOutput ||
+      typeof rawOutput !== "object" ||
+      alreadyCollected.has(
+        rawEngineName
+      )
+    ) {
+      continue;
+    }
+
+    const explicitSide =
+      voteMap.get(
+        rawEngineName
+      ) ||
+      rawOutput.predictedSide ||
+      rawOutput.side ||
+      rawOutput.selection ||
+      rawOutput.pick ||
+      rawOutput.outcome ||
+      "NEUTRAL";
+
+    const probabilityValue =
+      rawOutput.predictedProbability ??
+      rawOutput.probability ??
+      rawOutput.calibratedProbability ??
+      rawOutput.confidence ??
+      null;
+
+    push(
+      rawEngineName,
+      explicitSide,
+      probabilityValue,
+      rawOutput,
+      scoreOf(rawOutput)
+    );
+  }
+
+  return candidates;
 }
 
 function createEnginePredictionLog({ pool }) {

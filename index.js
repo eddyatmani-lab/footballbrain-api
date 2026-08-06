@@ -41,6 +41,9 @@ const {
 const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
+const {
+  createEngineLearningCore,
+} = require("./src/learning");
 const cors = require("cors");
 const {
   FootballMonteCarlo,
@@ -224,6 +227,32 @@ const pool = new Pool({
     rejectUnauthorized: false,
   },
 });
+const engineLearningCore =
+  createEngineLearningCore({
+    app,
+    pool,
+    /*
+     * La protection centrale du backend et ce guard
+     * utilisent la même ADMIN_API_KEY Railway.
+     */
+    adminGuard(req, res, next) {
+      if (
+        !requireOptionalAdminKey(
+          req,
+          res
+        )
+      ) {
+        return;
+      }
+
+      next();
+    },
+    schedulersEnabled:
+      AUTOMATIC_SCHEDULERS_ENABLED,
+  });
+
+engineLearningCore.registerRoutes();
+
 const aiEventEngine =
   createAIEventEngine({
     pool,
@@ -19375,197 +19404,155 @@ app.get(
 );
 
 
-/*
- * Compatibilité avec le tableau de bord Admin historique.
- * Ces routes exposent les données du nouveau Learning vivant
- * avec la forme attendue par l'interface existante.
- */
-app.get(
-  "/internal/learning/engines/status",
-  async (req, res) => {
+
+async function backfillAllEngineLearningLogs({
+  limit = 5000,
+  source = "manual",
+} = {}) {
+  await engineLearningCore.ensureTables();
+
+  const safeLimit = Math.max(
+    1,
+    Math.min(
+      20000,
+      Number(limit) || 5000
+    )
+  );
+
+  const result =
+    await pool.query(
+      `
+        SELECT
+          fixture_id,
+          studio_snapshot,
+          studio_analysis_version,
+          studio_market_key,
+          studio_market_label,
+          studio_probability,
+          studio_decision_type,
+          studio_decision_grade
+        FROM predictions
+        WHERE fixture_id IS NOT NULL
+          AND studio_snapshot IS NOT NULL
+          AND jsonb_typeof(
+            studio_snapshot
+          ) = 'object'
+        ORDER BY
+          fixture_date DESC NULLS LAST,
+          updated_at DESC NULLS LAST
+        LIMIT $1
+      `,
+      [safeLimit]
+    );
+
+  let fixtures = 0;
+  let inserted = 0;
+  let skipped = 0;
+  const errors = [];
+
+  for (const row of result.rows) {
     try {
-      await ensureLivingEngineWeightTables();
-      await loadLivingEngineWeightProfile();
+      const primaryMarket = {
+        key:
+          row.studio_market_key,
+        label:
+          row.studio_market_label,
+        probability:
+          row.studio_probability,
+        decision: {
+          type:
+            row.studio_decision_type,
+          grade:
+            row.studio_decision_grade,
+        },
+      };
 
-      const profile =
-        livingEngineWeightProfile;
+      const logged =
+        await engineLearningCore
+          .logStudioSnapshot({
+            fixtureId:
+              row.fixture_id,
+            snapshot:
+              row.studio_snapshot,
+            analysisVersion:
+              row.studio_analysis_version,
+            primaryMarket,
+          });
 
-      const sampleSize =
-        Number(profile?.sampleSize) || 0;
+      fixtures += 1;
+      inserted +=
+        Number(logged?.inserted) || 0;
 
-      return res.json({
-        ok: true,
-        mode:
-          ENGINE_WEIGHT_LEARNING_ENABLED
-            ? "ACTIVE"
-            : "SHADOW",
-        version:
-          "engine-learning-living-v2",
-        logs: sampleSize,
-        settlements: sampleSize,
-        performanceGroups:
-          profile ? 3 : 0,
-        running: true,
-        enabled:
-          ENGINE_WEIGHT_LEARNING_ENABLED,
-        profile,
-      });
-    } catch (error) {
-      return res.status(500).json({
-        ok: false,
-        error:
-          error?.message ||
-          "Impossible de charger le statut Learning.",
-      });
-    }
-  }
-);
-
-app.get(
-  "/internal/learning/engines/performance",
-  async (req, res) => {
-    try {
-      await ensureLivingEngineWeightTables();
-      await loadLivingEngineWeightProfile();
-
-      const profile =
-        livingEngineWeightProfile;
-
-      if (!profile) {
-        return res.json({
-          ok: true,
-          stats: [],
-          engineSummaries: [],
-        });
+      if (logged?.skipped) {
+        skipped += 1;
       }
-
-      const engines = [
-        {
-          engine_name: "Form Engine",
-          engine_key: "form",
-          weight:
-            Number(profile.formWeight) || 0,
-          brier:
-            profile.formBrier,
-        },
-        {
-          engine_name: "Market Engine",
-          engine_key: "market",
-          weight:
-            Number(profile.marketWeight) || 0,
-          brier:
-            profile.marketBrier,
-        },
-        {
-          engine_name: "Monte Carlo Engine",
-          engine_key: "monteCarlo",
-          weight:
-            Number(
-              profile.monteCarloWeight
-            ) || 0,
-          brier:
-            profile.monteCarloBrier,
-        },
-      ];
-
-      const mapEngine = (engine) => ({
-        ...engine,
-        sample_size:
-          Number(profile.sampleSize) || 0,
-        selection_groups: 1,
-        engine_versions:
-          `profile-v${profile.version || 1}`,
-        accuracy: null,
-        average_probability: null,
-        calibration_gap: null,
-        brier_score:
-          engine.brier,
-        reliability_level:
-          Number(profile.sampleSize) >=
-          ENGINE_WEIGHT_MIN_SAMPLES
-            ? "RELIABLE"
-            : "INSUFFICIENT_DATA",
-        current_weight:
-          Number(
-            (
-              engine.weight * 100
-            ).toFixed(2)
-          ),
-        status:
-          profile.status,
-      });
-
-      const summaries =
-        engines.map(mapEngine);
-
-      return res.json({
-        ok: true,
-        stats: summaries,
-        engineSummaries: summaries,
-        profile,
-      });
     } catch (error) {
-      return res.status(500).json({
-        ok: false,
+      errors.push({
+        fixtureId:
+          row.fixture_id,
         error:
           error?.message ||
-          "Impossible de charger les performances des moteurs.",
+          String(error),
       });
     }
   }
-);
+
+  return {
+    ok: errors.length === 0,
+    source,
+    rowsFound:
+      result.rows.length,
+    fixtures,
+    inserted,
+    skipped,
+    errors:
+      errors.slice(0, 50),
+  };
+}
 
 app.post(
-  "/internal/learning/engines/settle",
+  "/internal/learning/engines/backfill-all",
   async (req, res) => {
+    if (
+      !requireOptionalAdminKey(
+        req,
+        res
+      )
+    ) {
+      return;
+    }
+
     try {
       const result =
-        await rebuildLivingEngineWeights({
+        await backfillAllEngineLearningLogs({
+          limit:
+            req.body?.limit ||
+            10000,
           source:
-            "admin-compat-settle",
+            "admin-backfill",
         });
 
-      return res.status(
-        result.ok ? 200 : 500
-      ).json({
+      const settlement =
+        await engineLearningCore
+          .runSettlement();
+
+      const performance =
+        await engineLearningCore
+          .rebuildPerformance();
+
+      return res.json({
         ...result,
-        found:
-          Number(
-            result.sampleSize
-          ) || 0,
-        settled:
-          Number(
-            result.sampleSize
-          ) || 0,
-        skipped: 0,
+        settlement,
+        performance,
       });
     } catch (error) {
       return res.status(500).json({
         ok: false,
         error:
           error?.message ||
-          "Impossible de régler les prédictions moteurs.",
+          String(error),
       });
     }
-  }
-);
-
-app.post(
-  "/internal/learning/engines/rebuild-performance",
-  async (req, res) => {
-    const result =
-      await rebuildLivingEngineWeights({
-        source:
-          "admin-compat-performance",
-      });
-
-    return res.status(
-      result.ok ? 200 : 500
-    ).json({
-      ...result,
-      groups:
-        result.profile ? 3 : 0,
-    });
   }
 );
 
@@ -24488,6 +24475,52 @@ app.listen(
       .catch((error) => {
         console.error(
           "ERREUR TABLES POIDS MOTEURS :",
+          error
+        );
+      });
+
+    engineLearningCore
+      .ensureTables()
+      .then(() => {
+        engineLearningCore
+          .startScheduler();
+
+        setTimeout(() => {
+          backfillAllEngineLearningLogs({
+            limit: 10000,
+            source:
+              "automatic-startup-backfill",
+          })
+            .then(async (result) => {
+              console.log(
+                "✅ Backfill moteurs IA :",
+                result
+              );
+
+              const settlement =
+                await engineLearningCore
+                  .runSettlement();
+
+              if (
+                Number(
+                  settlement?.settled
+                ) > 0
+              ) {
+                await engineLearningCore
+                  .rebuildPerformance();
+              }
+            })
+            .catch((error) => {
+              console.error(
+                "ERREUR BACKFILL MOTEURS IA :",
+                error
+              );
+            });
+        }, 45 * 1000);
+      })
+      .catch((error) => {
+        console.error(
+          "ERREUR ENGINE LEARNING COMPLET :",
           error
         );
       });

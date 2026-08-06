@@ -308,175 +308,19 @@ function createEnginePerformanceService({ pool }) {
   }
 
   async function getPerformance() {
-    const [detailResult, globalResult] =
-      await Promise.all([
-        pool.query(`
-          SELECT *
-          FROM engine_performance_stats
-          ORDER BY
-            engine_name ASC,
-            sample_size DESC,
-            predicted_side ASC
-        `),
-
-        /*
-         * Vue globale : toutes les sélections d'un même moteur
-         * sont réunies pour le pilotage des poids.
-         *
-         * Les statistiques par sélection restent disponibles dans
-         * `stats` pour le diagnostic détaillé.
-         */
-        pool.query(`
-          SELECT
-            engine_name,
-
-            STRING_AGG(
-              DISTINCT engine_version,
-              ', ' ORDER BY engine_version
-            ) AS engine_versions,
-
-            SUM(sample_size)::INTEGER
-              AS sample_size,
-
-            SUM(wins)::INTEGER
-              AS wins,
-
-            SUM(losses)::INTEGER
-              AS losses,
-
-            CASE
-              WHEN SUM(sample_size) > 0
-              THEN
-                SUM(wins) * 100.0 /
-                SUM(sample_size)
-              ELSE NULL
-            END AS accuracy,
-
-            CASE
-              WHEN SUM(sample_size) > 0
-              THEN
-                SUM(
-                  COALESCE(
-                    average_probability,
-                    0
-                  ) * sample_size
-                ) /
-                SUM(sample_size)
-              ELSE NULL
-            END AS average_probability,
-
-            CASE
-              WHEN SUM(sample_size) > 0
-              THEN
-                SUM(
-                  COALESCE(
-                    actual_frequency,
-                    0
-                  ) * sample_size
-                ) /
-                SUM(sample_size)
-              ELSE NULL
-            END AS actual_frequency,
-
-            CASE
-              WHEN SUM(sample_size) > 0
-              THEN
-                SUM(
-                  COALESCE(
-                    calibration_gap,
-                    0
-                  ) * sample_size
-                ) /
-                SUM(sample_size)
-              ELSE NULL
-            END AS calibration_gap,
-
-            CASE
-              WHEN SUM(sample_size) > 0
-              THEN
-                SUM(
-                  COALESCE(
-                    brier_score,
-                    0
-                  ) * sample_size
-                ) /
-                SUM(sample_size)
-              ELSE NULL
-            END AS brier_score,
-
-            CASE
-              WHEN SUM(sample_size) > 0
-              THEN
-                SUM(
-                  COALESCE(
-                    log_loss,
-                    0
-                  ) * sample_size
-                ) /
-                SUM(sample_size)
-              ELSE NULL
-            END AS log_loss,
-
-            CASE
-              WHEN SUM(sample_size) > 0
-              THEN
-                SUM(
-                  COALESCE(
-                    average_absolute_error,
-                    0
-                  ) * sample_size
-                ) /
-                SUM(sample_size)
-              ELSE NULL
-            END AS average_absolute_error,
-
-            COUNT(*)::INTEGER
-              AS selection_groups,
-
-            ARRAY_AGG(
-              predicted_side
-              ORDER BY predicted_side
-            ) AS selections
-
-          FROM engine_performance_stats
-          GROUP BY engine_name
-          ORDER BY
-            SUM(sample_size) DESC,
-            engine_name ASC
-        `),
-      ]);
-
-    const engineSummaries =
-      globalResult.rows.map((row) => {
-        const sampleSize =
-          Number(row.sample_size) || 0;
-
-        const brier =
-          row.brier_score == null
-            ? null
-            : Number(row.brier_score);
-
-        return {
-          ...row,
-          reliability_level:
-            reliabilityLevel(
-              sampleSize,
-              brier
-            ),
-        };
-      });
+    const result = await pool.query(`
+      SELECT *
+      FROM engine_performance_stats
+      ORDER BY
+        engine_name ASC,
+        sample_size DESC,
+        predicted_side ASC
+    `);
 
     return {
       ok: true,
-      count: detailResult.rows.length,
-      engineCount: engineSummaries.length,
-
-      /* Vue principale du Dashboard. */
-      engineSummaries,
-
-      /* Vue détaillée par HOME/AWAY/BTTS/etc. */
-      stats: detailResult.rows,
-
+      count: result.rows.length,
+      stats: result.rows,
       generatedAt: new Date().toISOString(),
     };
   }
