@@ -20357,28 +20357,48 @@ function requireOptionalAdminKey(req, res) {
     return true;
   }
 
-  const receivedKey = String(
+  const headerKey = String(
     req.headers["x-admin-key"] || ""
   ).trim();
+
+  const authorizationHeader = String(
+    req.headers.authorization || ""
+  ).trim();
+
+  const bearerKey =
+    authorizationHeader
+      .toLowerCase()
+      .startsWith("bearer ")
+      ? authorizationHeader
+          .slice(7)
+          .trim()
+      : "";
+
+  const receivedKey =
+    headerKey || bearerKey;
 
   if (receivedKey === configuredKey) {
     return true;
   }
 
-  console.error("ADMIN KEY MISMATCH", {
-    configuredLength: configuredKey.length,
-    receivedLength: receivedKey.length,
-    receivedPresent: Boolean(receivedKey),
-  });
+  console.error(
+    "ADMIN KEY MISMATCH",
+    {
+      configuredLength:
+        configuredKey.length,
+      xAdminKeyLength:
+        headerKey.length,
+      bearerKeyLength:
+        bearerKey.length,
+      receivedPresent:
+        Boolean(receivedKey),
+    }
+  );
 
   res.status(401).json({
     ok: false,
-    error: "Clé administrateur invalide.",
-    debug: {
-      configuredLength: configuredKey.length,
-      receivedLength: receivedKey.length,
-      receivedPresent: Boolean(receivedKey),
-    },
+    error:
+      "Clé administrateur invalide.",
   });
 
   return false;
