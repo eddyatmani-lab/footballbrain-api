@@ -61,6 +61,20 @@ const {
   createMarketExplainability,
 } = require("./core/explainability/decisionExplainability");
 const app = express();
+function requireAdminKey(req, res) {
+  const adminKey = req.get("x-admin-key");
+
+  if (adminKey !== process.env.ADMIN_API_KEY) {
+    res.status(403).json({
+      ok: false,
+      error: "Clé administrateur invalide.",
+    });
+
+    return false;
+  }
+
+  return true;
+}
 const ALLOWED_ORIGINS = new Set([
   "https://footballaipro.fr",
   "https://www.footballaipro.fr",
@@ -1012,6 +1026,11 @@ async function syncLeagueManagerCatalogue({ forceRefresh = false } = {}) {
 app.get(
   "/internal/league-manager/leagues",
   async (req, res) => {
+
+    if (!requireAdminKey(req, res)) {
+      return;
+    }
+
     try {
       await ensureLeagueManagerTables();
 
@@ -1152,6 +1171,11 @@ app.get(
 app.post(
   "/internal/league-manager/sync",
   async (req, res) => {
+
+    if (!requireAdminKey(req, res)) {
+      return;
+    }
+
     try {
       await ensureLeagueManagerTables();
 
@@ -1181,6 +1205,11 @@ app.post(
 app.patch(
   "/internal/league-manager/leagues/:leagueId",
   async (req, res) => {
+
+    if (!requireAdminKey(req, res)) {
+      return;
+    }
+
     try {
       await ensureLeagueManagerTables();
 
@@ -1267,6 +1296,11 @@ app.patch(
 app.post(
   "/internal/league-manager/bulk",
   async (req, res) => {
+
+    if (!requireAdminKey(req, res)) {
+      return;
+    }
+
     try {
       await ensureLeagueManagerTables();
 
