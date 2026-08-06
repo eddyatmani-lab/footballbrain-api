@@ -2266,31 +2266,272 @@ app.get("/internal/predictions/:fixtureId", async (req, res) => {
   }
 });
 
+
+const ENGINE_WEIGHT_LEARNING_ENABLED = [
+  "1",
+  "true",
+  "yes",
+  "oui",
+  "on",
+].includes(
+  String(
+    process.env
+      .ENGINE_WEIGHT_LEARNING_ENABLED ||
+      "false"
+  )
+    .trim()
+    .toLowerCase()
+);
+
+const ENGINE_WEIGHT_MIN_SAMPLES =
+  Math.max(
+    100,
+    Number(
+      process.env
+        .ENGINE_WEIGHT_MIN_SAMPLES ||
+        200
+    ) || 200
+  );
+
+const ENGINE_WEIGHT_MAX_STEP =
+  Math.min(
+    0.02,
+    Math.max(
+      0.0025,
+      Number(
+        process.env
+          .ENGINE_WEIGHT_MAX_STEP ||
+          0.01
+      ) || 0.01
+    )
+  );
+
+const ENGINE_WEIGHT_MIN_VALUE =
+  Math.max(
+    0.05,
+    Math.min(
+      0.25,
+      Number(
+        process.env
+          .ENGINE_WEIGHT_MIN_VALUE ||
+          0.1
+      ) || 0.1
+    )
+  );
+
+const ENGINE_WEIGHT_MAX_VALUE =
+  Math.max(
+    0.4,
+    Math.min(
+      0.8,
+      Number(
+        process.env
+          .ENGINE_WEIGHT_MAX_VALUE ||
+          0.65
+      ) || 0.65
+    )
+  );
+
+const ENGINE_WEIGHT_PROFILE_KEY =
+  "1X2_GLOBAL";
+
+let livingEngineWeightProfile = null;
+let livingEngineWeightRefreshRunning = false;
+
+function clampEngineWeight(
+  value,
+  min = ENGINE_WEIGHT_MIN_VALUE,
+  max = ENGINE_WEIGHT_MAX_VALUE
+) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return min;
+  }
+
+  return Math.max(
+    min,
+    Math.min(max, number)
+  );
+}
+
+function normalizeEngineWeights(
+  weights
+) {
+  const safe = {
+    form: clampEngineWeight(
+      weights?.form
+    ),
+    market: clampEngineWeight(
+      weights?.market
+    ),
+    monteCarlo: clampEngineWeight(
+      weights?.monteCarlo
+    ),
+  };
+
+  const total =
+    safe.form +
+    safe.market +
+    safe.monteCarlo;
+
+  if (!Number.isFinite(total) || total <= 0) {
+    return {
+      form: 0.35,
+      market: 0.4,
+      monteCarlo: 0.25,
+    };
+  }
+
+  return {
+    form:
+      safe.form / total,
+    market:
+      safe.market / total,
+    monteCarlo:
+      safe.monteCarlo / total,
+  };
+}
+
+function getBaseEngineWeights(
+  xgConfidenceLevel
+) {
+  let monteCarloWeight = 0.05;
+
+  if (xgConfidenceLevel === "HIGH") {
+    monteCarloWeight = 0.25;
+  } else if (
+    xgConfidenceLevel === "MEDIUM"
+  ) {
+    monteCarloWeight = 0.15;
+  }
+
+  const remainingWeight =
+    1 - monteCarloWeight;
+
+  return normalizeEngineWeights({
+    form:
+      remainingWeight * (35 / 75),
+    market:
+      remainingWeight * (40 / 75),
+    monteCarlo:
+      monteCarloWeight,
+  });
+}
+
+function getLivingEngineWeights(
+  xgConfidenceLevel
+) {
+  const base =
+    getBaseEngineWeights(
+      xgConfidenceLevel
+    );
+
+  if (
+    !ENGINE_WEIGHT_LEARNING_ENABLED ||
+    !livingEngineWeightProfile ||
+    livingEngineWeightProfile.status !==
+      "ACTIVE"
+  ) {
+    return {
+      ...base,
+      source: "BASE_MODEL",
+      profileVersion: null,
+    };
+  }
+
+  const learned =
+    normalizeEngineWeights({
+      form:
+        livingEngineWeightProfile
+          .formWeight,
+      market:
+        livingEngineWeightProfile
+          .marketWeight,
+      monteCarlo:
+        livingEngineWeightProfile
+          .monteCarloWeight,
+    });
+
+  /*
+   * La confiance xG reste un garde-fou :
+   * Monte Carlo ne peut pas prendre un poids
+   * élevé lorsque ses entrées xG sont faibles.
+   */
+  const monteCarloCeiling =
+    xgConfidenceLevel === "HIGH"
+      ? 0.4
+      : xgConfidenceLevel === "MEDIUM"
+      ? 0.25
+      : 0.12;
+
+  const constrainedMonteCarlo =
+    Math.min(
+      learned.monteCarlo,
+      monteCarloCeiling
+    );
+
+  const nonMonteTotal =
+    learned.form +
+    learned.market;
+
+  const remaining =
+    1 - constrainedMonteCarlo;
+
+  const adjusted =
+    normalizeEngineWeights({
+      form:
+        nonMonteTotal > 0
+          ? remaining *
+            (
+              learned.form /
+              nonMonteTotal
+            )
+          : base.form,
+      market:
+        nonMonteTotal > 0
+          ? remaining *
+            (
+              learned.market /
+              nonMonteTotal
+            )
+          : base.market,
+      monteCarlo:
+        constrainedMonteCarlo,
+    });
+
+  return {
+    ...adjusted,
+    source:
+      "LEARNING_ENGINE",
+    profileVersion:
+      livingEngineWeightProfile
+        .version,
+  };
+}
+
 function computeFootballBrainDecision(
   footballBrain,
   market,
   monteCarloModel,
   xgConfidence
 ) {
-    const xgConfidenceLevel =
-  xgConfidence?.level || "LOW";
+  const xgConfidenceLevel =
+    xgConfidence?.level || "LOW";
 
-let monteCarloWeight = 0.05;
+  const livingWeights =
+    getLivingEngineWeights(
+      xgConfidenceLevel
+    );
 
-if (xgConfidenceLevel === "HIGH") {
-  monteCarloWeight = 0.25;
-} else if (xgConfidenceLevel === "MEDIUM") {
-  monteCarloWeight = 0.15;
-}
+  const formWeight =
+    livingWeights.form;
 
-const remainingWeight =
-  1 - monteCarloWeight;
+  const marketWeight =
+    livingWeights.market;
 
-const formWeight =
-  remainingWeight * (35 / 75);
-
-const marketWeight =
-  remainingWeight * (40 / 75);
+  const monteCarloWeight =
+    livingWeights.monteCarlo;
   const homeFormScore = footballBrain.homeScore || 0;
   const awayFormScore = footballBrain.awayScore || 0;
 
@@ -2589,6 +2830,10 @@ const explainability =
       form: formWeight,
       market: marketWeight,
       monteCarlo: monteCarloWeight,
+      source:
+        livingWeights.source,
+      profileVersion:
+        livingWeights.profileVersion,
     },
     modelInputs: {
       form: {
@@ -2645,6 +2890,10 @@ return {
       monteCarloWeight.toFixed(3)
     ),
     xgConfidenceLevel,
+    source:
+      livingWeights.source,
+    profileVersion:
+      livingWeights.profileVersion,
   },
 modelInputs: {
   form: {
@@ -18298,12 +18547,840 @@ async function evaluateActiveCalibrations({
 }
 
 
+
+async function ensureLivingEngineWeightTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS engine_weight_profiles (
+      profile_key TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'OBSERVING',
+      version INTEGER NOT NULL DEFAULT 1,
+
+      form_weight NUMERIC(8,6) NOT NULL DEFAULT 0.35,
+      market_weight NUMERIC(8,6) NOT NULL DEFAULT 0.40,
+      monte_carlo_weight NUMERIC(8,6) NOT NULL DEFAULT 0.25,
+
+      form_brier NUMERIC(12,8),
+      market_brier NUMERIC(12,8),
+      monte_carlo_brier NUMERIC(12,8),
+
+      sample_size INTEGER NOT NULL DEFAULT 0,
+      reason TEXT,
+      previous_weights JSONB,
+      proposed_weights JSONB,
+
+      calculated_at TIMESTAMPTZ,
+      activated_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS engine_weight_events (
+      id BIGSERIAL PRIMARY KEY,
+      profile_key TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      previous_weights JSONB,
+      new_weights JSONB,
+      sample_size INTEGER,
+      metrics JSONB,
+      reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS
+      engine_weight_events_profile_created_idx
+    ON engine_weight_events (
+      profile_key,
+      created_at DESC
+    );
+  `);
+}
+
+function parseEngineProbabilityVector(
+  modelInputs,
+  engineKey
+) {
+  const engine =
+    modelInputs?.[engineKey] ||
+    modelInputs?.[
+      engineKey === "monteCarlo"
+        ? "monte_carlo"
+        : engineKey
+    ] ||
+    null;
+
+  if (!engine) {
+    return null;
+  }
+
+  const values = {
+    home:
+      Number(engine.home),
+    draw:
+      Number(engine.draw),
+    away:
+      Number(engine.away),
+  };
+
+  if (
+    !Number.isFinite(values.home) ||
+    !Number.isFinite(values.draw) ||
+    !Number.isFinite(values.away)
+  ) {
+    return null;
+  }
+
+  /*
+   * Les snapshots historiques utilisent
+   * selon les versions des ratios 0..1
+   * ou des pourcentages 0..100.
+   */
+  const divisor =
+    Math.max(
+      values.home,
+      values.draw,
+      values.away
+    ) > 1.5
+      ? 100
+      : 1;
+
+  const normalized = {
+    home:
+      values.home / divisor,
+    draw:
+      values.draw / divisor,
+    away:
+      values.away / divisor,
+  };
+
+  const total =
+    normalized.home +
+    normalized.draw +
+    normalized.away;
+
+  if (
+    !Number.isFinite(total) ||
+    total <= 0
+  ) {
+    return null;
+  }
+
+  return {
+    home:
+      normalized.home / total,
+    draw:
+      normalized.draw / total,
+    away:
+      normalized.away / total,
+  };
+}
+
+function calculateMulticlassBrier(
+  probabilityVector,
+  actualOutcome
+) {
+  if (!probabilityVector) {
+    return null;
+  }
+
+  const outcomes = [
+    "home",
+    "draw",
+    "away",
+  ];
+
+  const score =
+    outcomes.reduce(
+      (sum, outcome) => {
+        const actual =
+          outcome === actualOutcome
+            ? 1
+            : 0;
+
+        const probability =
+          Number(
+            probabilityVector[
+              outcome
+            ]
+          );
+
+        return (
+          sum +
+          Math.pow(
+            probability - actual,
+            2
+          )
+        );
+      },
+      0
+    ) / outcomes.length;
+
+  return Number.isFinite(score)
+    ? score
+    : null;
+}
+
+function resolvePredictionOutcome(row) {
+  const homeGoals =
+    Number(row.home_goals);
+
+  const awayGoals =
+    Number(row.away_goals);
+
+  if (
+    !Number.isFinite(homeGoals) ||
+    !Number.isFinite(awayGoals)
+  ) {
+    return null;
+  }
+
+  if (homeGoals > awayGoals) {
+    return "home";
+  }
+
+  if (homeGoals < awayGoals) {
+    return "away";
+  }
+
+  return "draw";
+}
+
+function moveWeightTowardTarget({
+  current,
+  target,
+  maximumStep,
+}) {
+  const delta =
+    target - current;
+
+  if (
+    Math.abs(delta) <=
+    maximumStep
+  ) {
+    return target;
+  }
+
+  return (
+    current +
+    Math.sign(delta) *
+      maximumStep
+  );
+}
+
+async function loadLivingEngineWeightProfile() {
+  await ensureLivingEngineWeightTables();
+
+  const result =
+    await pool.query(
+      `
+        SELECT
+          profile_key,
+          status,
+          version,
+          form_weight,
+          market_weight,
+          monte_carlo_weight,
+          form_brier,
+          market_brier,
+          monte_carlo_brier,
+          sample_size,
+          reason,
+          calculated_at,
+          activated_at,
+          updated_at
+        FROM engine_weight_profiles
+        WHERE profile_key = $1
+        LIMIT 1
+      `,
+      [
+        ENGINE_WEIGHT_PROFILE_KEY,
+      ]
+    );
+
+  const row =
+    result.rows[0];
+
+  if (!row) {
+    livingEngineWeightProfile =
+      null;
+
+    return null;
+  }
+
+  livingEngineWeightProfile = {
+    profileKey:
+      row.profile_key,
+    status:
+      row.status,
+    version:
+      Number(row.version) || 1,
+    formWeight:
+      Number(row.form_weight),
+    marketWeight:
+      Number(row.market_weight),
+    monteCarloWeight:
+      Number(
+        row.monte_carlo_weight
+      ),
+    formBrier:
+      row.form_brier == null
+        ? null
+        : Number(row.form_brier),
+    marketBrier:
+      row.market_brier == null
+        ? null
+        : Number(row.market_brier),
+    monteCarloBrier:
+      row.monte_carlo_brier == null
+        ? null
+        : Number(
+            row.monte_carlo_brier
+          ),
+    sampleSize:
+      Number(row.sample_size) || 0,
+    reason:
+      row.reason,
+    calculatedAt:
+      row.calculated_at,
+    activatedAt:
+      row.activated_at,
+    updatedAt:
+      row.updated_at,
+  };
+
+  return livingEngineWeightProfile;
+}
+
+async function rebuildLivingEngineWeights({
+  source = "scheduler",
+} = {}) {
+  if (livingEngineWeightRefreshRunning) {
+    return {
+      ok: true,
+      skipped: true,
+      reason:
+        "ENGINE_WEIGHT_REFRESH_ALREADY_RUNNING",
+    };
+  }
+
+  livingEngineWeightRefreshRunning =
+    true;
+
+  const startedAt =
+    new Date().toISOString();
+
+  try {
+    await ensureLivingEngineWeightTables();
+
+    const result =
+      await pool.query(`
+        SELECT
+          model_inputs,
+          home_goals,
+          away_goals
+        FROM predictions
+        WHERE result_status = 'FINISHED'
+          AND model_inputs IS NOT NULL
+          AND home_goals IS NOT NULL
+          AND away_goals IS NOT NULL
+        ORDER BY fixture_date DESC NULLS LAST
+        LIMIT 10000
+      `);
+
+    const metrics = {
+      form: {
+        count: 0,
+        brierTotal: 0,
+      },
+      market: {
+        count: 0,
+        brierTotal: 0,
+      },
+      monteCarlo: {
+        count: 0,
+        brierTotal: 0,
+      },
+    };
+
+    for (const row of result.rows) {
+      const actualOutcome =
+        resolvePredictionOutcome(row);
+
+      if (!actualOutcome) {
+        continue;
+      }
+
+      const modelInputs =
+        row.model_inputs || {};
+
+      for (const engineKey of [
+        "form",
+        "market",
+        "monteCarlo",
+      ]) {
+        const probabilities =
+          parseEngineProbabilityVector(
+            modelInputs,
+            engineKey
+          );
+
+        const brier =
+          calculateMulticlassBrier(
+            probabilities,
+            actualOutcome
+          );
+
+        if (
+          brier == null
+        ) {
+          continue;
+        }
+
+        metrics[engineKey].count += 1;
+        metrics[
+          engineKey
+        ].brierTotal += brier;
+      }
+    }
+
+    const counts = [
+      metrics.form.count,
+      metrics.market.count,
+      metrics.monteCarlo.count,
+    ];
+
+    const commonSampleSize =
+      Math.min(...counts);
+
+    const briers = {
+      form:
+        metrics.form.count > 0
+          ? metrics.form.brierTotal /
+            metrics.form.count
+          : null,
+      market:
+        metrics.market.count > 0
+          ? metrics.market.brierTotal /
+            metrics.market.count
+          : null,
+      monteCarlo:
+        metrics.monteCarlo.count > 0
+          ? metrics.monteCarlo
+              .brierTotal /
+            metrics.monteCarlo.count
+          : null,
+    };
+
+    const existingResult =
+      await pool.query(
+        `
+          SELECT *
+          FROM engine_weight_profiles
+          WHERE profile_key = $1
+          LIMIT 1
+        `,
+        [
+          ENGINE_WEIGHT_PROFILE_KEY,
+        ]
+      );
+
+    const existing =
+      existingResult.rows[0] ||
+      null;
+
+    const currentWeights =
+      normalizeEngineWeights({
+        form:
+          existing?.form_weight ??
+          0.35,
+        market:
+          existing?.market_weight ??
+          0.4,
+        monteCarlo:
+          existing
+            ?.monte_carlo_weight ??
+          0.25,
+      });
+
+    let status =
+      "OBSERVING";
+
+    let reason =
+      "INSUFFICIENT_ENGINE_SAMPLES";
+
+    let nextWeights =
+      currentWeights;
+
+    if (
+      ENGINE_WEIGHT_LEARNING_ENABLED &&
+      commonSampleSize >=
+        ENGINE_WEIGHT_MIN_SAMPLES &&
+      Object.values(
+        briers
+      ).every(Number.isFinite)
+    ) {
+      /*
+       * Une erreur Brier faible signifie
+       * un moteur plus fiable. L'inverse
+       * de l'erreur devient son score.
+       */
+      const quality = {
+        form:
+          1 /
+          Math.max(
+            briers.form,
+            0.0001
+          ),
+        market:
+          1 /
+          Math.max(
+            briers.market,
+            0.0001
+          ),
+        monteCarlo:
+          1 /
+          Math.max(
+            briers.monteCarlo,
+            0.0001
+          ),
+      };
+
+      const qualityTotal =
+        quality.form +
+        quality.market +
+        quality.monteCarlo;
+
+      const targetWeights =
+        normalizeEngineWeights({
+          form:
+            quality.form /
+            qualityTotal,
+          market:
+            quality.market /
+            qualityTotal,
+          monteCarlo:
+            quality.monteCarlo /
+            qualityTotal,
+        });
+
+      nextWeights =
+        normalizeEngineWeights({
+          form:
+            moveWeightTowardTarget({
+              current:
+                currentWeights.form,
+              target:
+                targetWeights.form,
+              maximumStep:
+                ENGINE_WEIGHT_MAX_STEP,
+            }),
+
+          market:
+            moveWeightTowardTarget({
+              current:
+                currentWeights.market,
+              target:
+                targetWeights.market,
+              maximumStep:
+                ENGINE_WEIGHT_MAX_STEP,
+            }),
+
+          monteCarlo:
+            moveWeightTowardTarget({
+              current:
+                currentWeights.monteCarlo,
+              target:
+                targetWeights.monteCarlo,
+              maximumStep:
+                ENGINE_WEIGHT_MAX_STEP,
+            }),
+        });
+
+      status = "ACTIVE";
+      reason =
+        "BRIER_WEIGHT_OPTIMIZATION";
+    } else if (
+      !ENGINE_WEIGHT_LEARNING_ENABLED
+    ) {
+      reason =
+        "ENGINE_WEIGHT_LEARNING_DISABLED";
+    }
+
+    const version =
+      Number(existing?.version || 0) +
+      1;
+
+    await pool.query(
+      `
+        INSERT INTO engine_weight_profiles (
+          profile_key,
+          status,
+          version,
+          form_weight,
+          market_weight,
+          monte_carlo_weight,
+          form_brier,
+          market_brier,
+          monte_carlo_brier,
+          sample_size,
+          reason,
+          previous_weights,
+          proposed_weights,
+          calculated_at,
+          activated_at,
+          updated_at
+        )
+        VALUES (
+          $1, $2, $3,
+          $4, $5, $6,
+          $7, $8, $9,
+          $10, $11,
+          $12::jsonb,
+          $13::jsonb,
+          NOW(),
+          CASE
+            WHEN $2 = 'ACTIVE'
+            THEN NOW()
+            ELSE NULL
+          END,
+          NOW()
+        )
+        ON CONFLICT (
+          profile_key
+        )
+        DO UPDATE SET
+          status =
+            EXCLUDED.status,
+          version =
+            EXCLUDED.version,
+          form_weight =
+            EXCLUDED.form_weight,
+          market_weight =
+            EXCLUDED.market_weight,
+          monte_carlo_weight =
+            EXCLUDED.monte_carlo_weight,
+          form_brier =
+            EXCLUDED.form_brier,
+          market_brier =
+            EXCLUDED.market_brier,
+          monte_carlo_brier =
+            EXCLUDED.monte_carlo_brier,
+          sample_size =
+            EXCLUDED.sample_size,
+          reason =
+            EXCLUDED.reason,
+          previous_weights =
+            EXCLUDED.previous_weights,
+          proposed_weights =
+            EXCLUDED.proposed_weights,
+          calculated_at =
+            NOW(),
+          activated_at =
+            CASE
+              WHEN EXCLUDED.status =
+                'ACTIVE'
+              THEN COALESCE(
+                engine_weight_profiles
+                  .activated_at,
+                NOW()
+              )
+              ELSE engine_weight_profiles
+                .activated_at
+            END,
+          updated_at =
+            NOW()
+      `,
+      [
+        ENGINE_WEIGHT_PROFILE_KEY,
+        status,
+        version,
+        nextWeights.form,
+        nextWeights.market,
+        nextWeights.monteCarlo,
+        briers.form,
+        briers.market,
+        briers.monteCarlo,
+        commonSampleSize,
+        reason,
+        JSON.stringify(
+          currentWeights
+        ),
+        JSON.stringify(
+          nextWeights
+        ),
+      ]
+    );
+
+    await pool.query(
+      `
+        INSERT INTO engine_weight_events (
+          profile_key,
+          event_type,
+          previous_weights,
+          new_weights,
+          sample_size,
+          metrics,
+          reason
+        )
+        VALUES (
+          $1, $2,
+          $3::jsonb,
+          $4::jsonb,
+          $5,
+          $6::jsonb,
+          $7
+        )
+      `,
+      [
+        ENGINE_WEIGHT_PROFILE_KEY,
+        status === "ACTIVE"
+          ? "WEIGHTS_UPDATED"
+          : "WEIGHTS_OBSERVED",
+        JSON.stringify(
+          currentWeights
+        ),
+        JSON.stringify(
+          nextWeights
+        ),
+        commonSampleSize,
+        JSON.stringify({
+          briers,
+          source,
+          startedAt,
+          finishedAt:
+            new Date().toISOString(),
+        }),
+        reason,
+      ]
+    );
+
+    await loadLivingEngineWeightProfile();
+
+    return {
+      ok: true,
+      source,
+      status,
+      reason,
+      sampleSize:
+        commonSampleSize,
+      briers,
+      previousWeights:
+        currentWeights,
+      weights:
+        nextWeights,
+      profile:
+        livingEngineWeightProfile,
+      startedAt,
+      finishedAt:
+        new Date().toISOString(),
+    };
+  } catch (error) {
+    console.error(
+      "ERREUR LEARNING POIDS MOTEURS :",
+      error
+    );
+
+    return {
+      ok: false,
+      source,
+      error:
+        error?.message ||
+        "Erreur inconnue",
+      startedAt,
+      finishedAt:
+        new Date().toISOString(),
+    };
+  } finally {
+    livingEngineWeightRefreshRunning =
+      false;
+  }
+}
+
+app.post(
+  "/internal/learning/rebuild-engine-weights",
+  async (req, res) => {
+    const result =
+      await rebuildLivingEngineWeights({
+        source:
+          "manual-admin-route",
+      });
+
+    return res
+      .status(
+        result.ok ? 200 : 500
+      )
+      .json(result);
+  }
+);
+
+app.get(
+  "/internal/learning/engine-weights",
+  async (req, res) => {
+    try {
+      await ensureLivingEngineWeightTables();
+      await loadLivingEngineWeightProfile();
+
+      const events =
+        await pool.query(
+          `
+            SELECT
+              event_type,
+              previous_weights,
+              new_weights,
+              sample_size,
+              metrics,
+              reason,
+              created_at
+            FROM engine_weight_events
+            WHERE profile_key = $1
+            ORDER BY created_at DESC
+            LIMIT 20
+          `,
+          [
+            ENGINE_WEIGHT_PROFILE_KEY,
+          ]
+        );
+
+      return res.json({
+        ok: true,
+        enabled:
+          ENGINE_WEIGHT_LEARNING_ENABLED,
+        running:
+          livingEngineWeightRefreshRunning,
+        minimumSamples:
+          ENGINE_WEIGHT_MIN_SAMPLES,
+        maximumStep:
+          ENGINE_WEIGHT_MAX_STEP,
+        minimumWeight:
+          ENGINE_WEIGHT_MIN_VALUE,
+        maximumWeight:
+          ENGINE_WEIGHT_MAX_VALUE,
+        profile:
+          livingEngineWeightProfile,
+        recentEvents:
+          events.rows,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR STATUT POIDS MOTEURS :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Impossible de charger les poids moteurs.",
+      });
+    }
+  }
+);
+
 app.get(
   "/internal/learning/living-status",
   async (req, res) => {
     try {
       await ensureLearningEngineTables();
       await ensureCalibrationDecisionTables();
+      await ensureLivingEngineWeightTables();
+      await loadLivingEngineWeightProfile();
 
       const [
         calibrationCountResult,
@@ -18444,6 +19521,19 @@ app.get(
             CALIBRATION_MAX_BRIER_DEGRADATION,
         },
 
+        engineWeights: {
+          enabled:
+            ENGINE_WEIGHT_LEARNING_ENABLED,
+          running:
+            livingEngineWeightRefreshRunning,
+          minimumSamples:
+            ENGINE_WEIGHT_MIN_SAMPLES,
+          maximumStep:
+            ENGINE_WEIGHT_MAX_STEP,
+          profile:
+            livingEngineWeightProfile,
+        },
+
         automaticRollback: true,
         recentEvents:
           recentEventsResult.rows,
@@ -18491,17 +19581,25 @@ async function runAutomaticCalibrationCycle({
       source: `${source}-evaluation`,
     });
 
+    const engineWeights =
+      await rebuildLivingEngineWeights({
+        source:
+          `${source}-engine-weights`,
+      });
+
     return {
       ok:
         learning?.ok !== false &&
         generation?.ok !== false &&
-        evaluation?.ok !== false,
+        evaluation?.ok !== false &&
+        engineWeights?.ok !== false,
       source,
       startedAt,
       finishedAt: new Date().toISOString(),
       learning,
       generation,
       evaluation,
+      engineWeights,
     };
   } catch (error) {
     console.error(
@@ -22593,6 +23691,14 @@ app.listen(
     );
 
     console.log(
+      `Poids moteurs vivants : ${
+        ENGINE_WEIGHT_LEARNING_ENABLED
+          ? "✅ actifs"
+          : "👁️ observation uniquement"
+      }`
+    );
+
+    console.log(
       `Garde-fous Learning : activation à ${CALIBRATION_AUTO_ACTIVATION_MIN_SAMPLES} échantillons, écart ≥ ${CALIBRATION_AUTO_ACTIVATION_MIN_GAP} pts, pas max ${CALIBRATION_MAX_ADJUSTMENT_STEP} pt/cycle`
     );
 
@@ -22625,6 +23731,17 @@ app.listen(
       .catch((error) => {
         console.error(
           "ERREUR TABLES LEARNING ENGINE :",
+          error
+        );
+      });
+
+    ensureLivingEngineWeightTables()
+      .then(() =>
+        loadLivingEngineWeightProfile()
+      )
+      .catch((error) => {
+        console.error(
+          "ERREUR TABLES POIDS MOTEURS :",
           error
         );
       });
