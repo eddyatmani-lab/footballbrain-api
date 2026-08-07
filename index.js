@@ -44,6 +44,9 @@ const { Pool } = require("pg");
 const {
   createEngineLearningCore,
 } = require("./src/learning");
+const {
+  createOddsSyncService,
+} = require("./src/services/OddsSyncService");
 const cors = require("cors");
 const {
   FootballMonteCarlo,
@@ -321,6 +324,49 @@ async function callApiFootball(
 
   return response;
 }
+/*
+ * ============================================================
+ * ODDS SYNC SERVICE
+ * ============================================================
+ *
+ * Synchronisation API-Football des cotes,
+ * sélection Pinnacle / bookmakers autorisés,
+ * application automatique des meilleures cotes
+ * et routes /internal/odds/*.
+ */
+
+const oddsSyncService =
+  createOddsSyncService({
+    app,
+    pool,
+    callApiFootball,
+
+    schedulersEnabled:
+      AUTOMATIC_SCHEDULERS_ENABLED,
+
+    adminGuard(
+      req,
+      res,
+      next
+    ) {
+      if (
+        !requireOptionalAdminKey(
+          req,
+          res
+        )
+      ) {
+        return;
+      }
+
+      next();
+    },
+  });
+
+oddsSyncService.registerRoutes();
+
+console.log(
+  "✅ OddsSyncService : routes enregistrées"
+);
 function isExcludedFixture(
   fixture = {}
 ) {
@@ -25691,7 +25737,28 @@ app.listen(
           error
         );
       });
+oddsSyncService
+  .ensureTables()
+  .then(() => {
+    console.log(
+      "✅ OddsSyncService : tables prêtes"
+    );
 
+    oddsSyncService
+      .startScheduler();
+
+    console.log(
+      AUTOMATIC_SCHEDULERS_ENABLED
+        ? "✅ OddsSyncService : scheduler actif"
+        : "👁️ OddsSyncService : scheduler désactivé"
+    );
+  })
+  .catch((error) => {
+    console.error(
+      "ERREUR ODDS SYNC SERVICE :",
+      error
+    );
+  });
     ensureLearningEngineTables()
       .catch((error) => {
         console.error(
