@@ -591,7 +591,7 @@ async function getSiteVisitStats() {
       row.today_visits || 0
     ),
 };
-
+}
 app.post(
   "/public/site-visit",
   async (req, res) => {
