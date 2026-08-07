@@ -6,7 +6,7 @@ const DEFAULT_NEAR_KICKOFF_INTERVAL_MINUTES = 15;
 const DEFAULT_NEAR_KICKOFF_MAX_MINUTES = 100;
 const DEFAULT_NEAR_KICKOFF_MIN_MINUTES = 20;
 
-const BOOKMAKER_POLICY_VERSION = "FR_PINNACLE_V1";
+const BOOKMAKER_POLICY_VERSION = "FR_ONLY_V2";
 
 const AUTO_ODDS_POLICY_VERSION = "BEST_ALLOWED_COHERENT_V2";
 
@@ -22,21 +22,14 @@ const AUTO_ODDS_ABSOLUTE_MAX = 15;
 
 /*
  * Politique de cotes Football AI Pro :
- * - Pinnacle reste la référence prioritaire lorsqu'il est disponible ;
- * - sinon, seuls les opérateurs de paris sportifs autorisés en France
- *   sont acceptés ;
- * - tous les autres bookmakers sont ignorés à la synchronisation et
- *   exclus des anciennes lignes déjà présentes en base.
+ * - seuls les opérateurs de paris sportifs autorisés en France sont acceptés ;
+ * - Pinnacle et tous les autres bookmakers non autorisés sont ignorés
+ *   à la synchronisation et exclus des anciennes lignes déjà présentes en base.
  *
  * Les alias correspondent aux noms susceptibles d'être renvoyés par
  * API-Football. La normalisation supprime accents, espaces et ponctuation.
  */
 const ALLOWED_BOOKMAKER_ALIASES = Object.freeze({
-  PINNACLE: [
-    "pinnacle",
-    "pinnacle sports",
-  ],
-
   BETCLIC: [
     "betclic",
     "betclic fr",
@@ -134,7 +127,6 @@ const ALLOWED_BOOKMAKER_ALIASES = Object.freeze({
 });
 
 const BOOKMAKER_PRIORITY_ORDER = Object.freeze([
-  "PINNACLE",
   "BETCLIC",
   "WINAMAX",
   "UNIBET",
@@ -200,7 +192,6 @@ function canonicalBookmakerName(name, id = null) {
   /*
    * Identifiants API-Football déjà confirmés dans l'ancien service.
    */
-  if (Number(id) === 4) return "PINNACLE";
   if (Number(id) === 8) return "BET365";
   if (Number(id) === 16) return "UNIBET";
 
@@ -213,7 +204,7 @@ function canonicalBookmakerName(name, id = null) {
 
   /*
    * Secours contrôlé pour les noms enrichis du type
-   * "Pinnacle Sports EU" ou "Betclic France".
+   * "Betclic France" ou autres variantes enrichies.
    */
   for (const [alias, canonicalName] of BOOKMAKER_ALIAS_INDEX.entries()) {
     if (
@@ -238,7 +229,6 @@ function isAllowedBookmaker(name, id = null) {
 function publicBookmakerName(canonicalName, fallback = null) {
   return (
     {
-      PINNACLE: "Pinnacle",
       BETCLIC: "Betclic",
       WINAMAX: "Winamax",
       UNIBET: "Unibet",
@@ -317,13 +307,11 @@ function bookmakerPrioritySql(
         `REGEXP_REPLACE(LOWER(COALESCE(${nameColumn}, '')), '[^a-z0-9]+', '', 'g')`;
 
       const ids =
-        canonicalName === "PINNACLE"
-          ? [4]
-          : canonicalName === "BET365"
-            ? [8]
-            : canonicalName === "UNIBET"
-              ? [16]
-              : [];
+        canonicalName === "BET365"
+          ? [8]
+          : canonicalName === "UNIBET"
+            ? [16]
+            : [];
 
       const checks = [];
 
@@ -543,7 +531,7 @@ function createOddsSyncService({
       );
 
       /*
-       * Liste blanche : Pinnacle + opérateurs français uniquement.
+       * Liste blanche : opérateurs de paris sportifs autorisés en France uniquement.
        */
       if (!canonicalName) {
         continue;
@@ -869,7 +857,7 @@ return Array.from(groupedRows.values());
           AND is_current = TRUE
           AND odd > 1
           AND (
-            bookmaker_id IN (4, 8, 16)
+            bookmaker_id IN (8, 16)
             OR ${allowedBookmakerSql("bookmaker_name")}
           )
         ORDER BY
@@ -1037,7 +1025,7 @@ AND COALESCE(
 ) NOT IN ('true', '1', 'yes')
 
 AND (
-  mo.bookmaker_id IN (4, 8, 16)
+  mo.bookmaker_id IN (8, 16)
   OR ${allowedSql}
 )
 
@@ -1274,7 +1262,7 @@ LIMIT 1
               AND mo.is_current = TRUE
               AND mo.odd > 1
               AND (
-                mo.bookmaker_id IN (4, 8, 16)
+                mo.bookmaker_id IN (8, 16)
                 OR ${allowedBookmakerSql("mo.bookmaker_name")}
               )
             ORDER BY
@@ -1361,7 +1349,7 @@ LIMIT 1
         ok: true,
         policyVersion:
           BOOKMAKER_POLICY_VERSION,
-        referenceBookmaker: "Pinnacle",
+        referenceBookmaker: null,
         priority:
           BOOKMAKER_PRIORITY_ORDER.map(
             (canonicalName, index) => ({
