@@ -104,8 +104,6 @@ const FINISHED_FIXTURE_STATUSES = new Set([
 const API_BASE_URL =
   "https://v3.football.api-sports.io";
 
-const DEFAULT_BOOKMAKER = 4; // Pinnacle
-
 
 /*
  * Protection centrale API-Football.
@@ -330,7 +328,7 @@ async function callApiFootball(
  * ============================================================
  *
  * Synchronisation API-Football des cotes,
- * sélection Pinnacle / bookmakers autorisés,
+ * sélection des bookmakers autorisés par OddsSyncService,
  * application automatique des meilleures cotes
  * et routes /internal/odds/*.
  */
@@ -1696,7 +1694,7 @@ if (
       homeRecentResponse,
       awayRecentResponse,
       h2hResponse,
-      oddsResponse,
+      market,
 injuriesResponse,
 lineupsResponse,
     ] = await Promise.all([
@@ -1718,10 +1716,12 @@ lineupsResponse,
         timezone: "Europe/Paris",
       }),
 
-      callApiFootball("/odds", {
-  fixture: fixtureId,
-  bookmaker: DEFAULT_BOOKMAKER,
-}),
+      getOfficialMatchWinnerMarket(
+        fixtureId,
+        {
+          refresh: true,
+        }
+      ),
 callApiFootball("/injuries", {
   fixture: fixtureId,
 }),
@@ -1760,10 +1760,6 @@ const homeResults = homeRecentForm.map(
 const awayResults = awayRecentForm.map(
   (match) => getTeamResult(match, awayTeamId)
 );
-const rawOdds = oddsResponse.data?.response || [];
-
-const market = summarizeMatchWinnerOdds(rawOdds);
-
 const injuries =
   injuriesResponse.data?.response || [];
 
@@ -2242,65 +2238,142 @@ function computeFootballBrainScore(
     advantage: homeScore - awayScore,
   };
 }
-function summarizeMatchWinnerOdds(oddsData) {
-  const homeOdds = [];
-  const drawOdds = [];
-  const awayOdds = [];
+async function getOfficialMatchWinnerMarket(
+  fixtureId,
+  {
+    refresh = false,
+  } = {}
+) {
+  const normalizedFixtureId =
+    Number(fixtureId);
 
-  for (const fixtureOdds of oddsData) {
-    for (const bookmaker of fixtureOdds.bookmakers || []) {
-      const matchWinner = (bookmaker.bets || []).find(
-        (bet) => bet.name === "Match Winner"
-      );
-
-      if (!matchWinner) continue;
-
-      for (const item of matchWinner.values || []) {
-        const odd = Number(item.odd);
-
-        if (!Number.isFinite(odd)) continue;
-
-        if (item.value === "Home") homeOdds.push(odd);
-        if (item.value === "Draw") drawOdds.push(odd);
-        if (item.value === "Away") awayOdds.push(odd);
-      }
-    }
+  if (
+    !Number.isInteger(
+      normalizedFixtureId
+    ) ||
+    normalizedFixtureId <= 0
+  ) {
+    throw new Error(
+      "fixtureId invalide pour les cotes."
+    );
   }
 
-  const average = (values) => {
-    if (values.length === 0) return null;
-
-    return Number(
-      (
-        values.reduce((sum, value) => sum + value, 0) /
-        values.length
-      ).toFixed(2)
+  /*
+   * Source officielle unique des cotes :
+   * OddsSyncService.
+   *
+   * Le service applique la politique bookmaker
+   * courante (FR_ONLY_V2) avant d'enregistrer
+   * puis de relire les cotes de market_odds.
+   */
+  if (refresh) {
+    await oddsSyncService.syncFixture(
+      normalizedFixtureId
     );
+  }
+
+  const oddsMap =
+    await oddsSyncService.getCurrentOddsMap(
+      [normalizedFixtureId]
+    );
+
+  const getOdd = (marketKey) => {
+    const stored =
+      oddsMap.get(
+        `${normalizedFixtureId}:${marketKey}`
+      );
+
+    const odd =
+      Number(stored?.odd);
+
+    return Number.isFinite(odd) &&
+      odd > 1
+      ? odd
+      : null;
   };
 
-  const home = average(homeOdds);
-  const draw = average(drawOdds);
-  const away = average(awayOdds);
+  const home =
+    getOdd("HOME");
+
+  const draw =
+    getOdd("DRAW");
+
+  const away =
+    getOdd("AWAY");
 
   const availableOdds = [
-    { key: "home", odd: home },
-    { key: "draw", odd: draw },
-    { key: "away", odd: away },
-  ].filter((item) => item.odd !== null);
+    {
+      key: "home",
+      odd: home,
+    },
+    {
+      key: "draw",
+      odd: draw,
+    },
+    {
+      key: "away",
+      odd: away,
+    },
+  ].filter(
+    (item) =>
+      item.odd !== null
+  );
 
   const favorite =
     availableOdds.length > 0
-      ? availableOdds.reduce((best, current) =>
-          current.odd < best.odd ? current : best
+      ? availableOdds.reduce(
+          (best, current) =>
+            current.odd < best.odd
+              ? current
+              : best
         ).key
       : null;
 
+  const bookmakerNames =
+    new Set();
+
+  for (
+    const marketKey of [
+      "HOME",
+      "DRAW",
+      "AWAY",
+    ]
+  ) {
+    const stored =
+      oddsMap.get(
+        `${normalizedFixtureId}:${marketKey}`
+      );
+
+    if (stored?.bookmaker) {
+      bookmakerNames.add(
+        String(
+          stored.bookmaker
+        )
+      );
+    }
+  }
+
   return {
-    homeAverageOdd: home,
-    drawAverageOdd: draw,
-    awayAverageOdd: away,
-    marketFavorite: favorite,
-    bookmakersUsed: homeOdds.length,
+    /*
+     * Ces noms sont conservés pour compatibilité
+     * avec les moteurs existants. Il s'agit
+     * désormais de cotes officielles filtrées,
+     * et non d'une moyenne brute multi-bookmakers.
+     */
+    homeAverageOdd:
+      home,
+    drawAverageOdd:
+      draw,
+    awayAverageOdd:
+      away,
+    marketFavorite:
+      favorite,
+    bookmakersUsed:
+      bookmakerNames.size,
+    bookmakerPolicyVersion:
+      oddsSyncService
+        .BOOKMAKER_POLICY_VERSION ||
+      null,
   };
 }
 
@@ -12759,7 +12832,7 @@ function getSelectedProbability(
 async function runHourlyOddsWatcher() {
   if (hourlyOddsWatcherRunning) {
     console.log(
-      "ODDS WATCHER : contrôle déjà en cours"
+      "ODDS WATCHER FR_ONLY : contrôle déjà en cours"
     );
     return;
   }
@@ -12779,7 +12852,7 @@ async function runHourlyOddsWatcher() {
       getParisDateString();
 
     console.log(
-      `ODDS WATCHER : contrôle du ${date}`
+      `ODDS WATCHER FR_ONLY : contrôle du ${date}`
     );
 
     /*
@@ -12823,21 +12896,12 @@ async function runHourlyOddsWatcher() {
       try {
         summary.checked += 1;
 
-        const oddsResponse =
-          await callApiFootball(
-            "/odds",
-            {
-              fixture: fixtureId,
-            }
-          );
-
-        const rawOdds =
-          oddsResponse.data?.response ||
-          [];
-
         const market =
-          summarizeMatchWinnerOdds(
-            rawOdds
+          await getOfficialMatchWinnerMarket(
+            fixtureId,
+            {
+              refresh: true,
+            }
           );
 
         const newMarketOdd =
@@ -12910,7 +12974,7 @@ async function runHourlyOddsWatcher() {
           movementPercent >= 10
         ) {
           console.log(
-            "ODDS WATCHER : mouvement important",
+            "ODDS WATCHER FR_ONLY : mouvement important",
             {
               fixtureId,
               oldMarketOdd,
@@ -12970,7 +13034,7 @@ async function runHourlyOddsWatcher() {
         summary.failed += 1;
 
         console.error(
-          "ODDS WATCHER : erreur",
+          "ODDS WATCHER FR_ONLY : erreur",
           {
             fixtureId,
             error:
@@ -12984,12 +13048,12 @@ async function runHourlyOddsWatcher() {
     }
 
     console.log(
-      "ODDS WATCHER : terminé",
+      "ODDS WATCHER FR_ONLY : terminé",
       summary
     );
   } catch (error) {
     console.error(
-      "ODDS WATCHER : erreur générale",
+      "ODDS WATCHER FR_ONLY : erreur générale",
       error.message
     );
   } finally {
