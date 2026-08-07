@@ -1012,6 +1012,9 @@ async function syncLeagueManagerCatalogue({ forceRefresh = false } = {}) {
 app.get(
   "/internal/league-manager/leagues",
   async (req, res) => {
+      if (!requireOptionalAdminKey(req, res)) {
+  return;
+}
     try {
       await ensureLeagueManagerTables();
 
@@ -1152,6 +1155,9 @@ app.get(
 app.post(
   "/internal/league-manager/sync",
   async (req, res) => {
+      if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
     try {
       await ensureLeagueManagerTables();
 
@@ -1181,6 +1187,9 @@ app.post(
 app.patch(
   "/internal/league-manager/leagues/:leagueId",
   async (req, res) => {
+      if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
     try {
       await ensureLeagueManagerTables();
 
@@ -1267,6 +1276,10 @@ app.patch(
 app.post(
   "/internal/league-manager/bulk",
   async (req, res) => {
+      if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
+
     try {
       await ensureLeagueManagerTables();
 
@@ -14185,8 +14198,12 @@ async function saveStudioSnapshot({
   return result.rows[0];
 }
 app.post(
-  "/public/studio-snapshot/:fixtureId",
+  "/internal/admin/studio-snapshot/:fixtureId",
   async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
+
     try {
       await ensureBilanV3Columns();
 
@@ -18204,10 +18221,33 @@ async function calibrationStatusHandler(req, res) {
     }
 }
 
-app.get("/internal/calibration/status", calibrationStatusHandler);
+app.get(
+  "/internal/calibration/status",
+  async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
 
-/* Compatibilité avec l'ancienne URL utilisée par le frontend. */
-app.get("/internal/learning/status", calibrationStatusHandler);
+    return calibrationStatusHandler(
+      req,
+      res
+    );
+  }
+);
+
+app.get(
+  "/internal/learning/status",
+  async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
+
+    return calibrationStatusHandler(
+      req,
+      res
+    );
+  }
+);
 
 
 app.get(
@@ -20361,6 +20401,10 @@ async function rebuildLivingEngineWeights({
 app.post(
   "/internal/learning/rebuild-engine-weights",
   async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
+
     const result =
       await rebuildLivingEngineWeights({
         source:
@@ -20378,6 +20422,10 @@ app.post(
 app.get(
   "/internal/learning/engine-weights",
   async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
+
     try {
       await ensureLivingEngineWeightTables();
       await loadLivingEngineWeightProfile();
@@ -20399,44 +20447,46 @@ app.get(
             LIMIT 20
           `,
           [
-            ENGINE_WEIGHT_PROFILE_KEY,
+            LIVING_ENGINE_WEIGHT_PROFILE_KEY,
           ]
         );
 
       return res.json({
         ok: true,
+
         enabled:
           ENGINE_WEIGHT_LEARNING_ENABLED,
+
         running:
           livingEngineWeightRefreshRunning,
+
         minimumSamples:
           ENGINE_WEIGHT_MIN_SAMPLES,
+
         maximumStep:
           ENGINE_WEIGHT_MAX_STEP,
-        minimumWeight:
-          ENGINE_WEIGHT_MIN_VALUE,
-        maximumWeight:
-          ENGINE_WEIGHT_MAX_VALUE,
+
         profile:
           livingEngineWeightProfile,
-        recentEvents:
+
+        events:
           events.rows,
       });
     } catch (error) {
       console.error(
-        "ERREUR STATUT POIDS MOTEURS :",
+        "ERREUR ENGINE WEIGHTS :",
         error
       );
 
       return res.status(500).json({
         ok: false,
         error:
+          error?.message ||
           "Impossible de charger les poids moteurs.",
       });
     }
   }
 );
-
 
 
 async function backfillAllEngineLearningLogs({
