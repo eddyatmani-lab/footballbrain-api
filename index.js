@@ -1,5 +1,6 @@
 require("dotenv").config();
 const nodeCrypto = require("crypto");
+const SITE_VISITS_BASELINE = 120;
 function parseEnvironmentBoolean(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
@@ -579,17 +580,17 @@ async function getSiteVisitStats() {
     result.rows[0] || {};
 
   return {
-    totalVisits:
-      Number(
-        row.total_visits || 0
-      ),
+  totalVisits:
+    SITE_VISITS_BASELINE +
+    Number(
+      row.total_visits || 0
+    ),
 
-    todayVisits:
-      Number(
-        row.today_visits || 0
-      ),
-  };
-}
+  todayVisits:
+    Number(
+      row.today_visits || 0
+    ),
+};
 
 app.post(
   "/public/site-visit",
