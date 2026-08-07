@@ -475,6 +475,9 @@ app.get("/health", (req, res) => {
  * Une seule requête SQL est utilisée, même pour plusieurs milliers d'IDs.
  */
 app.post("/internal/fixture-competitions", async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+  return;
+}
   try {
     const rawFixtureIds = Array.isArray(req.body?.fixtureIds)
       ? req.body.fixtureIds
