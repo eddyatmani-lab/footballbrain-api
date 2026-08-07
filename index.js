@@ -10519,6 +10519,994 @@ const fixtures = rawFixtures
      }
   }
 );
+/*
+ * ============================================================
+ * PROGRAMME DU JOUR
+ * ============================================================
+ *
+ * Source officielle du frontend ProgrammeDuJour.
+ *
+ * - fixtures : API-Football
+ * - compétitions : League Manager
+ * - AI Lab : predictions PostgreSQL
+ * - Brain Studio : snapshots PostgreSQL
+ *
+ * Route publique :
+ * GET /public/programme-du-jour?date=YYYY-MM-DD
+ */
+
+function getProgrammeStatusMeta(
+  fixtureStatus = {}
+) {
+  const short = String(
+    fixtureStatus?.short || ""
+  )
+    .trim()
+    .toUpperCase();
+
+  const long = String(
+    fixtureStatus?.long || ""
+  ).trim();
+
+  const elapsed =
+    fixtureStatus?.elapsed ?? null;
+
+  const finishedStatuses =
+    new Set([
+      "FT",
+      "AET",
+      "PEN",
+    ]);
+
+  const liveStatuses =
+    new Set([
+      "1H",
+      "HT",
+      "2H",
+      "ET",
+      "BT",
+      "P",
+      "LIVE",
+      "INT",
+    ]);
+
+  const unavailableStatuses =
+    new Set([
+      "PST",
+      "CANC",
+      "ABD",
+      "AWD",
+      "WO",
+      "SUSP",
+    ]);
+
+  if (
+    finishedStatuses.has(short)
+  ) {
+    return {
+      category: "FINISHED",
+      short,
+      long:
+        long || "Match terminé",
+      elapsed,
+    };
+  }
+
+  if (
+    liveStatuses.has(short)
+  ) {
+    return {
+      category: "LIVE",
+      short,
+      long:
+        long || "En direct",
+      elapsed,
+    };
+  }
+
+  if (
+    unavailableStatuses.has(short)
+  ) {
+    return {
+      category: "UNAVAILABLE",
+      short,
+      long:
+        long || "Indisponible",
+      elapsed,
+    };
+  }
+
+  return {
+    category: "SCHEDULED",
+    short:
+      short || "NS",
+    long:
+      long || "À venir",
+    elapsed,
+  };
+}
+
+
+app.get(
+  "/public/programme-du-jour",
+  async (req, res) => {
+    try {
+      const requestedDate =
+        String(
+          req.query?.date || ""
+        ).trim();
+
+      const date =
+        requestedDate ||
+        getParisDateString();
+
+      /*
+       * Sécurité sur le format.
+       */
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(
+          date
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "Date invalide. Format attendu : YYYY-MM-DD",
+          });
+      }
+
+      /*
+       * ======================================================
+       * 1. LEAGUE MANAGER
+       * ======================================================
+       */
+
+      const enabledLeagueIds =
+        await getEnabledLeagueIds();
+
+      if (
+        enabledLeagueIds.size === 0
+      ) {
+        return res.json({
+          ok: true,
+          date,
+
+          summary: {
+            total: 0,
+            scheduled: 0,
+            live: 0,
+            finished: 0,
+            unavailable: 0,
+
+            aiLabAvailable: 0,
+            brainStudioAvailable: 0,
+
+            enabledLeagues: 0,
+            fixturesFromApi: 0,
+            excludedByLeagueManager:
+              0,
+          },
+
+          matches: [],
+
+          warning:
+            "Aucune compétition n'est activée dans le League Manager.",
+
+          generatedAt:
+            new Date()
+              .toISOString(),
+        });
+      }
+
+      /*
+       * ======================================================
+       * 2. FIXTURES API-FOOTBALL
+       * ======================================================
+       */
+
+      const fixturesResponse =
+        await callApiFootball(
+          "/fixtures",
+          {
+            date,
+            timezone:
+              "Europe/Paris",
+          }
+        );
+
+      const rawFixtures =
+        Array.isArray(
+          fixturesResponse
+            ?.data
+            ?.response
+        )
+          ? fixturesResponse
+              .data
+              .response
+          : [];
+
+      /*
+       * Seulement :
+       *
+       * - fixtures valides
+       * - ligues activées
+       * - pas amicaux / jeunes
+       */
+      const fixtures =
+        rawFixtures
+          .filter((item) => {
+            const fixtureId =
+              Number(
+                item
+                  ?.fixture
+                  ?.id
+              );
+
+            if (
+              !Number.isInteger(
+                fixtureId
+              ) ||
+              fixtureId <= 0
+            ) {
+              return false;
+            }
+
+            if (
+              !item
+                ?.teams
+                ?.home
+                ?.name ||
+              !item
+                ?.teams
+                ?.away
+                ?.name
+            ) {
+              return false;
+            }
+
+            if (
+              !isLeagueEnabled(
+                item,
+                enabledLeagueIds
+              )
+            ) {
+              return false;
+            }
+
+            if (
+              isExcludedFixture(
+                item
+              )
+            ) {
+              return false;
+            }
+
+            return true;
+          })
+          .sort(
+            (
+              first,
+              second
+            ) =>
+              String(
+                first
+                  ?.fixture
+                  ?.date ||
+                  ""
+              ).localeCompare(
+                String(
+                  second
+                    ?.fixture
+                    ?.date ||
+                    ""
+                )
+              )
+          );
+
+      const fixtureIds =
+        fixtures
+          .map((item) =>
+            Number(
+              item
+                ?.fixture
+                ?.id
+            )
+          )
+          .filter(
+            (fixtureId) =>
+              Number.isInteger(
+                fixtureId
+              ) &&
+              fixtureId > 0
+          );
+
+      /*
+       * ======================================================
+       * 3. ANALYSES RAILWAY
+       * ======================================================
+       */
+
+      let predictionsByFixture =
+        new Map();
+
+      if (
+        fixtureIds.length > 0
+      ) {
+        /*
+         * Les colonnes Brain Studio sont nécessaires
+         * pour construire le contrat de la page.
+         */
+        await ensureStudioPredictionColumns();
+
+        const predictionResult =
+          await pool.query(
+            `
+              SELECT DISTINCT ON (
+                fixture_id
+              )
+
+                fixture_id,
+
+                decision,
+                selected_outcome,
+                bet_status,
+
+                confidence,
+                risk,
+
+                home_probability,
+                draw_probability,
+                away_probability,
+
+                fair_odd,
+                market_odd,
+                value_percentage,
+
+                explanation,
+
+                official_xg_home,
+                official_xg_away,
+                xg_source,
+                xg_confidence_score,
+                xg_confidence_level,
+
+                studio_market_key,
+                studio_market_label,
+                studio_probability,
+                studio_decision_score,
+                studio_decision_type,
+                studio_decision_grade,
+                studio_analysis_version,
+                studio_snapshot,
+                studio_saved_at,
+
+                analysis_status,
+                analysis_error,
+
+                updated_at
+
+              FROM predictions
+
+              WHERE
+                fixture_id =
+                  ANY(
+                    $1::bigint[]
+                  )
+
+              ORDER BY
+                fixture_id,
+                updated_at DESC
+                  NULLS LAST,
+                id DESC
+            `,
+            [
+              fixtureIds,
+            ]
+          );
+
+        predictionsByFixture =
+          new Map(
+            predictionResult
+              .rows
+              .map(
+                (
+                  prediction
+                ) => [
+                  Number(
+                    prediction
+                      .fixture_id
+                  ),
+                  prediction,
+                ]
+              )
+          );
+      }
+
+      /*
+       * ======================================================
+       * 4. FORMAT FRONTEND
+       * ======================================================
+       */
+
+      const matches =
+        fixtures.map(
+          (item) => {
+            const fixtureId =
+              Number(
+                item
+                  ?.fixture
+                  ?.id
+              );
+
+            const prediction =
+              predictionsByFixture
+                .get(
+                  fixtureId
+                ) ||
+              null;
+
+            const status =
+              getProgrammeStatusMeta(
+                item
+                  ?.fixture
+                  ?.status ||
+                  {}
+              );
+
+            /*
+             * ------------------------------
+             * AI LAB
+             * ------------------------------
+             */
+
+            const aiLabAvailable =
+              Boolean(
+                prediction
+              );
+
+            const aiLab =
+              aiLabAvailable
+                ? {
+                    available:
+                      true,
+
+                    decision:
+                      prediction
+                        ?.decision ||
+                      null,
+
+                    selectedOutcome:
+                      prediction
+                        ?.selected_outcome ||
+                      null,
+
+                    betStatus:
+                      prediction
+                        ?.bet_status ||
+                      null,
+
+                    confidence:
+                      prediction
+                        ?.confidence ==
+                      null
+                        ? null
+                        : Number(
+                            prediction
+                              .confidence
+                          ),
+
+                    risk:
+                      prediction
+                        ?.risk ==
+                      null
+                        ? null
+                        : Number(
+                            prediction
+                              .risk
+                          ),
+
+                    probabilities:
+                      {
+                        home:
+                          prediction
+                            ?.home_probability ==
+                          null
+                            ? null
+                            : Number(
+                                prediction
+                                  .home_probability
+                              ),
+
+                        draw:
+                          prediction
+                            ?.draw_probability ==
+                          null
+                            ? null
+                            : Number(
+                                prediction
+                                  .draw_probability
+                              ),
+
+                        away:
+                          prediction
+                            ?.away_probability ==
+                          null
+                            ? null
+                            : Number(
+                                prediction
+                                  .away_probability
+                              ),
+                      },
+
+                    xg: {
+                      home:
+                        prediction
+                          ?.official_xg_home ==
+                        null
+                          ? null
+                          : Number(
+                              prediction
+                                .official_xg_home
+                            ),
+
+                      away:
+                        prediction
+                          ?.official_xg_away ==
+                        null
+                          ? null
+                          : Number(
+                              prediction
+                                .official_xg_away
+                            ),
+
+                      source:
+                        prediction
+                          ?.xg_source ||
+                        null,
+
+                      confidence:
+                        prediction
+                          ?.xg_confidence_score ==
+                        null
+                          ? null
+                          : Number(
+                              prediction
+                                .xg_confidence_score
+                            ),
+
+                      confidenceLevel:
+                        prediction
+                          ?.xg_confidence_level ||
+                        null,
+                    },
+
+                    fairOdd:
+                      prediction
+                        ?.fair_odd ==
+                      null
+                        ? null
+                        : Number(
+                            prediction
+                              .fair_odd
+                          ),
+
+                    marketOdd:
+                      prediction
+                        ?.market_odd ==
+                      null
+                        ? null
+                        : Number(
+                            prediction
+                              .market_odd
+                          ),
+
+                    valuePercentage:
+                      prediction
+                        ?.value_percentage ==
+                      null
+                        ? null
+                        : Number(
+                            prediction
+                              .value_percentage
+                          ),
+
+                    explanation:
+                      prediction
+                        ?.explanation ||
+                      null,
+
+                    updatedAt:
+                      prediction
+                        ?.updated_at ||
+                      null,
+                  }
+                : {
+                    available:
+                      false,
+
+                    decision:
+                      null,
+
+                    selectedOutcome:
+                      null,
+
+                    probabilities: {
+                      home: null,
+                      draw: null,
+                      away: null,
+                    },
+
+                    xg: {
+                      home: null,
+                      away: null,
+                    },
+                  };
+
+            /*
+             * ------------------------------
+             * BRAIN STUDIO
+             * ------------------------------
+             */
+
+            const studioSnapshot =
+              prediction
+                ?.studio_snapshot &&
+              typeof prediction
+                .studio_snapshot ===
+                "object"
+                ? prediction
+                    .studio_snapshot
+                : null;
+
+            const brainStudioAvailable =
+              Boolean(
+                studioSnapshot ||
+                prediction
+                  ?.studio_market_key ||
+                prediction
+                  ?.studio_market_label
+              );
+
+            const brainStudio =
+              {
+                available:
+                  brainStudioAvailable,
+
+                marketKey:
+                  prediction
+                    ?.studio_market_key ||
+                  studioSnapshot
+                    ?.primaryMarket
+                    ?.key ||
+                  null,
+
+                marketLabel:
+                  prediction
+                    ?.studio_market_label ||
+                  studioSnapshot
+                    ?.primaryMarket
+                    ?.label ||
+                  null,
+
+                probability:
+                  prediction
+                    ?.studio_probability ==
+                  null
+                    ? (
+                        studioSnapshot
+                          ?.primaryMarket
+                          ?.probability ??
+                        null
+                      )
+                    : Number(
+                        prediction
+                          .studio_probability
+                      ),
+
+                decisionScore:
+                  prediction
+                    ?.studio_decision_score ==
+                  null
+                    ? (
+                        studioSnapshot
+                          ?.primaryMarket
+                          ?.decision
+                          ?.score ??
+                        studioSnapshot
+                          ?.primaryMarket
+                          ?.score ??
+                        null
+                      )
+                    : Number(
+                        prediction
+                          .studio_decision_score
+                      ),
+
+                decisionType:
+                  prediction
+                    ?.studio_decision_type ||
+                  null,
+
+                decisionGrade:
+                  prediction
+                    ?.studio_decision_grade ||
+                  null,
+
+                analysisVersion:
+                  prediction
+                    ?.studio_analysis_version ||
+                  null,
+
+                savedAt:
+                  prediction
+                    ?.studio_saved_at ||
+                  null,
+
+                status:
+                  prediction
+                    ?.analysis_status ||
+                  null,
+
+                error:
+                  prediction
+                    ?.analysis_error ||
+                  null,
+              };
+
+            return {
+              fixtureId,
+
+              date:
+                item
+                  ?.fixture
+                  ?.date ||
+                null,
+
+              timestamp:
+                item
+                  ?.fixture
+                  ?.timestamp ||
+                null,
+
+              status,
+
+              league: {
+                id:
+                  item
+                    ?.league
+                    ?.id ||
+                  null,
+
+                name:
+                  item
+                    ?.league
+                    ?.name ||
+                  "Compétition",
+
+                country:
+                  item
+                    ?.league
+                    ?.country ||
+                  null,
+
+                logo:
+                  item
+                    ?.league
+                    ?.logo ||
+                  null,
+
+                season:
+                  item
+                    ?.league
+                    ?.season ||
+                  null,
+
+                round:
+                  item
+                    ?.league
+                    ?.round ||
+                  null,
+              },
+
+              homeTeam: {
+                id:
+                  item
+                    ?.teams
+                    ?.home
+                    ?.id ||
+                  null,
+
+                name:
+                  item
+                    ?.teams
+                    ?.home
+                    ?.name ||
+                  "Domicile",
+
+                logo:
+                  item
+                    ?.teams
+                    ?.home
+                    ?.logo ||
+                  null,
+              },
+
+              awayTeam: {
+                id:
+                  item
+                    ?.teams
+                    ?.away
+                    ?.id ||
+                  null,
+
+                name:
+                  item
+                    ?.teams
+                    ?.away
+                    ?.name ||
+                  "Extérieur",
+
+                logo:
+                  item
+                    ?.teams
+                    ?.away
+                    ?.logo ||
+                  null,
+              },
+
+              goals: {
+                home:
+                  item
+                    ?.goals
+                    ?.home ??
+                  null,
+
+                away:
+                  item
+                    ?.goals
+                    ?.away ??
+                  null,
+              },
+
+              analysis: {
+                aiLab,
+                brainStudio,
+              },
+
+              analysisAvailable:
+                aiLabAvailable ||
+                brainStudioAvailable,
+            };
+          }
+        );
+
+      /*
+       * ======================================================
+       * 5. RÉSUMÉ
+       * ======================================================
+       */
+
+      const summary = {
+        total:
+          matches.length,
+
+        scheduled:
+          matches.filter(
+            (match) =>
+              match
+                ?.status
+                ?.category ===
+              "SCHEDULED"
+          ).length,
+
+        live:
+          matches.filter(
+            (match) =>
+              match
+                ?.status
+                ?.category ===
+              "LIVE"
+          ).length,
+
+        finished:
+          matches.filter(
+            (match) =>
+              match
+                ?.status
+                ?.category ===
+              "FINISHED"
+          ).length,
+
+        unavailable:
+          matches.filter(
+            (match) =>
+              match
+                ?.status
+                ?.category ===
+              "UNAVAILABLE"
+          ).length,
+
+        aiLabAvailable:
+          matches.filter(
+            (match) =>
+              match
+                ?.analysis
+                ?.aiLab
+                ?.available ===
+              true
+          ).length,
+
+        brainStudioAvailable:
+          matches.filter(
+            (match) =>
+              match
+                ?.analysis
+                ?.brainStudio
+                ?.available ===
+              true
+          ).length,
+
+        fixturesFromApi:
+          rawFixtures.length,
+
+        enabledLeagues:
+          enabledLeagueIds.size,
+
+        excludedByLeagueManager:
+          Math.max(
+            0,
+            rawFixtures.length -
+              fixtures.length
+          ),
+      };
+
+      return res.json({
+        ok: true,
+
+        date,
+
+        summary,
+
+        matches,
+
+        generatedAt:
+          new Date()
+            .toISOString(),
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /public/programme-du-jour :",
+        error
+      );
+
+      return res
+        .status(
+          error
+            ?.response
+            ?.status ||
+            error
+              ?.status ||
+            500
+        )
+        .json({
+          ok: false,
+
+          error:
+            error
+              ?.message ||
+            "Impossible de charger le Programme du jour.",
+
+          apiData:
+            error
+              ?.response
+              ?.data ||
+            null,
+        });
+    }
+  }
+);
                       function getParisDateString() {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Paris",
