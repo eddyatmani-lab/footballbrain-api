@@ -1,4 +1,5 @@
 require("dotenv").config();
+const nodeCrypto = require("crypto");
 function parseEnvironmentBoolean(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
@@ -103,6 +104,8 @@ const FINISHED_FIXTURE_STATUSES = new Set([
 ]);
 const API_BASE_URL =
   "https://v3.football.api-sports.io";
+
+const DEFAULT_BOOKMAKER = 4; // Pinnacle
 
 
 /*
@@ -328,7 +331,7 @@ async function callApiFootball(
  * ============================================================
  *
  * Synchronisation API-Football des cotes,
- * sélection des bookmakers autorisés par OddsSyncService,
+ * sélection Pinnacle / bookmakers autorisés,
  * application automatique des meilleures cotes
  * et routes /internal/odds/*.
  */
@@ -472,6 +475,215 @@ app.get("/health", (req, res) => {
  * Renvoie les compétitions Railway associées à une liste de fixtures.
  * Une seule requête SQL est utilisée, même pour plusieurs milliers d'IDs.
  */
+/*
+ * ============================================================
+ * COMPTEUR DE VISITES FOOTBALL AI PRO
+ * ============================================================
+ *
+ * Une visite maximum par jour pour une même combinaison
+ * IP + navigateur.
+ *
+ * Aucune IP brute n'est enregistrée en base.
+ */
+
+async function ensureSiteVisitsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS site_visits (
+      id BIGSERIAL PRIMARY KEY,
+      visit_date DATE NOT NULL,
+      visitor_hash TEXT NOT NULL,
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+      UNIQUE (
+        visit_date,
+        visitor_hash
+      )
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_site_visits_date
+    ON site_visits(visit_date);
+  `);
+}
+
+function getSiteVisitorIp(req) {
+  const forwardedFor =
+    String(
+      req.headers[
+        "x-forwarded-for"
+      ] || ""
+    )
+      .split(",")[0]
+      .trim();
+
+  return (
+    forwardedFor ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown"
+  );
+}
+
+function buildSiteVisitorHash(req) {
+  const ip =
+    getSiteVisitorIp(req);
+
+  const userAgent =
+    String(
+      req.headers[
+        "user-agent"
+      ] || "unknown"
+    );
+
+  const salt =
+    String(
+      process.env
+        .SITE_VISITOR_SALT ||
+      process.env
+        .ADMIN_API_KEY ||
+      "football-ai-pro-visits"
+    );
+
+  return nodeCrypto
+    .createHash("sha256")
+    .update(
+      `${salt}|${ip}|${userAgent}`
+    )
+    .digest("hex");
+}
+
+async function getSiteVisitStats() {
+  await ensureSiteVisitsTable();
+
+  const result =
+    await pool.query(`
+      SELECT
+        COUNT(*)::INTEGER
+          AS total_visits,
+
+        COUNT(*) FILTER (
+          WHERE visit_date =
+            (
+              NOW()
+              AT TIME ZONE
+              'Europe/Paris'
+            )::date
+        )::INTEGER
+          AS today_visits
+
+      FROM site_visits
+    `);
+
+  const row =
+    result.rows[0] || {};
+
+  return {
+    totalVisits:
+      Number(
+        row.total_visits || 0
+      ),
+
+    todayVisits:
+      Number(
+        row.today_visits || 0
+      ),
+  };
+}
+
+app.post(
+  "/public/site-visit",
+  async (req, res) => {
+    try {
+      await ensureSiteVisitsTable();
+
+      const visitorHash =
+        buildSiteVisitorHash(req);
+
+      const insertResult =
+        await pool.query(
+          `
+            INSERT INTO site_visits (
+              visit_date,
+              visitor_hash
+            )
+            VALUES (
+              (
+                NOW()
+                AT TIME ZONE
+                'Europe/Paris'
+              )::date,
+              $1
+            )
+
+            ON CONFLICT (
+              visit_date,
+              visitor_hash
+            )
+            DO NOTHING
+
+            RETURNING id
+          `,
+          [
+            visitorHash,
+          ]
+        );
+
+      const stats =
+        await getSiteVisitStats();
+
+      return res.json({
+        ok: true,
+
+        counted:
+          insertResult.rowCount > 0,
+
+        ...stats,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR SITE VISIT :",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "Impossible d'enregistrer la visite.",
+        });
+    }
+  }
+);
+
+app.get(
+  "/public/site-stats",
+  async (req, res) => {
+    try {
+      const stats =
+        await getSiteVisitStats();
+
+      return res.json({
+        ok: true,
+        ...stats,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR SITE STATS :",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "Impossible de charger les statistiques du site.",
+        });
+    }
+  }
+);
 app.post("/internal/fixture-competitions", async (req, res) => {
     if (!requireOptionalAdminKey(req, res)) {
   return;
@@ -1694,7 +1906,7 @@ if (
       homeRecentResponse,
       awayRecentResponse,
       h2hResponse,
-      market,
+      oddsResponse,
 injuriesResponse,
 lineupsResponse,
     ] = await Promise.all([
@@ -1716,12 +1928,10 @@ lineupsResponse,
         timezone: "Europe/Paris",
       }),
 
-      getOfficialMatchWinnerMarket(
-        fixtureId,
-        {
-          refresh: true,
-        }
-      ),
+      callApiFootball("/odds", {
+  fixture: fixtureId,
+  bookmaker: DEFAULT_BOOKMAKER,
+}),
 callApiFootball("/injuries", {
   fixture: fixtureId,
 }),
@@ -1760,6 +1970,10 @@ const homeResults = homeRecentForm.map(
 const awayResults = awayRecentForm.map(
   (match) => getTeamResult(match, awayTeamId)
 );
+const rawOdds = oddsResponse.data?.response || [];
+
+const market = summarizeMatchWinnerOdds(rawOdds);
+
 const injuries =
   injuriesResponse.data?.response || [];
 
@@ -2238,142 +2452,65 @@ function computeFootballBrainScore(
     advantage: homeScore - awayScore,
   };
 }
-async function getOfficialMatchWinnerMarket(
-  fixtureId,
-  {
-    refresh = false,
-  } = {}
-) {
-  const normalizedFixtureId =
-    Number(fixtureId);
+function summarizeMatchWinnerOdds(oddsData) {
+  const homeOdds = [];
+  const drawOdds = [];
+  const awayOdds = [];
 
-  if (
-    !Number.isInteger(
-      normalizedFixtureId
-    ) ||
-    normalizedFixtureId <= 0
-  ) {
-    throw new Error(
-      "fixtureId invalide pour les cotes."
-    );
-  }
-
-  /*
-   * Source officielle unique des cotes :
-   * OddsSyncService.
-   *
-   * Le service applique la politique bookmaker
-   * courante (FR_ONLY_V2) avant d'enregistrer
-   * puis de relire les cotes de market_odds.
-   */
-  if (refresh) {
-    await oddsSyncService.syncFixture(
-      normalizedFixtureId
-    );
-  }
-
-  const oddsMap =
-    await oddsSyncService.getCurrentOddsMap(
-      [normalizedFixtureId]
-    );
-
-  const getOdd = (marketKey) => {
-    const stored =
-      oddsMap.get(
-        `${normalizedFixtureId}:${marketKey}`
+  for (const fixtureOdds of oddsData) {
+    for (const bookmaker of fixtureOdds.bookmakers || []) {
+      const matchWinner = (bookmaker.bets || []).find(
+        (bet) => bet.name === "Match Winner"
       );
 
-    const odd =
-      Number(stored?.odd);
+      if (!matchWinner) continue;
 
-    return Number.isFinite(odd) &&
-      odd > 1
-      ? odd
-      : null;
-  };
+      for (const item of matchWinner.values || []) {
+        const odd = Number(item.odd);
 
-  const home =
-    getOdd("HOME");
+        if (!Number.isFinite(odd)) continue;
 
-  const draw =
-    getOdd("DRAW");
-
-  const away =
-    getOdd("AWAY");
-
-  const availableOdds = [
-    {
-      key: "home",
-      odd: home,
-    },
-    {
-      key: "draw",
-      odd: draw,
-    },
-    {
-      key: "away",
-      odd: away,
-    },
-  ].filter(
-    (item) =>
-      item.odd !== null
-  );
-
-  const favorite =
-    availableOdds.length > 0
-      ? availableOdds.reduce(
-          (best, current) =>
-            current.odd < best.odd
-              ? current
-              : best
-        ).key
-      : null;
-
-  const bookmakerNames =
-    new Set();
-
-  for (
-    const marketKey of [
-      "HOME",
-      "DRAW",
-      "AWAY",
-    ]
-  ) {
-    const stored =
-      oddsMap.get(
-        `${normalizedFixtureId}:${marketKey}`
-      );
-
-    if (stored?.bookmaker) {
-      bookmakerNames.add(
-        String(
-          stored.bookmaker
-        )
-      );
+        if (item.value === "Home") homeOdds.push(odd);
+        if (item.value === "Draw") drawOdds.push(odd);
+        if (item.value === "Away") awayOdds.push(odd);
+      }
     }
   }
 
+  const average = (values) => {
+    if (values.length === 0) return null;
+
+    return Number(
+      (
+        values.reduce((sum, value) => sum + value, 0) /
+        values.length
+      ).toFixed(2)
+    );
+  };
+
+  const home = average(homeOdds);
+  const draw = average(drawOdds);
+  const away = average(awayOdds);
+
+  const availableOdds = [
+    { key: "home", odd: home },
+    { key: "draw", odd: draw },
+    { key: "away", odd: away },
+  ].filter((item) => item.odd !== null);
+
+  const favorite =
+    availableOdds.length > 0
+      ? availableOdds.reduce((best, current) =>
+          current.odd < best.odd ? current : best
+        ).key
+      : null;
+
   return {
-    /*
-     * Ces noms sont conservés pour compatibilité
-     * avec les moteurs existants. Il s'agit
-     * désormais de cotes officielles filtrées,
-     * et non d'une moyenne brute multi-bookmakers.
-     */
-    homeAverageOdd:
-      home,
-    drawAverageOdd:
-      draw,
-    awayAverageOdd:
-      away,
-    marketFavorite:
-      favorite,
-    bookmakersUsed:
-      bookmakerNames.size,
-    bookmakerPolicyVersion:
-      oddsSyncService
-        .BOOKMAKER_POLICY_VERSION ||
-      null,
+    homeAverageOdd: home,
+    drawAverageOdd: draw,
+    awayAverageOdd: away,
+    marketFavorite: favorite,
+    bookmakersUsed: homeOdds.length,
   };
 }
 
@@ -12832,7 +12969,7 @@ function getSelectedProbability(
 async function runHourlyOddsWatcher() {
   if (hourlyOddsWatcherRunning) {
     console.log(
-      "ODDS WATCHER FR_ONLY : contrôle déjà en cours"
+      "ODDS WATCHER : contrôle déjà en cours"
     );
     return;
   }
@@ -12852,7 +12989,7 @@ async function runHourlyOddsWatcher() {
       getParisDateString();
 
     console.log(
-      `ODDS WATCHER FR_ONLY : contrôle du ${date}`
+      `ODDS WATCHER : contrôle du ${date}`
     );
 
     /*
@@ -12896,12 +13033,21 @@ async function runHourlyOddsWatcher() {
       try {
         summary.checked += 1;
 
-        const market =
-          await getOfficialMatchWinnerMarket(
-            fixtureId,
+        const oddsResponse =
+          await callApiFootball(
+            "/odds",
             {
-              refresh: true,
+              fixture: fixtureId,
             }
+          );
+
+        const rawOdds =
+          oddsResponse.data?.response ||
+          [];
+
+        const market =
+          summarizeMatchWinnerOdds(
+            rawOdds
           );
 
         const newMarketOdd =
@@ -12974,7 +13120,7 @@ async function runHourlyOddsWatcher() {
           movementPercent >= 10
         ) {
           console.log(
-            "ODDS WATCHER FR_ONLY : mouvement important",
+            "ODDS WATCHER : mouvement important",
             {
               fixtureId,
               oldMarketOdd,
@@ -13034,7 +13180,7 @@ async function runHourlyOddsWatcher() {
         summary.failed += 1;
 
         console.error(
-          "ODDS WATCHER FR_ONLY : erreur",
+          "ODDS WATCHER : erreur",
           {
             fixtureId,
             error:
@@ -13048,12 +13194,12 @@ async function runHourlyOddsWatcher() {
     }
 
     console.log(
-      "ODDS WATCHER FR_ONLY : terminé",
+      "ODDS WATCHER : terminé",
       summary
     );
   } catch (error) {
     console.error(
-      "ODDS WATCHER FR_ONLY : erreur générale",
+      "ODDS WATCHER : erreur générale",
       error.message
     );
   } finally {
