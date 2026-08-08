@@ -1,16 +1,26 @@
 "use strict";
 
 const DEFAULT_TIMEZONE = "Europe/Paris";
-const DEFAULT_SYNC_HOURS = 3;
-const DEFAULT_NEAR_KICKOFF_INTERVAL_MINUTES = 15;
-const DEFAULT_NEAR_KICKOFF_MAX_MINUTES = 100;
-const DEFAULT_NEAR_KICKOFF_MIN_MINUTES = 20;
+const DEFAULT_SYNC_HOURS = 1;
+
+/*
+ * Politique "Fresh Odds" :
+ * - cycle de proximité toutes les 5 minutes ;
+ * - fréquence réelle adaptée au temps restant avant le coup d'envoi.
+ */
+const DEFAULT_NEAR_KICKOFF_INTERVAL_MINUTES = 5;
+const DEFAULT_NEAR_KICKOFF_MAX_MINUTES = 360;
+const DEFAULT_NEAR_KICKOFF_MIN_MINUTES = 0;
+
+const FRESH_ODDS_POLICY_VERSION = "FRESH_ODDS_V1";
+const ODDS_FRESHNESS_GREEN_MINUTES = 5;
+const ODDS_FRESHNESS_AMBER_MINUTES = 15;
 
 const BOOKMAKER_POLICY_VERSION = "FR_ONLY_V2";
 
 const MARKET_MAPPING_POLICY_VERSION = "STRICT_CORE_MARKETS_V1";
 
-const AUTO_ODDS_POLICY_VERSION = "BEST_ALLOWED_COHERENT_V3";
+const AUTO_ODDS_POLICY_VERSION = "BEST_ALLOWED_COHERENT_V4";
 
 /*
  * Une cote très éloignée de la probabilité IA est généralement un marché
@@ -434,6 +444,95 @@ function normalizedMarketSql(columnName) {
     WHEN ${compact} IN ('UNDER25', 'UNDER250', 'MOINS25') THEN 'UNDER25'
     ELSE ${compact}
   END`;
+}
+
+function getOddsFreshnessMeta(capturedAt) {
+  if (!capturedAt) {
+    return {
+      ageSeconds: null,
+      ageMinutes: null,
+      freshness: "UNKNOWN",
+      stale: true,
+    };
+  }
+
+  const capturedTime =
+    new Date(capturedAt).getTime();
+
+  if (!Number.isFinite(capturedTime)) {
+    return {
+      ageSeconds: null,
+      ageMinutes: null,
+      freshness: "UNKNOWN",
+      stale: true,
+    };
+  }
+
+  const ageMilliseconds =
+    Math.max(
+      0,
+      Date.now() - capturedTime
+    );
+
+  const ageSeconds =
+    Math.floor(
+      ageMilliseconds / 1000
+    );
+
+  const ageMinutes =
+    ageMilliseconds /
+    (60 * 1000);
+
+  let freshness = "RED";
+
+  if (
+    ageMinutes <=
+    ODDS_FRESHNESS_GREEN_MINUTES
+  ) {
+    freshness = "GREEN";
+  } else if (
+    ageMinutes <=
+    ODDS_FRESHNESS_AMBER_MINUTES
+  ) {
+    freshness = "AMBER";
+  }
+
+  return {
+    ageSeconds,
+    ageMinutes:
+      Number(
+        ageMinutes.toFixed(1)
+      ),
+    freshness,
+    stale:
+      ageMinutes >
+      ODDS_FRESHNESS_AMBER_MINUTES,
+  };
+}
+
+function getDesiredRefreshMinutes(
+  minutesToKickoff
+) {
+  const minutes =
+    Number(minutesToKickoff);
+
+  if (!Number.isFinite(minutes)) {
+    return 60;
+  }
+
+  if (minutes <= 30) {
+    return 5;
+  }
+
+  if (minutes <= 120) {
+    return 10;
+  }
+
+  if (minutes <= 360) {
+    return 30;
+  }
+
+  return 60;
 }
 
 function parisDate(value = new Date()) {
@@ -1040,49 +1139,182 @@ return Array.from(groupedRows.values());
 
   async function syncNearKickoff() {
     if (syncingNearKickoff) {
-      return { ok: true, skipped: true, reason: "NEAR_KICKOFF_SYNC_ALREADY_RUNNING" };
+      return {
+        ok: true,
+        skipped: true,
+        reason:
+          "NEAR_KICKOFF_SYNC_ALREADY_RUNNING",
+      };
     }
+
     syncingNearKickoff = true;
+
     try {
       await ensureTables();
-      const result = await pool.query(
-        `
-          SELECT DISTINCT ON (fixture_id)
-            fixture_id,
-            fixture_date
-          FROM predictions
-          WHERE fixture_date BETWEEN
-            NOW() + ($1::text || ' minutes')::interval
-            AND NOW() + ($2::text || ' minutes')::interval
-          ORDER BY fixture_id, updated_at DESC NULLS LAST, id DESC
-        `,
-        [DEFAULT_NEAR_KICKOFF_MIN_MINUTES, DEFAULT_NEAR_KICKOFF_MAX_MINUTES]
-      );
+
+      const result =
+        await pool.query(
+          `
+            SELECT DISTINCT ON (fixture_id)
+              fixture_id,
+              fixture_date,
+
+              EXTRACT(
+                EPOCH FROM (
+                  fixture_date -
+                  NOW()
+                )
+              ) / 60.0
+                AS minutes_to_kickoff
+
+            FROM predictions
+
+            WHERE
+              fixture_date >
+                NOW()
+
+              AND fixture_date <=
+                NOW() +
+                (
+                  $1::text ||
+                  ' minutes'
+                )::interval
+
+            ORDER BY
+              fixture_id,
+              updated_at DESC NULLS LAST,
+              id DESC
+          `,
+          [
+            DEFAULT_NEAR_KICKOFF_MAX_MINUTES,
+          ]
+        );
 
       const synced = [];
+      const skippedFresh = [];
+
       for (const row of result.rows) {
-        const freshness = await pool.query(
-          `
-            SELECT MAX(captured_at) AS last_capture
-            FROM market_odds
-            WHERE fixture_id = $1
-          `,
-          [row.fixture_id]
-        );
-        const lastCapture = freshness.rows[0]?.last_capture
-          ? new Date(freshness.rows[0].last_capture)
-          : null;
-        if (lastCapture && Date.now() - lastCapture.getTime() < 20 * 60 * 1000) {
+        const minutesToKickoff =
+          Number(
+            row.minutes_to_kickoff
+          );
+
+        const desiredRefreshMinutes =
+          getDesiredRefreshMinutes(
+            minutesToKickoff
+          );
+
+        const freshness =
+          await pool.query(
+            `
+              SELECT
+                MAX(captured_at)
+                  AS last_capture
+
+              FROM market_odds
+
+              WHERE
+                fixture_id = $1
+                AND is_current = TRUE
+            `,
+            [
+              row.fixture_id,
+            ]
+          );
+
+        const lastCapture =
+          freshness.rows[0]
+            ?.last_capture
+            ? new Date(
+                freshness.rows[0]
+                  .last_capture
+              )
+            : null;
+
+        const ageMinutes =
+          lastCapture
+            ? (
+                Date.now() -
+                lastCapture.getTime()
+              ) /
+              (60 * 1000)
+            : null;
+
+        if (
+          ageMinutes !== null &&
+          ageMinutes <
+            desiredRefreshMinutes
+        ) {
+          skippedFresh.push({
+            fixtureId:
+              Number(
+                row.fixture_id
+              ),
+            minutesToKickoff:
+              Number(
+                minutesToKickoff
+                  .toFixed(1)
+              ),
+            ageMinutes:
+              Number(
+                ageMinutes
+                  .toFixed(1)
+              ),
+            desiredRefreshMinutes,
+          });
+
           continue;
         }
-        synced.push(await syncFixture(row.fixture_id));
+
+        const syncResult =
+          await syncFixture(
+            row.fixture_id
+          );
+
+        synced.push({
+          ...syncResult,
+
+          minutesToKickoff:
+            Number(
+              minutesToKickoff
+                .toFixed(1)
+            ),
+
+          desiredRefreshMinutes,
+        });
       }
 
       return {
         ok: true,
-        checked: result.rows.length,
-        synced: synced.length,
-        details: synced,
+
+        policyVersion:
+          FRESH_ODDS_POLICY_VERSION,
+
+        checked:
+          result.rows.length,
+
+        synced:
+          synced.length,
+
+        skippedFresh:
+          skippedFresh.length,
+
+        schedule: {
+          under30Minutes:
+            5,
+          from30To120Minutes:
+            10,
+          from120To360Minutes:
+            30,
+          beyond360Minutes:
+            60,
+        },
+
+        details:
+          synced,
+
+        freshDetails:
+          skippedFresh,
       };
     } finally {
       syncingNearKickoff = false;
@@ -1132,6 +1364,11 @@ return Array.from(groupedRows.values());
     );
 
     for (const row of result.rows) {
+      const freshnessMeta =
+        getOddsFreshnessMeta(
+          row.captured_at
+        );
+
       map.set(`${row.fixture_id}:${row.market_key}`, {
         odd: Number(row.odd),
         bookmakerId: row.bookmaker_id === null ? null : Number(row.bookmaker_id),
@@ -1148,6 +1385,7 @@ return Array.from(groupedRows.values());
         mappingPolicyVersion:
           row.raw_payload?.mappingPolicyVersion ||
           null,
+        ...freshnessMeta,
       });
     }
     return map;
@@ -1178,7 +1416,17 @@ return Array.from(groupedRows.values());
       bookmakerOdds: stored.odd,
       bookmakerOdd: stored.odd,
       oddsAvailable: true,
-      oddsFresh: Date.now() - new Date(stored.capturedAt).getTime() <= 12 * 60 * 60 * 1000,
+      oddsFresh:
+        stored.stale !== true,
+      oddsFreshness:
+        stored.freshness ||
+        "UNKNOWN",
+      oddsAgeSeconds:
+        stored.ageSeconds ??
+        null,
+      oddsAgeMinutes:
+        stored.ageMinutes ??
+        null,
       bookmaker: stored.bookmaker,
       oddsSource: stored.source,
       bookmakerSource: stored.source,
@@ -1569,29 +1817,37 @@ LIMIT 1
           ok: true,
           date,
           count: result.rows.length,
-          odds: result.rows.map((row) => ({
-            fixtureId: Number(row.fixture_id),
-            marketKey: row.market_key,
-            bookmakerId: row.bookmaker_id === null ? null : Number(row.bookmaker_id),
-            bookmaker: row.bookmaker_name,
-            odd: Number(row.odd),
-            source: row.source,
-            apiUpdatedAt: row.api_updated_at,
-            capturedAt: row.captured_at,
-            rawBetName:
-              row.raw_payload?.betName ||
-              null,
-            rawValue:
-              row.raw_payload?.value ||
-              null,
-            mappingPolicyVersion:
-              row.raw_payload?.mappingPolicyVersion ||
-              null,
-            homeTeam: row.home_team_name,
-            awayTeam: row.away_team_name,
-            leagueName: row.league_name,
-            kickoff: row.fixture_date,
-          })),
+          odds: result.rows.map((row) => {
+            const freshnessMeta =
+              getOddsFreshnessMeta(
+                row.captured_at
+              );
+
+            return {
+              fixtureId: Number(row.fixture_id),
+              marketKey: row.market_key,
+              bookmakerId: row.bookmaker_id === null ? null : Number(row.bookmaker_id),
+              bookmaker: row.bookmaker_name,
+              odd: Number(row.odd),
+              source: row.source,
+              apiUpdatedAt: row.api_updated_at,
+              capturedAt: row.captured_at,
+              ...freshnessMeta,
+              rawBetName:
+                row.raw_payload?.betName ||
+                null,
+              rawValue:
+                row.raw_payload?.value ||
+                null,
+              mappingPolicyVersion:
+                row.raw_payload?.mappingPolicyVersion ||
+                null,
+              homeTeam: row.home_team_name,
+              awayTeam: row.away_team_name,
+              leagueName: row.league_name,
+              kickoff: row.fixture_date,
+            };
+          }),
         });
       } catch (error) {
         return res.status(500).json({ ok: false, error: error.message });
@@ -1646,6 +1902,16 @@ LIMIT 1
         ok: true,
         policyVersion:
           BOOKMAKER_POLICY_VERSION,
+        marketMappingPolicyVersion:
+          MARKET_MAPPING_POLICY_VERSION,
+        freshOddsPolicyVersion:
+          FRESH_ODDS_POLICY_VERSION,
+        freshness: {
+          greenMaxMinutes:
+            ODDS_FRESHNESS_GREEN_MINUTES,
+          amberMaxMinutes:
+            ODDS_FRESHNESS_AMBER_MINUTES,
+        },
         referenceBookmaker: null,
         priority:
           BOOKMAKER_PRIORITY_ORDER.map(
@@ -1733,6 +1999,7 @@ LIMIT 1
     isAllowedBookmaker,
     BOOKMAKER_POLICY_VERSION,
     MARKET_MAPPING_POLICY_VERSION,
+    FRESH_ODDS_POLICY_VERSION,
   };
 }
 
@@ -1744,4 +2011,5 @@ module.exports = {
   bookmakerPriority,
   BOOKMAKER_POLICY_VERSION,
   MARKET_MAPPING_POLICY_VERSION,
+  FRESH_ODDS_POLICY_VERSION,
 };
