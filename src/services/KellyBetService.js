@@ -1,5 +1,5 @@
 const KELLY_SERVICE_VERSION =
-  "KELLY-BET-SERVICE-V1";
+  "KELLY-BET-SERVICE-V2";
 
 const DEFAULT_CONFIG =
   Object.freeze({
@@ -71,13 +71,6 @@ function normalizeProbability(
     return null;
   }
 
-  /*
-   * Brain Studio utilise normalement
-   * une probabilité en pourcentage.
-   *
-   * On accepte aussi exceptionnellement
-   * une valeur 0-1.
-   */
   if (
     number > 0 &&
     number <= 1
@@ -304,7 +297,18 @@ function calculateFractionalKelly({
   const normalizedFraction =
     Math.max(
       0,
-      Number(fraction) || 0
+      Math.min(
+        1,
+        Number(fraction) || 0
+      )
+    );
+
+  const normalizedMaximumStakePercent =
+    Math.max(
+      0,
+      Number(
+        maximumStakePercent
+      ) || 0
     );
 
   if (
@@ -320,6 +324,9 @@ function calculateFractionalKelly({
 
       cappedKellyPercent:
         0,
+
+      ceilingApplied:
+        false,
     };
   }
 
@@ -328,17 +335,13 @@ function calculateFractionalKelly({
     normalizedFraction;
 
   const fractionalKellyPercent =
-    fractionalKelly * 100;
+    fractionalKelly *
+    100;
 
   const cappedKellyPercent =
     Math.min(
       fractionalKellyPercent,
-      Math.max(
-        0,
-        Number(
-          maximumStakePercent
-        ) || 0
-      )
+      normalizedMaximumStakePercent
     );
 
   return {
@@ -355,6 +358,10 @@ function calculateFractionalKelly({
         cappedKellyPercent,
         2
       ),
+
+    ceilingApplied:
+      fractionalKellyPercent >
+      normalizedMaximumStakePercent,
   };
 }
 
@@ -721,6 +728,14 @@ function buildKellyBet(
       cappedPercent:
         fractional
           .cappedKellyPercent,
+
+      maximumStakePercent:
+        mergedConfig
+          .maximumStakePercent,
+
+      ceilingApplied:
+        fractional
+          .ceilingApplied,
 
       suggestedStake,
     },

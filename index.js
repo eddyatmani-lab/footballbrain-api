@@ -25242,7 +25242,35 @@ app.get(
         bankroll > 0
           ? bankroll
           : null;
+const requestedKellyFraction =
+  Number(
+    req.query.kellyFraction
+  );
 
+const kellyFraction =
+  Number.isFinite(
+    requestedKellyFraction
+  ) &&
+  requestedKellyFraction > 0 &&
+  requestedKellyFraction <= 1
+    ? requestedKellyFraction
+    : 0.20;
+
+const requestedMaximumStakePercent =
+  Number(
+    req.query.maximumStakePercent
+  );
+
+const maximumStakePercent =
+  Number.isFinite(
+    requestedMaximumStakePercent
+  ) &&
+  requestedMaximumStakePercent > 0
+    ? Math.min(
+        requestedMaximumStakePercent,
+        100
+      )
+    : 3;
       const includeRejected =
         String(
           req.query
@@ -25428,28 +25456,43 @@ app.get(
         );
 
       const kelly =
-        buildDailyKellyBets(
-          rows,
-          {
-            bankroll:
-              normalizedBankroll,
+  buildDailyKellyBets(
+    rows,
+    {
+      bankroll:
+        normalizedBankroll,
 
-            includeRejected,
-          }
-        );
+      includeRejected,
 
-      return res.json({
-        ok: true,
+      config: {
+        fractionalKelly:
+          kellyFraction,
 
-        generatedAt:
-          new Date()
-            .toISOString(),
+        maximumStakePercent:
+          maximumStakePercent,
+      },
+    }
+  );
+   return res.json({
+  ok: true,
 
-        bankroll:
-          normalizedBankroll,
+  generatedAt:
+    new Date()
+      .toISOString(),
 
-        ...kelly,
-      });
+  bankroll:
+    normalizedBankroll,
+
+  kellySettings: {
+    fraction:
+      kellyFraction,
+
+    maximumStakePercent:
+      maximumStakePercent,
+  },
+
+  ...kelly,
+});
     } catch (error) {
       console.error(
         "ERREUR /public/paris-du-jour :",
