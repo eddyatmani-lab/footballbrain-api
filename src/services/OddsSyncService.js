@@ -8,7 +8,9 @@ const DEFAULT_NEAR_KICKOFF_MIN_MINUTES = 20;
 
 const BOOKMAKER_POLICY_VERSION = "FR_ONLY_V2";
 
-const AUTO_ODDS_POLICY_VERSION = "BEST_ALLOWED_COHERENT_V2";
+const MARKET_MAPPING_POLICY_VERSION = "STRICT_CORE_MARKETS_V1";
+
+const AUTO_ODDS_POLICY_VERSION = "BEST_ALLOWED_COHERENT_V3";
 
 /*
  * Une cote très éloignée de la probabilité IA est généralement un marché
@@ -337,40 +339,64 @@ function bookmakerPrioritySql(
 }
 
 function normalizeMarketKeyFromApi(betName, valueName) {
-  const bet = normalizeText(betName);
-  const value = normalizeText(valueName);
+  const bet = normalizeText(betName)
+    .replace(/\s+/g, " ")
+    .trim();
 
-  if (
-    bet.includes("match winner") ||
-    bet === "1x2" ||
-    bet.includes("winner")
-  ) {
+  const value = normalizeText(valueName)
+    .replace(",", ".")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  /*
+   * IMPORTANT :
+   * Le mapping est volontairement STRICT.
+   *
+   * On ne doit jamais transformer :
+   * - "First 10 min Winner" en HOME/DRAW/AWAY ;
+   * - "Goals Over/Under First Half" en OVER25/UNDER25 ;
+   * - "Home Team Total Goals" en OVER25/UNDER25 ;
+   * - une ligne Over 1.5 / Under 4.5 en Over/Under 2.5.
+   *
+   * Les anciennes règles basées sur includes("winner"),
+   * includes("total goals") ou includes("over/under")
+   * pouvaient mélanger des marchés totalement différents.
+   */
+
+  const matchWinnerNames = new Set([
+    "match winner",
+    "1x2",
+  ]);
+
+  const bothTeamsScoreNames = new Set([
+    "both teams score",
+    "both teams to score",
+    "btts",
+  ]);
+
+  const fullMatchGoalsNames = new Set([
+    "goals over/under",
+    "goals over under",
+    "total goals",
+  ]);
+
+  if (matchWinnerNames.has(bet)) {
     if (["home", "1", "domicile"].includes(value)) return "HOME";
     if (["draw", "x", "nul"].includes(value)) return "DRAW";
     if (["away", "2", "exterieur"].includes(value)) return "AWAY";
+    return null;
   }
 
-  if (
-    bet.includes("both teams") ||
-    bet.includes("btts") ||
-    bet.includes("les deux equipes")
-  ) {
+  if (bothTeamsScoreNames.has(bet)) {
     if (["yes", "oui", "true"].includes(value)) return "BTTS_YES";
     if (["no", "non", "false"].includes(value)) return "BTTS_NO";
+    return null;
   }
 
-  if (
-    bet.includes("over/under") ||
-    bet.includes("goals over") ||
-    bet.includes("total goals") ||
-    bet.includes("buts")
-  ) {
-    if (/^over\s*2[.,]5$/.test(value) || value === "over 2.5") {
-      return "OVER25";
-    }
-    if (/^under\s*2[.,]5$/.test(value) || value === "under 2.5") {
-      return "UNDER25";
-    }
+  if (fullMatchGoalsNames.has(bet)) {
+    if (value === "over 2.5") return "OVER25";
+    if (value === "under 2.5") return "UNDER25";
+    return null;
   }
 
   return null;
@@ -478,6 +504,118 @@ function createOddsSyncService({
         finished_at TIMESTAMPTZ
       );
     `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS odds_policy_state (
+        policy_key TEXT PRIMARY KEY,
+        policy_value TEXT NOT NULL,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    /*
+     * Migration one-shot :
+     * toutes les cotes API enregistrées avant le mapping strict
+     * sont invalidées. Les cotes automatiques déjà copiées dans
+     * predictions sont également supprimées afin qu'une ancienne
+     * cote mal appariée ne reste jamais affichée.
+     *
+     * Les vraies saisies manuelles administrateur ne sont PAS touchées.
+     */
+    const policyState = await pool.query(
+      `
+        SELECT policy_value
+        FROM odds_policy_state
+        WHERE policy_key = 'market_mapping'
+        LIMIT 1
+      `
+    );
+
+    const currentPolicy =
+      policyState.rows[0]?.policy_value ||
+      null;
+
+    if (
+      currentPolicy !==
+      MARKET_MAPPING_POLICY_VERSION
+    ) {
+      const client =
+        await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        await client.query(
+          `
+            UPDATE market_odds
+            SET is_current = FALSE
+            WHERE source = 'API_FOOTBALL'
+              AND COALESCE(
+                raw_payload->>'mappingPolicyVersion',
+                ''
+              ) <> $1
+          `,
+          [
+            MARKET_MAPPING_POLICY_VERSION,
+          ]
+        );
+
+        await client.query(
+          `
+            UPDATE predictions
+            SET
+              manual_market_odd = NULL,
+              manual_odd_source = NULL,
+              manual_odd_entered_at = NULL,
+              manual_odd_updated_at = NULL,
+              manual_odd_entered_by = NULL,
+              manual_profit_units = NULL,
+              manual_roi_percent = NULL,
+              updated_at = NOW()
+            WHERE manual_odd_source
+              LIKE 'AUTO_BEST_ODD%'
+          `
+        );
+
+        await client.query(
+          `
+            INSERT INTO odds_policy_state (
+              policy_key,
+              policy_value,
+              applied_at
+            )
+            VALUES (
+              'market_mapping',
+              $1,
+              NOW()
+            )
+            ON CONFLICT (policy_key)
+            DO UPDATE SET
+              policy_value =
+                EXCLUDED.policy_value,
+              applied_at = NOW()
+          `,
+          [
+            MARKET_MAPPING_POLICY_VERSION,
+          ]
+        );
+
+        await client.query("COMMIT");
+
+        console.log(
+          "ODDS MAPPING MIGRATION APPLIQUÉE",
+          {
+            mappingPolicyVersion:
+              MARKET_MAPPING_POLICY_VERSION,
+          }
+        );
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
   }
 
   async function beginRun(syncType, target) {
@@ -569,6 +707,23 @@ if (suspended) {
               betId: bet?.id ?? null,
               betName: bet?.name ?? null,
               value: value?.value ?? null,
+              normalizedBetName:
+                normalizeText(
+                  bet?.name
+                )
+                  .replace(/\s+/g, " ")
+                  .trim(),
+              normalizedValue:
+                normalizeText(
+                  value?.value
+                )
+                  .replace(",", ".")
+                  .replace(/\s+/g, " ")
+                  .trim(),
+              mappedMarketKey:
+                marketKey,
+              mappingPolicyVersion:
+                MARKET_MAPPING_POLICY_VERSION,
               suspended: value?.suspended ?? null,
               main: value?.main ?? null,
               bookmakerPolicyVersion:
@@ -584,17 +739,14 @@ if (suspended) {
     }
 
     /*
- * Plusieurs lignes API peuvent correspondre au même marché chez un même
- * bookmaker. On ne conserve qu'une seule ligne par :
- *
- * fixture + marché + bookmaker
- *
- * Priorités :
- * 1. ligne non suspendue ;
- * 2. ligne principale ;
- * 3. donnée la plus proche d'un marché standard ;
- * 4. en dernier recours, cote la moins extrême.
- */
+     * Après le mapping strict, plusieurs lignes ne devraient normalement
+     * plus pointer vers le même marché chez un même bookmaker.
+     *
+     * Si l'API renvoie malgré tout un doublon strictement identique :
+     * 1. ligne non suspendue ;
+     * 2. ligne principale ;
+     * 3. meilleure cote parmi les lignes du même marché EXACT.
+     */
 const groupedRows = new Map();
 
 for (const row of rows) {
@@ -648,15 +800,44 @@ for (const row of rows) {
   }
 
   /*
-   * À priorité égale, on évite qu'une cote secondaire très haute écrase
-   * arbitrairement une cote standard.
+   * À priorité égale, les deux lignes ont déjà été validées comme
+   * représentant exactement le même marché. On peut donc conserver
+   * la meilleure cote.
    */
-  if (Number(row.odd) < Number(current.odd)) {
+  if (Number(row.odd) > Number(current.odd)) {
     groupedRows.set(key, row);
   }
 }
 
 return Array.from(groupedRows.values());
+  }
+
+  async function invalidateCurrentApiOddsForFixture(
+    fixtureId
+  ) {
+    const id =
+      toNumber(
+        fixtureId,
+        null
+      );
+
+    if (!id) {
+      return 0;
+    }
+
+    const result =
+      await pool.query(
+        `
+          UPDATE market_odds
+          SET is_current = FALSE
+          WHERE fixture_id = $1
+            AND source = 'API_FOOTBALL'
+            AND is_current = TRUE
+        `,
+        [id]
+      );
+
+    return result.rowCount || 0;
   }
 
   async function saveRows(rows = []) {
@@ -710,6 +891,8 @@ return Array.from(groupedRows.values());
     let totalPages = 1;
     let fixtures = 0;
     let oddsSaved = 0;
+    const syncedFixtureIds =
+      new Set();
 
     try {
       do {
@@ -725,11 +908,58 @@ return Array.from(groupedRows.values());
         fixtures += items.length;
 
         for (const item of items) {
-          oddsSaved += await saveRows(extractOddsRows(item));
+          const fixtureId =
+            toNumber(
+              item?.fixture?.id,
+              null
+            );
+
+          if (fixtureId) {
+            syncedFixtureIds.add(
+              fixtureId
+            );
+
+            /*
+             * Snapshot courant :
+             * avant d'enregistrer la nouvelle réponse API,
+             * les anciennes lignes API du match cessent d'être courantes.
+             * Cela empêche une cote retirée par le bookmaker de rester
+             * active indéfiniment dans market_odds.
+             */
+            await invalidateCurrentApiOddsForFixture(
+              fixtureId
+            );
+          }
+
+          oddsSaved +=
+            await saveRows(
+              extractOddsRows(
+                item
+              )
+            );
         }
 
         page += 1;
       } while (page <= totalPages);
+
+      let automaticApply =
+        null;
+
+      if (
+        syncedFixtureIds.size > 0
+      ) {
+        automaticApply =
+          await applyBestAvailableOdds({
+            fixtureIds:
+              [
+                ...syncedFixtureIds,
+              ],
+            overwriteAutomatic:
+              true,
+            enteredBy:
+              "odds-sync-date",
+          });
+      }
 
       const result = {
         ok: true,
@@ -737,6 +967,7 @@ return Array.from(groupedRows.values());
         pages: totalPages,
         fixtures,
         oddsSaved,
+        automaticApply,
         syncedAt: new Date().toISOString(),
       };
       await finishRun(runId, result);
@@ -765,15 +996,38 @@ return Array.from(groupedRows.values());
         ? response.data.response
         : [];
       let oddsSaved = 0;
+
+      /*
+       * Un refresh fixture remplace le snapshot API courant du match.
+       */
+      await invalidateCurrentApiOddsForFixture(
+        id
+      );
+
       for (const item of items) {
-        oddsSaved += await saveRows(extractOddsRows(item));
+        oddsSaved +=
+          await saveRows(
+            extractOddsRows(
+              item
+            )
+          );
       }
+
+      const automaticApply =
+        await applyBestAvailableOdds({
+          fixtureIds: [id],
+          overwriteAutomatic: true,
+          enteredBy:
+            "odds-sync-fixture",
+        });
+
       const result = {
         ok: true,
         fixtureId: id,
         fixtures: items.length,
         pages: 1,
         oddsSaved,
+        automaticApply,
         syncedAt: new Date().toISOString(),
       };
       await finishRun(runId, result);
@@ -851,11 +1105,16 @@ return Array.from(groupedRows.values());
           odd,
           source,
           api_updated_at,
-          captured_at
+          captured_at,
+          raw_payload
         FROM market_odds
         WHERE fixture_id = ANY($1::bigint[])
           AND is_current = TRUE
           AND odd > 1
+          AND COALESCE(
+            raw_payload->>'mappingPolicyVersion',
+            ''
+          ) = '${MARKET_MAPPING_POLICY_VERSION}'
           AND (
             bookmaker_id IN (8, 16)
             OR ${allowedBookmakerSql("bookmaker_name")}
@@ -880,6 +1139,15 @@ return Array.from(groupedRows.values());
         source: row.source || "API_FOOTBALL",
         updatedAt: row.api_updated_at || row.captured_at,
         capturedAt: row.captured_at,
+        rawBetName:
+          row.raw_payload?.betName ||
+          null,
+        rawValue:
+          row.raw_payload?.value ||
+          null,
+        mappingPolicyVersion:
+          row.raw_payload?.mappingPolicyVersion ||
+          null,
       });
     }
     return map;
@@ -1001,7 +1269,8 @@ return Array.from(groupedRows.values());
           best_odd.bookmaker_name,
           best_odd.source,
           best_odd.api_updated_at,
-          best_odd.captured_at
+          best_odd.captured_at,
+          best_odd.raw_payload
 
         FROM predictions p
 
@@ -1012,11 +1281,16 @@ return Array.from(groupedRows.values());
             mo.bookmaker_name,
             mo.source,
             mo.api_updated_at,
-            mo.captured_at
+            mo.captured_at,
+            mo.raw_payload
           FROM market_odds mo
           WHERE mo.fixture_id = p.fixture_id
             AND mo.is_current = TRUE
             AND mo.odd > 1
+            AND COALESCE(
+              mo.raw_payload->>'mappingPolicyVersion',
+              ''
+            ) = '${MARKET_MAPPING_POLICY_VERSION}'
 AND mo.odd <= ${AUTO_ODDS_ABSOLUTE_MAX}
 
 AND COALESCE(
@@ -1201,6 +1475,15 @@ LIMIT 1
               : null,
           capturedAt:
             candidate.captured_at,
+          rawBetName:
+            candidate.raw_payload?.betName ||
+            null,
+          rawValue:
+            candidate.raw_payload?.value ||
+            null,
+          mappingPolicyVersion:
+            candidate.raw_payload?.mappingPolicyVersion ||
+            null,
         });
       }
     }
@@ -1246,6 +1529,7 @@ LIMIT 1
               mo.source,
               mo.api_updated_at,
               mo.captured_at,
+              mo.raw_payload,
               p.home_team_name,
               p.away_team_name,
               p.league_name,
@@ -1261,6 +1545,10 @@ LIMIT 1
             WHERE (p.fixture_date AT TIME ZONE $2)::date = $1::date
               AND mo.is_current = TRUE
               AND mo.odd > 1
+              AND COALESCE(
+                mo.raw_payload->>'mappingPolicyVersion',
+                ''
+              ) = '${MARKET_MAPPING_POLICY_VERSION}'
               AND (
                 mo.bookmaker_id IN (8, 16)
                 OR ${allowedBookmakerSql("mo.bookmaker_name")}
@@ -1290,6 +1578,15 @@ LIMIT 1
             source: row.source,
             apiUpdatedAt: row.api_updated_at,
             capturedAt: row.captured_at,
+            rawBetName:
+              row.raw_payload?.betName ||
+              null,
+            rawValue:
+              row.raw_payload?.value ||
+              null,
+            mappingPolicyVersion:
+              row.raw_payload?.mappingPolicyVersion ||
+              null,
             homeTeam: row.home_team_name,
             awayTeam: row.away_team_name,
             leagueName: row.league_name,
@@ -1435,6 +1732,7 @@ LIMIT 1
     canonicalBookmakerName,
     isAllowedBookmaker,
     BOOKMAKER_POLICY_VERSION,
+    MARKET_MAPPING_POLICY_VERSION,
   };
 }
 
@@ -1445,4 +1743,5 @@ module.exports = {
   isAllowedBookmaker,
   bookmakerPriority,
   BOOKMAKER_POLICY_VERSION,
+  MARKET_MAPPING_POLICY_VERSION,
 };
