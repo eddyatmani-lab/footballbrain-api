@@ -49,6 +49,9 @@ const {
 const {
   createOddsSyncService,
 } = require("./src/services/OddsSyncService");
+const {
+  buildDailyKellyBets,
+} = require("./src/services/KellyBetService");
 const cors = require("cors");
 const {
   FootballMonteCarlo,
@@ -25221,7 +25224,250 @@ const DEFAULT_BET_QUALIFICATION_CONFIG = Object.freeze({
     maximumRisk: 90,
   },
 });
+app.get(
+  "/public/paris-du-jour",
+  async (req, res) => {
+    try {
+      await ensureBilanV3Columns();
 
+      const bankroll =
+        Number(
+          req.query.bankroll
+        );
+
+      const normalizedBankroll =
+        Number.isFinite(
+          bankroll
+        ) &&
+        bankroll > 0
+          ? bankroll
+          : null;
+
+      const includeRejected =
+        String(
+          req.query
+            .includeRejected ||
+            ""
+        )
+          .trim()
+          .toLowerCase() ===
+        "true";
+
+      const result =
+        await pool.query(`
+          SELECT
+            fixture_id,
+            fixture_date,
+            league_id,
+            league_name,
+            home_team_name,
+            away_team_name,
+
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  official_tracked_market_key
+                ),
+                ''
+              ),
+              NULLIF(
+                BTRIM(
+                  studio_market_key
+                ),
+                ''
+              )
+            )
+              AS market_key,
+
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  official_tracked_market_label
+                ),
+                ''
+              ),
+              NULLIF(
+                BTRIM(
+                  studio_market_label
+                ),
+                ''
+              ),
+              'Marché principal'
+            )
+              AS market_label,
+
+            COALESCE(
+              official_tracked_probability,
+              studio_probability
+            )::NUMERIC
+              AS probability,
+
+            COALESCE(
+              official_tracked_decision_score,
+              studio_decision_score
+            )::NUMERIC
+              AS decision_score,
+
+            manual_market_odd::NUMERIC
+              AS bookmaker_odd,
+
+            manual_odd_source
+              AS bookmaker
+
+          FROM predictions
+
+          WHERE
+            result_status =
+              'PENDING'
+
+            AND fixture_date >
+              NOW()
+
+            AND manual_market_odd >
+              1
+
+            AND COALESCE(
+              official_tracked_probability,
+              studio_probability
+            ) IS NOT NULL
+
+            AND COALESCE(
+              official_tracked_decision_score,
+              studio_decision_score
+            ) IS NOT NULL
+
+            AND COALESCE(
+              NULLIF(
+                BTRIM(
+                  official_tracked_market_key
+                ),
+                ''
+              ),
+              NULLIF(
+                BTRIM(
+                  studio_market_key
+                ),
+                ''
+              )
+            ) IS NOT NULL
+
+          ORDER BY
+            fixture_date ASC
+        `);
+
+      const rows =
+        result.rows.map(
+          (row) => ({
+            fixtureId:
+              Number(
+                row.fixture_id
+              ),
+
+            kickoff:
+              row.fixture_date,
+
+            leagueId:
+              row.league_id ==
+              null
+                ? null
+                : Number(
+                    row.league_id
+                  ),
+
+            leagueName:
+              row.league_name ||
+              null,
+
+            homeTeam:
+              row.home_team_name ||
+              null,
+
+            awayTeam:
+              row.away_team_name ||
+              null,
+
+            marketKey:
+              row.market_key,
+
+            marketLabel:
+              row.market_label,
+
+            probability:
+              row.probability ==
+              null
+                ? null
+                : Number(
+                    row.probability
+                  ),
+
+            decisionScore:
+              row.decision_score ==
+              null
+                ? null
+                : Number(
+                    row.decision_score
+                  ),
+
+            bookmakerOdd:
+              row.bookmaker_odd ==
+              null
+                ? null
+                : Number(
+                    row.bookmaker_odd
+                  ),
+
+            bookmaker:
+              row.bookmaker ||
+              null,
+
+            bookmakerSource:
+              row.bookmaker
+                ? "MANUAL_ODD_SOURCE"
+                : null,
+          })
+        );
+
+      const kelly =
+        buildDailyKellyBets(
+          rows,
+          {
+            bankroll:
+              normalizedBankroll,
+
+            includeRejected,
+          }
+        );
+
+      return res.json({
+        ok: true,
+
+        generatedAt:
+          new Date()
+            .toISOString(),
+
+        bankroll:
+          normalizedBankroll,
+
+        ...kelly,
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /public/paris-du-jour :",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "Impossible de charger les Paris du jour.",
+        });
+    }
+  }
+);
 function betCalibrationNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
