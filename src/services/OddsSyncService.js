@@ -12,7 +12,7 @@ const DEFAULT_NEAR_KICKOFF_INTERVAL_MINUTES = 5;
 const DEFAULT_NEAR_KICKOFF_MAX_MINUTES = 360;
 const DEFAULT_NEAR_KICKOFF_MIN_MINUTES = 0;
 
-const FRESH_ODDS_POLICY_VERSION = "FRESH_ODDS_V1";
+const FRESH_ODDS_POLICY_VERSION = "FRESH_ODDS_V2_EXACT_APPLIED_META";
 const ODDS_FRESHNESS_GREEN_MINUTES = 5;
 const ODDS_FRESHNESS_AMBER_MINUTES = 15;
 
@@ -533,6 +533,73 @@ function getDesiredRefreshMinutes(
   }
 
   return 60;
+}
+
+
+function automaticBookmakerFromSource(
+  source = ""
+) {
+  const text =
+    String(source || "")
+      .trim();
+
+  if (
+    !text.startsWith(
+      "AUTO_BEST_ODD"
+    )
+  ) {
+    return "";
+  }
+
+  const separatorIndex =
+    text.indexOf("·");
+
+  if (separatorIndex >= 0) {
+    return text
+      .slice(
+        separatorIndex + 1
+      )
+      .trim();
+  }
+
+  return text
+    .replace(
+      /^AUTO_BEST_ODD\s*[-:|]?\s*/i,
+      ""
+    )
+    .trim();
+}
+
+function normalizedBookmakerIdentity(
+  value = ""
+) {
+  return compactBookmakerName(
+    value
+  );
+}
+
+function oddsAreEquivalent(
+  first,
+  second,
+  tolerance = 0.005
+) {
+  const a =
+    Number(first);
+
+  const b =
+    Number(second);
+
+  if (
+    !Number.isFinite(a) ||
+    !Number.isFinite(b)
+  ) {
+    return false;
+  }
+
+  return (
+    Math.abs(a - b) <=
+    tolerance
+  );
 }
 
 function parisDate(value = new Date()) {
@@ -1756,6 +1823,340 @@ LIMIT 1
     };
   }
 
+  async function getAppliedAutomaticOddsMeta(
+    fixtureIds = []
+  ) {
+    await ensureTables();
+
+    const ids = [
+      ...new Set(
+        (
+          Array.isArray(
+            fixtureIds
+          )
+            ? fixtureIds
+            : []
+        )
+          .map(Number)
+          .filter(
+            (fixtureId) =>
+              Number.isInteger(
+                fixtureId
+              ) &&
+              fixtureId > 0
+          )
+      ),
+    ];
+
+    if (ids.length === 0) {
+      return {
+        ok: true,
+        count: 0,
+        rows: [],
+        generatedAt:
+          new Date()
+            .toISOString(),
+      };
+    }
+
+    const predictionResult =
+      await pool.query(
+        `
+          SELECT DISTINCT ON (
+            fixture_id
+          )
+            fixture_id,
+            studio_market_key,
+            manual_market_key,
+            manual_market_odd,
+            manual_odd_source,
+            manual_odd_updated_at
+
+          FROM predictions
+
+          WHERE
+            fixture_id =
+              ANY($1::bigint[])
+
+          ORDER BY
+            fixture_id,
+            updated_at DESC
+              NULLS LAST,
+            id DESC
+        `,
+        [
+          ids,
+        ]
+      );
+
+    const oddsResult =
+      await pool.query(
+        `
+          SELECT
+            fixture_id,
+            market_key,
+            bookmaker_id,
+            bookmaker_name,
+            odd,
+            source,
+            api_updated_at,
+            captured_at,
+            raw_payload
+
+          FROM market_odds
+
+          WHERE
+            fixture_id =
+              ANY($1::bigint[])
+
+            AND is_current = TRUE
+
+            AND odd > 1
+
+            AND (
+              bookmaker_id IN (
+                8,
+                16
+              )
+              OR ${allowedBookmakerSql(
+                "bookmaker_name"
+              )}
+            )
+
+          ORDER BY
+            fixture_id,
+            market_key,
+            captured_at DESC
+        `,
+        [
+          ids,
+        ]
+      );
+
+    const oddsByFixtureMarket =
+      new Map();
+
+    for (
+      const oddRow of
+      oddsResult.rows
+    ) {
+      const key =
+        `${Number(
+          oddRow.fixture_id
+        )}:${normalizeStoredMarketKey(
+          oddRow.market_key
+        )}`;
+
+      if (
+        !oddsByFixtureMarket.has(
+          key
+        )
+      ) {
+        oddsByFixtureMarket.set(
+          key,
+          []
+        );
+      }
+
+      oddsByFixtureMarket
+        .get(key)
+        .push(
+          oddRow
+        );
+    }
+
+    const rows =
+      predictionResult.rows.map(
+        (prediction) => {
+          const fixtureId =
+            Number(
+              prediction.fixture_id
+            );
+
+          const marketKey =
+            normalizeStoredMarketKey(
+              prediction.manual_market_key ||
+                prediction.studio_market_key
+            );
+
+          const appliedOdd =
+            toNumber(
+              prediction.manual_market_odd,
+              null
+            );
+
+          const source =
+            String(
+              prediction.manual_odd_source ||
+                ""
+            );
+
+          const isAutomatic =
+            source.startsWith(
+              "AUTO_BEST_ODD"
+            );
+
+          const expectedBookmaker =
+            automaticBookmakerFromSource(
+              source
+            );
+
+          const expectedBookmakerIdentity =
+            normalizedBookmakerIdentity(
+              expectedBookmaker
+            );
+
+          const candidates =
+            oddsByFixtureMarket.get(
+              `${fixtureId}:${marketKey}`
+            ) || [];
+
+          const exactBookmakerCandidates =
+            expectedBookmakerIdentity
+              ? candidates.filter(
+                  (candidate) =>
+                    normalizedBookmakerIdentity(
+                      candidate
+                        .bookmaker_name
+                    ) ===
+                      expectedBookmakerIdentity
+                )
+              : [];
+
+          const sameOddCandidates =
+            candidates.filter(
+              (candidate) =>
+                oddsAreEquivalent(
+                  candidate.odd,
+                  appliedOdd
+                )
+            );
+
+          const chosen =
+            exactBookmakerCandidates[0] ||
+            sameOddCandidates[0] ||
+            candidates[0] ||
+            null;
+
+          const freshness =
+            chosen
+              ? getOddsFreshnessMeta(
+                  chosen.captured_at
+                )
+              : {
+                  ageSeconds:
+                    null,
+                  ageMinutes:
+                    null,
+                  freshness:
+                    "UNKNOWN",
+                  stale:
+                    true,
+                };
+
+          return {
+            fixtureId,
+            marketKey,
+            isAutomatic,
+            automaticSource:
+              source ||
+              null,
+            expectedBookmaker:
+              expectedBookmaker ||
+              null,
+            appliedOdd,
+            appliedAt:
+              prediction
+                .manual_odd_updated_at ||
+              null,
+
+            currentOdd:
+              chosen
+                ? Number(
+                    chosen.odd
+                  )
+                : null,
+
+            bookmaker:
+              chosen
+                ?.bookmaker_name ||
+              expectedBookmaker ||
+              null,
+
+            bookmakerId:
+              chosen
+                ?.bookmaker_id ===
+              null
+                ? null
+                : chosen
+                    ?.bookmaker_id !==
+                  undefined
+                  ? Number(
+                      chosen.bookmaker_id
+                    )
+                  : null,
+
+            capturedAt:
+              chosen
+                ?.captured_at ||
+              null,
+
+            apiUpdatedAt:
+              chosen
+                ?.api_updated_at ||
+              null,
+
+            rawBetName:
+              chosen
+                ?.raw_payload
+                ?.betName ||
+              null,
+
+            rawValue:
+              chosen
+                ?.raw_payload
+                ?.value ||
+              null,
+
+            mappingPolicyVersion:
+              chosen
+                ?.raw_payload
+                ?.mappingPolicyVersion ||
+              null,
+
+            exactBookmakerMatch:
+              exactBookmakerCandidates
+                .length > 0,
+
+            currentOddMatchesApplied:
+              chosen
+                ? oddsAreEquivalent(
+                    chosen.odd,
+                    appliedOdd
+                  )
+                : false,
+
+            candidateCount:
+              candidates.length,
+
+            ...freshness,
+          };
+        }
+      );
+
+    return {
+      ok: true,
+      policyVersion:
+        FRESH_ODDS_POLICY_VERSION,
+      count:
+        rows.length,
+      rows,
+      generatedAt:
+        new Date()
+          .toISOString(),
+    };
+  }
+
   function withAdminGuard(handler) {
     if (typeof adminGuard !== "function") return handler;
     return [adminGuard, handler];
@@ -1897,6 +2298,58 @@ LIMIT 1
         : [applyBestOddsHandlers])
     );
 
+    const appliedMetaHandler =
+      async (req, res) => {
+        try {
+          const fixtureIds =
+            Array.isArray(
+              req.body?.fixtureIds
+            )
+              ? req.body
+                  .fixtureIds
+              : [];
+
+          const result =
+            await getAppliedAutomaticOddsMeta(
+              fixtureIds
+            );
+
+          return res.json(
+            result
+          );
+        } catch (error) {
+          console.error(
+            "ERREUR MÉTA COTES AUTOMATIQUES :",
+            error
+          );
+
+          return res
+            .status(500)
+            .json({
+              ok: false,
+              error:
+                error?.message ||
+                "Impossible de charger les métadonnées des cotes automatiques.",
+            });
+        }
+      };
+
+    const appliedMetaHandlers =
+      withAdminGuard(
+        appliedMetaHandler
+      );
+
+    app.post(
+      "/internal/odds/applied-meta",
+      ...(Array.isArray(
+        appliedMetaHandlers
+      )
+        ? appliedMetaHandlers
+        : [
+            appliedMetaHandlers,
+          ])
+    );
+
     app.get("/public/odds/bookmakers", (req, res) => {
       return res.json({
         ok: true,
@@ -1993,6 +2446,7 @@ LIMIT 1
     getCurrentOddsMap,
     applyOddsToMarket,
     applyBestAvailableOdds,
+    getAppliedAutomaticOddsMeta,
     normalizeMarketKeyFromApi,
     bookmakerPriority,
     canonicalBookmakerName,
