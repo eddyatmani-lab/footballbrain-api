@@ -27143,1335 +27143,281 @@ app.get("/public/bilan/detaille", async (req, res) => {
 
 /*
  * ============================================================
- * TRACKED BETS — PARIS RÉELLEMENT JOUÉS
+ * TRACKED BETS V2 — PARIS RÉELLEMENT JOUÉS
  * ============================================================
- *
- * Ces paris sont totalement séparés :
- * - des recommandations FootballBrain ;
- * - des qualified_bets ;
- * - du Bilan IA.
- *
- * Ils représentent uniquement les paris réellement saisis
- * manuellement par l'administrateur.
+ * Lecture publique : SAFE / FUN / OPPORTUNITY.
+ * Écriture, modification et suppression : administrateur uniquement.
  */
 
-const TRACKED_BET_STATUSES = new Set([
-  "PENDING",
-  "WIN",
-  "LOSS",
-  "VOID",
-]);
+const TRACKED_BET_STATUSES = new Set(["PENDING", "WIN", "LOSS", "VOID"]);
+const TRACKED_BET_CATEGORIES = new Set(["SAFE", "FUN", "OPPORTUNITY"]);
+
+function normalizeTrackedBetStatus(value) {
+  const normalized = String(value || "PENDING").trim().toUpperCase();
+  return TRACKED_BET_STATUSES.has(normalized) ? normalized : "PENDING";
+}
+
+function normalizeTrackedBetCategory(value) {
+  const normalized = String(value || "SAFE").trim().toUpperCase();
+  return TRACKED_BET_CATEGORIES.has(normalized) ? normalized : "SAFE";
+}
 
 async function ensureTrackedBetsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracked_bets (
       id BIGSERIAL PRIMARY KEY,
-
       fixture_id BIGINT,
-
       kickoff TIMESTAMPTZ,
-
       league_id BIGINT,
       league_name TEXT,
-
       home_team_name TEXT NOT NULL,
       away_team_name TEXT NOT NULL,
-
       market_key TEXT NOT NULL,
       market_label TEXT NOT NULL,
-
       odd NUMERIC(10, 4) NOT NULL,
       stake NUMERIC(12, 4) NOT NULL DEFAULT 1,
-
       bookmaker TEXT,
-
+      category TEXT NOT NULL DEFAULT 'SAFE',
       status TEXT NOT NULL DEFAULT 'PENDING',
-
       profit NUMERIC(12, 4),
-
       note TEXT,
-
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       settled_at TIMESTAMPTZ,
-
-      CONSTRAINT tracked_bets_status_check
-        CHECK (
-          status IN (
-            'PENDING',
-            'WIN',
-            'LOSS',
-            'VOID'
-          )
-        ),
-
-      CONSTRAINT tracked_bets_odd_check
-        CHECK (odd > 1),
-
-      CONSTRAINT tracked_bets_stake_check
-        CHECK (stake > 0)
+      CONSTRAINT tracked_bets_status_check CHECK (status IN ('PENDING','WIN','LOSS','VOID')),
+      CONSTRAINT tracked_bets_odd_check CHECK (odd > 1),
+      CONSTRAINT tracked_bets_stake_check CHECK (stake > 0)
     );
   `);
 
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_fixture_id
-    ON tracked_bets(fixture_id);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_status
-    ON tracked_bets(status);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_kickoff
-    ON tracked_bets(kickoff DESC);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_created_at
-    ON tracked_bets(created_at DESC);
-  `);
+  // Migration transparente depuis la V1 déjà en production.
+  await pool.query(`ALTER TABLE tracked_bets ADD COLUMN IF NOT EXISTS category TEXT;`);
+  await pool.query(`UPDATE tracked_bets SET category = 'SAFE' WHERE category IS NULL OR BTRIM(category) = '';`);
+  await pool.query(`ALTER TABLE tracked_bets ALTER COLUMN category SET DEFAULT 'SAFE';`);
+  await pool.query(`ALTER TABLE tracked_bets ALTER COLUMN category SET NOT NULL;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tracked_bets_fixture_id ON tracked_bets(fixture_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tracked_bets_status ON tracked_bets(status);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tracked_bets_category ON tracked_bets(category);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tracked_bets_kickoff ON tracked_bets(kickoff DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tracked_bets_created_at ON tracked_bets(created_at DESC);`);
 }
 
-function normalizeTrackedBetStatus(value) {
-  const normalized = String(
-    value || "PENDING"
-  )
-    .trim()
-    .toUpperCase();
-
-  return TRACKED_BET_STATUSES.has(
-    normalized
-  )
-    ? normalized
-    : "PENDING";
-}
-
-function computeTrackedBetProfit({
-  status,
-  odd,
-  stake,
-}) {
-  const normalizedStatus =
-    normalizeTrackedBetStatus(status);
-
-  const safeOdd = Number(odd);
-  const safeStake = Number(stake);
-
-  if (
-    !Number.isFinite(safeOdd) ||
-    !Number.isFinite(safeStake)
-  ) {
-    return null;
-  }
-
-  if (normalizedStatus === "WIN") {
-    return Number(
-      (
-        safeStake *
-        (safeOdd - 1)
-      ).toFixed(4)
-    );
-  }
-
-  if (normalizedStatus === "LOSS") {
-    return Number(
-      (-safeStake).toFixed(4)
-    );
-  }
-
-  if (normalizedStatus === "VOID") {
-    return 0;
-  }
-
+function computeTrackedBetProfit({ status, odd, stake }) {
+  const s = normalizeTrackedBetStatus(status);
+  const o = Number(odd);
+  const u = Number(stake);
+  if (!Number.isFinite(o) || !Number.isFinite(u)) return null;
+  if (s === "WIN") return Number((u * (o - 1)).toFixed(4));
+  if (s === "LOSS") return Number((-u).toFixed(4));
+  if (s === "VOID") return 0;
   return null;
 }
 
 function formatTrackedBet(row = {}) {
   return {
     id: Number(row.id),
-
-    fixtureId:
-      row.fixture_id === null ||
-      row.fixture_id === undefined
-        ? null
-        : Number(row.fixture_id),
-
-    kickoff:
-      row.kickoff || null,
-
-    leagueId:
-      row.league_id === null ||
-      row.league_id === undefined
-        ? null
-        : Number(row.league_id),
-
-    leagueName:
-      row.league_name || "",
-
-    homeTeam:
-      row.home_team_name || "",
-
-    awayTeam:
-      row.away_team_name || "",
-
-    marketKey:
-      row.market_key || "",
-
-    marketLabel:
-      row.market_label || "",
-
-    odd:
-      row.odd === null
-        ? null
-        : Number(row.odd),
-
-    stake:
-      row.stake === null
-        ? null
-        : Number(row.stake),
-
-    bookmaker:
-      row.bookmaker || "",
-
-    status:
-      normalizeTrackedBetStatus(
-        row.status
-      ),
-
-    profit:
-      row.profit === null
-        ? null
-        : Number(row.profit),
-
-    note:
-      row.note || "",
-
-    createdAt:
-      row.created_at || null,
-
-    updatedAt:
-      row.updated_at || null,
-
-    settledAt:
-      row.settled_at || null,
+    fixtureId: row.fixture_id == null ? null : Number(row.fixture_id),
+    kickoff: row.kickoff || null,
+    leagueId: row.league_id == null ? null : Number(row.league_id),
+    leagueName: row.league_name || "",
+    homeTeam: row.home_team_name || "",
+    awayTeam: row.away_team_name || "",
+    marketKey: row.market_key || "",
+    marketLabel: row.market_label || "",
+    odd: row.odd == null ? null : Number(row.odd),
+    stake: row.stake == null ? null : Number(row.stake),
+    bookmaker: row.bookmaker || "",
+    category: normalizeTrackedBetCategory(row.category),
+    status: normalizeTrackedBetStatus(row.status),
+    profit: row.profit == null ? null : Number(row.profit),
+    note: row.note || "",
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    settledAt: row.settled_at || null,
   };
 }
 
-/*
- * ============================================================
- * GET — LISTE DES PARIS RÉELS
- * ============================================================
- */
+function trackedBetStatsFromRows(rows = []) {
+  const total = rows.length;
+  const pending = rows.filter((b) => b.status === "PENDING").length;
+  const wins = rows.filter((b) => b.status === "WIN").length;
+  const losses = rows.filter((b) => b.status === "LOSS").length;
+  const voids = rows.filter((b) => b.status === "VOID").length;
+  const decisions = wins + losses;
+  const settled = decisions + voids;
+  const totalStake = rows.reduce((s, b) => s + Number(b.stake || 0), 0);
+  const settledStake = rows.filter((b) => b.status === "WIN" || b.status === "LOSS").reduce((s, b) => s + Number(b.stake || 0), 0);
+  const profit = rows.filter((b) => b.status !== "PENDING").reduce((s, b) => s + Number(b.profit || 0), 0);
+  const odds = rows.map((b) => Number(b.odd)).filter(Number.isFinite);
+  const settledOdds = rows.filter((b) => b.status === "WIN" || b.status === "LOSS").map((b) => Number(b.odd)).filter(Number.isFinite);
+  return {
+    total, pending, settled, wins, losses, voids, decisions,
+    accuracy: decisions ? Number(((wins / decisions) * 100).toFixed(2)) : 0,
+    totalStake: Number(totalStake.toFixed(2)),
+    settledStake: Number(settledStake.toFixed(2)),
+    profit: Number(profit.toFixed(2)),
+    roi: settledStake ? Number(((profit / settledStake) * 100).toFixed(2)) : 0,
+    averageOdd: odds.length ? Number((odds.reduce((a,b)=>a+b,0) / odds.length).toFixed(2)) : 0,
+    settledAverageOdd: settledOdds.length ? Number((settledOdds.reduce((a,b)=>a+b,0) / settledOdds.length).toFixed(2)) : 0,
+  };
+}
 
-app.get(
-  "/internal/tracked-bets",
-  async (req, res) => {
-    if (
-      !requireOptionalAdminKey(
-        req,
-        res
-      )
-    ) {
-      return;
+async function loadTrackedBets(filters = {}) {
+  await ensureTrackedBetsTable();
+  const values = [];
+  const where = [];
+  const status = String(filters.status || "").trim().toUpperCase();
+  const category = String(filters.category || "").trim().toUpperCase();
+  if (status && TRACKED_BET_STATUSES.has(status)) { values.push(status); where.push(`status = $${values.length}`); }
+  if (category && TRACKED_BET_CATEGORIES.has(category)) { values.push(category); where.push(`category = $${values.length}`); }
+  const result = await pool.query(`
+    SELECT * FROM tracked_bets
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+    ORDER BY kickoff DESC NULLS LAST, created_at DESC, id DESC
+    LIMIT 2000
+  `, values);
+  return result.rows.map(formatTrackedBet);
+}
+
+// Lecture publique pour le Bilan Paris.
+app.get("/public/tracked-bets", async (req, res) => {
+  try {
+    const bets = await loadTrackedBets({ status: req.query.status, category: req.query.category });
+    const allBets = await loadTrackedBets();
+    const categories = {};
+    for (const category of TRACKED_BET_CATEGORIES) {
+      categories[category] = trackedBetStatsFromRows(allBets.filter((bet) => bet.category === category));
     }
-
-    try {
-      await ensureTrackedBetsTable();
-
-      const status = String(
-        req.query.status || ""
-      )
-        .trim()
-        .toUpperCase();
-
-      const values = [];
-      const where = [];
-
-      if (
-        status &&
-        TRACKED_BET_STATUSES.has(status)
-      ) {
-        values.push(status);
-
-        where.push(
-          `status = $${values.length}`
-        );
-      }
-
-      const result =
-        await pool.query(
-          `
-            SELECT *
-            FROM tracked_bets
-
-            ${
-              where.length > 0
-                ? `WHERE ${where.join(
-                    " AND "
-                  )}`
-                : ""
-            }
-
-            ORDER BY
-              kickoff DESC NULLS LAST,
-              created_at DESC,
-              id DESC
-
-            LIMIT 2000
-          `,
-          values
-        );
-
-      return res.json({
-        ok: true,
-
-        count:
-          result.rows.length,
-
-        bets:
-          result.rows.map(
-            formatTrackedBet
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "ERREUR TRACKED BETS LIST :",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Impossible de charger les paris suivis.",
-        });
-    }
+    return res.json({ ok: true, count: bets.length, stats: trackedBetStatsFromRows(allBets), categories, bets });
+  } catch (error) {
+    console.error("ERREUR PUBLIC TRACKED BETS :", error);
+    return res.status(500).json({ ok: false, error: error?.message || "Impossible de charger les paris publics." });
   }
-);
+});
 
-/*
- * ============================================================
- * POST — AJOUTER UN PARI RÉEL
- * ============================================================
- */
-
-app.post(
-  "/internal/tracked-bets",
-  async (req, res) => {
-    if (
-      !requireOptionalAdminKey(
-        req,
-        res
-      )
-    ) {
-      return;
-    }
-
-    try {
-      await ensureTrackedBetsTable();
-
-      const fixtureId =
-        req.body?.fixtureId === null ||
-        req.body?.fixtureId === undefined ||
-        req.body?.fixtureId === ""
-          ? null
-          : Number(
-              req.body.fixtureId
-            );
-
-      const leagueId =
-        req.body?.leagueId === null ||
-        req.body?.leagueId === undefined ||
-        req.body?.leagueId === ""
-          ? null
-          : Number(
-              req.body.leagueId
-            );
-
-      const homeTeam =
-        String(
-          req.body?.homeTeam || ""
-        ).trim();
-
-      const awayTeam =
-        String(
-          req.body?.awayTeam || ""
-        ).trim();
-
-      const leagueName =
-        String(
-          req.body?.leagueName || ""
-        )
-          .trim()
-          .slice(0, 300);
-
-      const marketKey =
-        normalizeManualOddsMarketKey(
-          req.body?.marketKey || ""
-        );
-
-      const marketLabel =
-        String(
-          req.body?.marketLabel ||
-            getBilanMarketLabel(
-              {},
-              marketKey
-            )
-        )
-          .trim()
-          .slice(0, 300);
-
-      const odd =
-        Number(req.body?.odd);
-
-      const stake =
-        Number(req.body?.stake ?? 1);
-
-      const bookmaker =
-        String(
-          req.body?.bookmaker || ""
-        )
-          .trim()
-          .slice(0, 200);
-
-      const note =
-        String(
-          req.body?.note || ""
-        )
-          .trim()
-          .slice(0, 2000);
-
-      const status =
-        normalizeTrackedBetStatus(
-          req.body?.status
-        );
-
-      const kickoff =
-        req.body?.kickoff
-          ? new Date(
-              req.body.kickoff
-            )
-          : null;
-
-      if (
-        fixtureId !== null &&
-        (
-          !Number.isInteger(
-            fixtureId
-          ) ||
-          fixtureId <= 0
-        )
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "fixtureId invalide.",
-          });
-      }
-
-      if (
-        leagueId !== null &&
-        (
-          !Number.isInteger(
-            leagueId
-          ) ||
-          leagueId <= 0
-        )
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "leagueId invalide.",
-          });
-      }
-
-      if (
-        !homeTeam ||
-        !awayTeam
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Les deux équipes sont obligatoires.",
-          });
-      }
-
-      if (!marketKey) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Le marché est obligatoire.",
-          });
-      }
-
-      if (
-        !Number.isFinite(odd) ||
-        odd <= 1
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "La cote doit être supérieure à 1.",
-          });
-      }
-
-      if (
-        !Number.isFinite(stake) ||
-        stake <= 0
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "La mise doit être supérieure à 0.",
-          });
-      }
-
-      if (
-        kickoff &&
-        Number.isNaN(
-          kickoff.getTime()
-        )
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Date du match invalide.",
-          });
-      }
-
-      const profit =
-        computeTrackedBetProfit({
-          status,
-          odd,
-          stake,
-        });
-
-      const result =
-        await pool.query(
-          `
-            INSERT INTO tracked_bets (
-              fixture_id,
-              kickoff,
-
-              league_id,
-              league_name,
-
-              home_team_name,
-              away_team_name,
-
-              market_key,
-              market_label,
-
-              odd,
-              stake,
-
-              bookmaker,
-
-              status,
-              profit,
-
-              note,
-
-              settled_at,
-
-              created_at,
-              updated_at
-            )
-
-            VALUES (
-              $1,
-              $2,
-
-              $3,
-              $4,
-
-              $5,
-              $6,
-
-              $7,
-              $8,
-
-              $9,
-              $10,
-
-              $11,
-
-              $12,
-              $13,
-
-              $14,
-
-              CASE
-                WHEN $12 = 'PENDING'
-                  THEN NULL
-                ELSE NOW()
-              END,
-
-              NOW(),
-              NOW()
-            )
-
-            RETURNING *
-          `,
-          [
-            fixtureId,
-            kickoff
-              ? kickoff.toISOString()
-              : null,
-
-            leagueId,
-            leagueName || null,
-
-            homeTeam,
-            awayTeam,
-
-            marketKey,
-            marketLabel,
-
-            odd,
-            stake,
-
-            bookmaker || null,
-
-            status,
-            profit,
-
-            note || null,
-          ]
-        );
-
-      return res
-        .status(201)
-        .json({
-          ok: true,
-
-          bet:
-            formatTrackedBet(
-              result.rows[0]
-            ),
-        });
-    } catch (error) {
-      console.error(
-        "ERREUR TRACKED BET CREATE :",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Impossible d'ajouter le pari.",
-        });
-    }
+// Lecture admin (compatibilité avec l'interface existante).
+app.get("/internal/tracked-bets", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  try {
+    const bets = await loadTrackedBets({ status: req.query.status, category: req.query.category });
+    return res.json({ ok: true, count: bets.length, bets });
+  } catch (error) {
+    console.error("ERREUR TRACKED BETS LIST :", error);
+    return res.status(500).json({ ok: false, error: error?.message || "Impossible de charger les paris suivis." });
   }
-);
+});
 
-/*
- * ============================================================
- * PATCH — MODIFIER / RÉGLER UN PARI
- * ============================================================
- */
-
-app.patch(
-  "/internal/tracked-bets/:id",
-  async (req, res) => {
-    if (
-      !requireOptionalAdminKey(
-        req,
-        res
-      )
-    ) {
-      return;
-    }
-
-    try {
-      await ensureTrackedBetsTable();
-
-      const id =
-        Number(req.params.id);
-
-      if (
-        !Number.isInteger(id) ||
-        id <= 0
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Identifiant invalide.",
-          });
-      }
-
-      const currentResult =
-        await pool.query(
-          `
-            SELECT *
-            FROM tracked_bets
-            WHERE id = $1
-            LIMIT 1
-          `,
-          [id]
-        );
-
-      if (
-        currentResult.rows.length ===
-        0
-      ) {
-        return res
-          .status(404)
-          .json({
-            ok: false,
-            error:
-              "Pari introuvable.",
-          });
-      }
-
-      const current =
-        currentResult.rows[0];
-
-      const odd =
-        req.body?.odd !==
-          undefined
-          ? Number(
-              req.body.odd
-            )
-          : Number(
-              current.odd
-            );
-
-      const stake =
-        req.body?.stake !==
-          undefined
-          ? Number(
-              req.body.stake
-            )
-          : Number(
-              current.stake
-            );
-
-      if (
-        !Number.isFinite(odd) ||
-        odd <= 1
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "La cote doit être supérieure à 1.",
-          });
-      }
-
-      if (
-        !Number.isFinite(stake) ||
-        stake <= 0
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "La mise doit être supérieure à 0.",
-          });
-      }
-
-      const status =
-        req.body?.status !==
-          undefined
-          ? normalizeTrackedBetStatus(
-              req.body.status
-            )
-          : normalizeTrackedBetStatus(
-              current.status
-            );
-
-      const profit =
-        computeTrackedBetProfit({
-          status,
-          odd,
-          stake,
-        });
-
-      const homeTeam =
-        req.body?.homeTeam !==
-          undefined
-          ? String(
-              req.body.homeTeam || ""
-            ).trim()
-          : current.home_team_name;
-
-      const awayTeam =
-        req.body?.awayTeam !==
-          undefined
-          ? String(
-              req.body.awayTeam || ""
-            ).trim()
-          : current.away_team_name;
-
-      if (
-        !homeTeam ||
-        !awayTeam
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Les deux équipes sont obligatoires.",
-          });
-      }
-
-      const rawMarketKey =
-        req.body?.marketKey !==
-          undefined
-          ? req.body.marketKey
-          : current.market_key;
-
-      const marketKey =
-        normalizeManualOddsMarketKey(
-          rawMarketKey
-        );
-
-      if (!marketKey) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Le marché est obligatoire.",
-          });
-      }
-
-      const marketLabel =
-        req.body?.marketLabel !==
-          undefined
-          ? String(
-              req.body
-                .marketLabel || ""
-            )
-              .trim()
-              .slice(0, 300)
-          : current.market_label;
-
-      const bookmaker =
-        req.body?.bookmaker !==
-          undefined
-          ? String(
-              req.body.bookmaker || ""
-            )
-              .trim()
-              .slice(0, 200)
-          : current.bookmaker;
-
-      const note =
-        req.body?.note !==
-          undefined
-          ? String(
-              req.body.note || ""
-            )
-              .trim()
-              .slice(0, 2000)
-          : current.note;
-
-      let kickoff =
-        current.kickoff;
-
-      if (
-        req.body?.kickoff !==
-        undefined
-      ) {
-        if (
-          req.body.kickoff === null ||
-          req.body.kickoff === ""
-        ) {
-          kickoff = null;
-        } else {
-          const parsedKickoff =
-            new Date(
-              req.body.kickoff
-            );
-
-          if (
-            Number.isNaN(
-              parsedKickoff
-                .getTime()
-            )
-          ) {
-            return res
-              .status(400)
-              .json({
-                ok: false,
-                error:
-                  "Date du match invalide.",
-              });
-          }
-
-          kickoff =
-            parsedKickoff.toISOString();
-        }
-      }
-
-      const result =
-        await pool.query(
-          `
-            UPDATE tracked_bets
-
-            SET
-              kickoff = $2,
-
-              league_name = $3,
-
-              home_team_name = $4,
-              away_team_name = $5,
-
-              market_key = $6,
-              market_label = $7,
-
-              odd = $8,
-              stake = $9,
-
-              bookmaker = $10,
-
-              status = $11,
-              profit = $12,
-
-              note = $13,
-
-              settled_at =
-                CASE
-                  WHEN $11 = 'PENDING'
-                    THEN NULL
-
-                  WHEN status = 'PENDING'
-                    OR settled_at IS NULL
-                    THEN NOW()
-
-                  ELSE settled_at
-                END,
-
-              updated_at = NOW()
-
-            WHERE id = $1
-
-            RETURNING *
-          `,
-          [
-            id,
-            kickoff,
-            req.body?.leagueName !==
-              undefined
-              ? String(
-                  req.body
-                    .leagueName || ""
-                )
-                  .trim()
-                  .slice(0, 300) ||
-                null
-              : current.league_name,
-
-            homeTeam,
-            awayTeam,
-
-            marketKey,
-            marketLabel,
-
-            odd,
-            stake,
-
-            bookmaker || null,
-
-            status,
-            profit,
-
-            note || null,
-          ]
-        );
-
-      return res.json({
-        ok: true,
-
-        bet:
-          formatTrackedBet(
-            result.rows[0]
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "ERREUR TRACKED BET UPDATE :",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Impossible de modifier le pari.",
-        });
-    }
+app.post("/internal/tracked-bets", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  try {
+    await ensureTrackedBetsTable();
+    const fixtureId = req.body?.fixtureId == null || req.body?.fixtureId === "" ? null : Number(req.body.fixtureId);
+    const leagueId = req.body?.leagueId == null || req.body?.leagueId === "" ? null : Number(req.body.leagueId);
+    const homeTeam = String(req.body?.homeTeam || "").trim();
+    const awayTeam = String(req.body?.awayTeam || "").trim();
+    const leagueName = String(req.body?.leagueName || "").trim().slice(0,300);
+    const marketKey = normalizeManualOddsMarketKey(req.body?.marketKey || "");
+    const marketLabel = String(req.body?.marketLabel || getBilanMarketLabel({}, marketKey)).trim().slice(0,300);
+    const odd = Number(req.body?.odd);
+    const stake = Number(req.body?.stake ?? 1);
+    const bookmaker = String(req.body?.bookmaker || "").trim().slice(0,200);
+    const note = String(req.body?.note || "").trim().slice(0,2000);
+    const category = normalizeTrackedBetCategory(req.body?.category);
+    const status = normalizeTrackedBetStatus(req.body?.status);
+    const kickoff = req.body?.kickoff ? new Date(req.body.kickoff) : null;
+    if (fixtureId !== null && (!Number.isInteger(fixtureId) || fixtureId <= 0)) return res.status(400).json({ok:false,error:"fixtureId invalide."});
+    if (leagueId !== null && (!Number.isInteger(leagueId) || leagueId <= 0)) return res.status(400).json({ok:false,error:"leagueId invalide."});
+    if (!homeTeam || !awayTeam) return res.status(400).json({ok:false,error:"Les deux équipes sont obligatoires."});
+    if (!marketKey) return res.status(400).json({ok:false,error:"Le marché est obligatoire."});
+    if (!Number.isFinite(odd) || odd <= 1) return res.status(400).json({ok:false,error:"La cote doit être supérieure à 1."});
+    if (!Number.isFinite(stake) || stake <= 0) return res.status(400).json({ok:false,error:"La mise doit être supérieure à 0."});
+    if (kickoff && Number.isNaN(kickoff.getTime())) return res.status(400).json({ok:false,error:"Date du match invalide."});
+    const profit = computeTrackedBetProfit({status, odd, stake});
+    const result = await pool.query(`
+      INSERT INTO tracked_bets (
+        fixture_id,kickoff,league_id,league_name,home_team_name,away_team_name,
+        market_key,market_label,odd,stake,bookmaker,category,status,profit,note,settled_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,CASE WHEN $13='PENDING' THEN NULL ELSE NOW() END)
+      RETURNING *
+    `,[fixtureId,kickoff?kickoff.toISOString():null,leagueId,leagueName||null,homeTeam,awayTeam,marketKey,marketLabel,odd,stake,bookmaker||null,category,status,profit,note||null]);
+    return res.status(201).json({ok:true,bet:formatTrackedBet(result.rows[0])});
+  } catch (error) {
+    console.error("ERREUR TRACKED BET CREATE :", error);
+    return res.status(500).json({ok:false,error:error?.message||"Impossible d'ajouter le pari."});
   }
-);
+});
 
-/*
- * ============================================================
- * DELETE — SUPPRIMER UN PARI
- * ============================================================
- */
-
-app.delete(
-  "/internal/tracked-bets/:id",
-  async (req, res) => {
-    if (
-      !requireOptionalAdminKey(
-        req,
-        res
-      )
-    ) {
-      return;
+app.patch("/internal/tracked-bets/:id", async (req, res) => {
+  if (!requireOptionalAdminKey(req, res)) return;
+  try {
+    await ensureTrackedBetsTable();
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ok:false,error:"Identifiant invalide."});
+    const currentResult = await pool.query(`SELECT * FROM tracked_bets WHERE id=$1 LIMIT 1`,[id]);
+    if (!currentResult.rows.length) return res.status(404).json({ok:false,error:"Pari introuvable."});
+    const c=currentResult.rows[0];
+    const homeTeam=req.body?.homeTeam!==undefined?String(req.body.homeTeam||"").trim():c.home_team_name;
+    const awayTeam=req.body?.awayTeam!==undefined?String(req.body.awayTeam||"").trim():c.away_team_name;
+    const odd=req.body?.odd!==undefined?Number(req.body.odd):Number(c.odd);
+    const stake=req.body?.stake!==undefined?Number(req.body.stake):Number(c.stake);
+    const status=req.body?.status!==undefined?normalizeTrackedBetStatus(req.body.status):normalizeTrackedBetStatus(c.status);
+    const category=req.body?.category!==undefined?normalizeTrackedBetCategory(req.body.category):normalizeTrackedBetCategory(c.category);
+    const marketKey=req.body?.marketKey!==undefined?normalizeManualOddsMarketKey(req.body.marketKey):c.market_key;
+    const marketLabel=req.body?.marketLabel!==undefined?String(req.body.marketLabel||"").trim().slice(0,300):c.market_label;
+    const bookmaker=req.body?.bookmaker!==undefined?String(req.body.bookmaker||"").trim().slice(0,200):c.bookmaker;
+    const note=req.body?.note!==undefined?String(req.body.note||"").trim().slice(0,2000):c.note;
+    const leagueName=req.body?.leagueName!==undefined?String(req.body.leagueName||"").trim().slice(0,300):c.league_name;
+    let kickoff=c.kickoff;
+    if(req.body?.kickoff!==undefined){
+      if(req.body.kickoff===null||req.body.kickoff==="") kickoff=null;
+      else { const d=new Date(req.body.kickoff); if(Number.isNaN(d.getTime())) return res.status(400).json({ok:false,error:"Date du match invalide."}); kickoff=d.toISOString(); }
     }
-
-    try {
-      await ensureTrackedBetsTable();
-
-      const id =
-        Number(req.params.id);
-
-      if (
-        !Number.isInteger(id) ||
-        id <= 0
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Identifiant invalide.",
-          });
-      }
-
-      const result =
-        await pool.query(
-          `
-            DELETE FROM tracked_bets
-            WHERE id = $1
-            RETURNING id
-          `,
-          [id]
-        );
-
-      if (
-        result.rows.length === 0
-      ) {
-        return res
-          .status(404)
-          .json({
-            ok: false,
-            error:
-              "Pari introuvable.",
-          });
-      }
-
-      return res.json({
-        ok: true,
-        deleted: true,
-        id,
-      });
-    } catch (error) {
-      console.error(
-        "ERREUR TRACKED BET DELETE :",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Impossible de supprimer le pari.",
-        });
-    }
+    if(!homeTeam||!awayTeam) return res.status(400).json({ok:false,error:"Les deux équipes sont obligatoires."});
+    if(!marketKey) return res.status(400).json({ok:false,error:"Le marché est obligatoire."});
+    if(!Number.isFinite(odd)||odd<=1) return res.status(400).json({ok:false,error:"La cote doit être supérieure à 1."});
+    if(!Number.isFinite(stake)||stake<=0) return res.status(400).json({ok:false,error:"La mise doit être supérieure à 0."});
+    const profit=computeTrackedBetProfit({status,odd,stake});
+    const result=await pool.query(`
+      UPDATE tracked_bets SET kickoff=$2,league_name=$3,home_team_name=$4,away_team_name=$5,
+      market_key=$6,market_label=$7,odd=$8,stake=$9,bookmaker=$10,category=$11,status=$12,profit=$13,note=$14,
+      settled_at=CASE WHEN $12='PENDING' THEN NULL WHEN status='PENDING' OR settled_at IS NULL THEN NOW() ELSE settled_at END,
+      updated_at=NOW() WHERE id=$1 RETURNING *
+    `,[id,kickoff,leagueName||null,homeTeam,awayTeam,marketKey,marketLabel,odd,stake,bookmaker||null,category,status,profit,note||null]);
+    return res.json({ok:true,bet:formatTrackedBet(result.rows[0])});
+  } catch(error){
+    console.error("ERREUR TRACKED BET UPDATE :",error);
+    return res.status(500).json({ok:false,error:error?.message||"Impossible de modifier le pari."});
   }
-);
+});
 
-/*
- * ============================================================
- * GET — STATISTIQUES DES PARIS RÉELS
- * ============================================================
- */
-
-app.get(
-  "/internal/tracked-bets/stats",
-  async (req, res) => {
-    if (
-      !requireOptionalAdminKey(
-        req,
-        res
-      )
-    ) {
-      return;
-    }
-
-    try {
-      await ensureTrackedBetsTable();
-
-      const result =
-        await pool.query(`
-          SELECT
-            COUNT(*)::INTEGER
-              AS total,
-
-            COUNT(*) FILTER (
-              WHERE status = 'PENDING'
-            )::INTEGER
-              AS pending,
-
-            COUNT(*) FILTER (
-              WHERE status = 'WIN'
-            )::INTEGER
-              AS wins,
-
-            COUNT(*) FILTER (
-              WHERE status = 'LOSS'
-            )::INTEGER
-              AS losses,
-
-            COUNT(*) FILTER (
-              WHERE status = 'VOID'
-            )::INTEGER
-              AS voids,
-
-            COUNT(*) FILTER (
-              WHERE status IN (
-                'WIN',
-                'LOSS'
-              )
-            )::INTEGER
-              AS decisions,
-
-            COUNT(*) FILTER (
-              WHERE status IN (
-                'WIN',
-                'LOSS',
-                'VOID'
-              )
-            )::INTEGER
-              AS settled,
-
-            COALESCE(
-              SUM(stake) FILTER (
-                WHERE status IN (
-                  'WIN',
-                  'LOSS'
-                )
-              ),
-              0
-            )::NUMERIC
-              AS settled_stake,
-
-            COALESCE(
-              SUM(stake),
-              0
-            )::NUMERIC
-              AS total_stake,
-
-            COALESCE(
-              SUM(profit) FILTER (
-                WHERE status IN (
-                  'WIN',
-                  'LOSS',
-                  'VOID'
-                )
-              ),
-              0
-            )::NUMERIC
-              AS profit,
-
-            COALESCE(
-              AVG(odd),
-              0
-            )::NUMERIC
-              AS average_odd,
-
-            COALESCE(
-              AVG(odd) FILTER (
-                WHERE status IN (
-                  'WIN',
-                  'LOSS'
-                )
-              ),
-              0
-            )::NUMERIC
-              AS settled_average_odd
-
-          FROM tracked_bets
-        `);
-
-      const row =
-        result.rows[0] || {};
-
-      const total =
-        Number(row.total || 0);
-
-      const wins =
-        Number(row.wins || 0);
-
-      const losses =
-        Number(row.losses || 0);
-
-      const decisions =
-        Number(
-          row.decisions || 0
-        );
-
-      const settledStake =
-        Number(
-          row.settled_stake ||
-            0
-        );
-
-      const profit =
-        Number(
-          row.profit || 0
-        );
-
-      const accuracy =
-        decisions > 0
-          ? (
-              wins /
-              decisions
-            ) *
-            100
-          : 0;
-
-      const roi =
-        settledStake > 0
-          ? (
-              profit /
-              settledStake
-            ) *
-            100
-          : 0;
-
-      return res.json({
-        ok: true,
-
-        stats: {
-          total,
-
-          pending:
-            Number(
-              row.pending || 0
-            ),
-
-          settled:
-            Number(
-              row.settled || 0
-            ),
-
-          wins,
-          losses,
-
-          voids:
-            Number(
-              row.voids || 0
-            ),
-
-          decisions,
-
-          accuracy:
-            Number(
-              accuracy.toFixed(2)
-            ),
-
-          totalStake:
-            Number(
-              Number(
-                row.total_stake || 0
-              ).toFixed(2)
-            ),
-
-          settledStake:
-            Number(
-              settledStake.toFixed(2)
-            ),
-
-          profit:
-            Number(
-              profit.toFixed(2)
-            ),
-
-          roi:
-            Number(
-              roi.toFixed(2)
-            ),
-
-          averageOdd:
-            Number(
-              Number(
-                row.average_odd ||
-                  0
-              ).toFixed(2)
-            ),
-
-          settledAverageOdd:
-            Number(
-              Number(
-                row
-                  .settled_average_odd ||
-                  0
-              ).toFixed(2)
-            ),
-        },
-      });
-    } catch (error) {
-      console.error(
-        "ERREUR TRACKED BET STATS :",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Impossible de calculer les statistiques des paris.",
-        });
-    }
+app.delete("/internal/tracked-bets/:id", async (req,res)=>{
+  if(!requireOptionalAdminKey(req,res)) return;
+  try{
+    await ensureTrackedBetsTable();
+    const id=Number(req.params.id);
+    if(!Number.isInteger(id)||id<=0) return res.status(400).json({ok:false,error:"Identifiant invalide."});
+    const result=await pool.query(`DELETE FROM tracked_bets WHERE id=$1 RETURNING id`,[id]);
+    if(!result.rows.length) return res.status(404).json({ok:false,error:"Pari introuvable."});
+    return res.json({ok:true,deleted:true,id});
+  }catch(error){
+    console.error("ERREUR TRACKED BET DELETE :",error);
+    return res.status(500).json({ok:false,error:error?.message||"Impossible de supprimer le pari."});
   }
-);
+});
+
+app.get("/internal/tracked-bets/stats", async (req,res)=>{
+  if(!requireOptionalAdminKey(req,res)) return;
+  try{
+    const bets=await loadTrackedBets();
+    const categories={};
+    for(const category of TRACKED_BET_CATEGORIES) categories[category]=trackedBetStatsFromRows(bets.filter((bet)=>bet.category===category));
+    return res.json({ok:true,stats:trackedBetStatsFromRows(bets),categories});
+  }catch(error){
+    console.error("ERREUR TRACKED BET STATS :",error);
+    return res.status(500).json({ok:false,error:error?.message||"Impossible de calculer les statistiques des paris."});
+  }
+});
+
 app.get("/public/bilan/paris", async (req, res) => {
   try {
     await ensureBetQualificationCalibrationTables();
