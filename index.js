@@ -29245,6 +29245,29 @@ app.get(
           .trim()
           .toUpperCase();
 
+      const mode =
+        String(
+          req.query.mode || "current"
+        )
+          .trim()
+          .toLowerCase();
+
+      const historyMode =
+        mode === "history";
+
+      const dateFilter =
+        historyMode
+          ? `
+              fixture_date <= NOW()
+              AND fixture_date >
+                NOW() - INTERVAL '30 days'
+            `
+          : `
+              fixture_date > NOW()
+              AND fixture_date <
+                NOW() + INTERVAL '7 days'
+            `;
+
       const result =
         await pool.query(
           `
@@ -29291,12 +29314,10 @@ app.get(
 
             WHERE
               studio_snapshot IS NOT NULL
-              AND fixture_date > NOW()
-              AND fixture_date <
-                NOW() + INTERVAL '7 days'
+              AND ${dateFilter}
 
             ORDER BY
-              fixture_date ASC,
+              fixture_date ${historyMode ? "DESC" : "ASC"},
               id DESC
 
             LIMIT $1
@@ -29469,7 +29490,11 @@ app.get(
         ok: true,
         private: true,
         version:
-          "safe-bet-engine-v3",
+          "safe-bet-engine-v4",
+        mode:
+          historyMode
+            ? "history"
+            : "current",
         summary,
         rows,
         generatedAt:
