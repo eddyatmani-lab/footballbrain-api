@@ -28543,50 +28543,49 @@ app.get("/public/bilan/paris", async (req, res) => {
 
 /*
  * ============================================================
- * SAFE BET ENGINE — PRIVÉ ADMIN
+ * SAFE BET ENGINE V2 — PRIVÉ ADMIN
  * ============================================================
  *
- * Analyse les snapshots Brain Studio existants et calcule
- * un SAFE SCORE /100 uniquement pour l'administrateur.
+ * Sources utilisées :
+ * - colonnes officielles de predictions ;
+ * - studio_snapshot Brain Studio ;
+ * - cote manuelle / marché réel si disponible.
+ *
+ * Aucune route publique.
  */
 
-function numberOrSafe(value, fallback = 0) {
+function safeNumber(value, fallback = null) {
   const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
+  return Number.isFinite(number)
+    ? number
+    : fallback;
 }
 
-function clampSafe(value, min = 0, max = 100) {
-  return Math.max(min, Math.min(max, value));
+function safeClamp(value, min = 0, max = 100) {
+  const number = safeNumber(value, min);
+  return Math.max(min, Math.min(max, number));
 }
 
-function normalizeSafeRisk(value) {
-  const text = String(value || "")
-    .trim()
-    .toUpperCase();
-
+function safeRiskNumeric(risk) {
   if (
-    ["LOW", "FAIBLE", "VERY_LOW", "TRÈS_FAIBLE", "VERY LOW"].includes(text)
+    risk !== null &&
+    risk !== undefined &&
+    Number.isFinite(Number(risk))
   ) {
-    return "LOW";
+    return safeClamp(Number(risk));
   }
 
-  if (
-    ["MEDIUM", "MOYEN", "MODERATE", "MODÉRÉ"].includes(text)
-  ) {
-    return "MEDIUM";
-  }
-
-  if (
-    ["HIGH", "ÉLEVÉ", "ELEVE", "VERY_HIGH", "TRÈS_ÉLEVÉ", "VERY HIGH"].includes(text)
-  ) {
-    return "HIGH";
-  }
-
-  return "UNKNOWN";
+  /*
+   * Réutilise exactement la logique déjà employée
+   * par Brain Studio dans ce backend.
+   */
+  return safeClamp(
+    studioRiskToScore(risk)
+  );
 }
 
-function getSafeProbabilityScore(probability) {
-  const p = numberOrSafe(probability, 0);
+function safeProbabilityPoints(probability) {
+  const p = safeNumber(probability, 0);
 
   if (p >= 80) return 30;
   if (p >= 75) return 26;
@@ -28596,8 +28595,8 @@ function getSafeProbabilityScore(probability) {
   return 0;
 }
 
-function getSafeConsensusScore(consensus) {
-  const c = numberOrSafe(consensus, 0);
+function safeConsensusPoints(consensus) {
+  const c = safeNumber(consensus, 0);
 
   if (c >= 85) return 20;
   if (c >= 75) return 16;
@@ -28606,258 +28605,505 @@ function getSafeConsensusScore(consensus) {
   return 0;
 }
 
-function getSafeRiskScore(risk, confidence) {
-  const normalizedRisk = normalizeSafeRisk(risk);
-  const confidenceValue = numberOrSafe(confidence, 0);
+function safeRiskPoints(riskScore, confidence) {
+  const risk =
+    safeRiskNumeric(riskScore);
 
-  if (normalizedRisk === "LOW") return 15;
-  if (normalizedRisk === "MEDIUM") return 8;
-  if (normalizedRisk === "HIGH") return 2;
+  const conf =
+    safeNumber(confidence, 0);
 
-  if (confidenceValue >= 85) return 13;
-  if (confidenceValue >= 75) return 10;
-  if (confidenceValue >= 65) return 6;
+  if (risk <= 35) return 15;
+  if (risk <= 50) return 12;
+  if (risk <= 65) return 8;
+  if (risk <= 75) return 4;
 
-  return 0;
-}
-
-function getSafeStatsScore(snapshot = {}) {
-  const candidates = [
-    snapshot?.primaryMarket?.decision?.score,
-    snapshot?.primaryMarket?.score,
-    snapshot?.accuracy?.learningScore,
-    snapshot?.confidence,
-    snapshot?.confidenceScore,
-  ]
-    .map((value) => Number(value))
-    .filter(Number.isFinite);
-
-  if (candidates.length === 0) return 0;
-
-  const base =
-    candidates.reduce((sum, value) => sum + value, 0) /
-    candidates.length;
-
-  if (base >= 85) return 15;
-  if (base >= 75) return 12;
-  if (base >= 65) return 9;
-  if (base >= 55) return 5;
-  return 0;
-}
-
-function getSafeContextScore(snapshot = {}) {
-  const fatigue =
-    numberOrSafe(
-      snapshot?.fatigue?.score ??
-        snapshot?.fatigueScore ??
-        snapshot?.context?.fatigueScore,
-      50
-    );
-
-  const injuries =
-    numberOrSafe(
-      snapshot?.injuries?.impactScore ??
-        snapshot?.context?.injuryScore,
-      50
-    );
-
-  const motivation =
-    numberOrSafe(
-      snapshot?.mental?.score ??
-        snapshot?.context?.motivationScore,
-      50
-    );
-
-  const average =
-    (fatigue + injuries + motivation) / 3;
-
-  if (average >= 80) return 10;
-  if (average >= 70) return 8;
-  if (average >= 60) return 6;
-  if (average >= 50) return 4;
-  return 2;
-}
-
-function getSafeDataQualityScore(snapshot = {}) {
-  const direct =
-    snapshot?.dataQuality?.score ??
-    snapshot?.data_quality_score ??
-    snapshot?.quality?.score ??
-    snapshot?.dataQualityScore;
-
-  if (direct !== undefined && direct !== null) {
-    const value = numberOrSafe(direct, 0);
-
-    if (value >= 90) return 10;
-    if (value >= 80) return 8;
-    if (value >= 70) return 6;
-    if (value >= 60) return 4;
-    return 1;
+  /*
+   * Si le risque est inconnu mais que la confiance
+   * est correctement stockée, on ne donne pas 0
+   * arbitrairement : on limite simplement le score.
+   */
+  if (
+    (
+      riskScore === null ||
+      riskScore === undefined ||
+      String(riskScore).trim() === ""
+    ) &&
+    conf >= 80
+  ) {
+    return 8;
   }
 
-  const signals = [
-    snapshot?.primaryMarket,
-    snapshot?.probabilities,
-    snapshot?.consensus,
-    snapshot?.confidence,
-    snapshot?.risk,
-    snapshot?.expectedGoals,
-    snapshot?.market,
-  ];
-
-  const present = signals.filter(Boolean).length;
-  const ratio = present / signals.length;
-
-  if (ratio >= 0.9) return 10;
-  if (ratio >= 0.75) return 8;
-  if (ratio >= 0.6) return 6;
-  if (ratio >= 0.4) return 4;
-  return 2;
+  return 0;
 }
 
-function extractSafeBetSignals(snapshot = {}) {
-  const primaryMarket =
-    snapshot?.primaryMarket ||
-    snapshot?.prediction ||
-    snapshot?.market ||
-    {};
+function safeDecisionPoints(decisionScore) {
+  const score =
+    safeNumber(decisionScore, 0);
 
+  if (score >= 90) return 15;
+  if (score >= 82) return 13;
+  if (score >= 75) return 11;
+  if (score >= 65) return 8;
+  if (score >= 55) return 4;
+  return 0;
+}
+
+function safeContextPoints(row = {}) {
+  const context =
+    row.analysis_context &&
+    typeof row.analysis_context === "object"
+      ? row.analysis_context
+      : {};
+
+  const modelInputs =
+    row.model_inputs &&
+    typeof row.model_inputs === "object"
+      ? row.model_inputs
+      : {};
+
+  const xgConfidence =
+    safeNumber(
+      row.xg_confidence_score,
+      null
+    );
+
+  let availableSignals = 0;
+  let points = 0;
+
+  if (
+    context &&
+    Object.keys(context).length > 0
+  ) {
+    availableSignals += 1;
+    points += 4;
+  }
+
+  if (
+    modelInputs &&
+    Object.keys(modelInputs).length > 0
+  ) {
+    availableSignals += 1;
+    points += 3;
+  }
+
+  if (xgConfidence !== null) {
+    availableSignals += 1;
+
+    if (xgConfidence >= 80) {
+      points += 3;
+    } else if (xgConfidence >= 65) {
+      points += 2;
+    } else if (xgConfidence >= 50) {
+      points += 1;
+    }
+  }
+
+  /*
+   * L'absence de contexte ne doit pas être inventée.
+   * Elle donne simplement 0 point ici.
+   */
   return {
-    probability:
-      numberOrSafe(
-        primaryMarket?.probability ??
-          primaryMarket?.probabilityPercent ??
-          snapshot?.probability ??
-          snapshot?.probabilityPercent ??
-          snapshot?.recommendedProbability,
-        0
-      ),
-
-    consensus:
-      numberOrSafe(
-        snapshot?.consensus?.score ??
-          snapshot?.consensusScore ??
-          snapshot?.aiConsensus ??
-          primaryMarket?.consensus,
-        0
-      ),
-
-    confidence:
-      numberOrSafe(
-        primaryMarket?.confidence ??
-          snapshot?.confidence ??
-          snapshot?.confidenceScore,
-        0
-      ),
-
-    risk:
-      primaryMarket?.risk ??
-      snapshot?.risk?.level ??
-      snapshot?.riskLevel ??
-      snapshot?.risk ??
-      "UNKNOWN",
-
-    odd:
-      numberOrSafe(
-        primaryMarket?.odd ??
-          primaryMarket?.marketOdd ??
-          snapshot?.manualMarketOdd ??
-          snapshot?.marketOdd ??
-          snapshot?.odd,
-        0
-      ),
-
-    marketKey:
-      String(
-        primaryMarket?.key ??
-        primaryMarket?.marketKey ??
-        snapshot?.marketKey ??
-        ""
-      ).trim(),
-
-    marketLabel:
-      String(
-        primaryMarket?.label ??
-        snapshot?.marketLabel ??
-        primaryMarket?.key ??
-        "Marché"
-      ).trim(),
+    points: Math.min(10, points),
+    availableSignals,
+    xgConfidence,
   };
 }
 
-function evaluateSafeBet(snapshot = {}) {
-  const signals = extractSafeBetSignals(snapshot);
+function safeDataQuality(row = {}) {
+  const checks = [
+    {
+      key: "studio_market_key",
+      ok:
+        Boolean(
+          String(
+            row.studio_market_key || ""
+          ).trim()
+        ),
+    },
+    {
+      key: "studio_market_label",
+      ok:
+        Boolean(
+          String(
+            row.studio_market_label || ""
+          ).trim()
+        ),
+    },
+    {
+      key: "studio_probability",
+      ok:
+        safeNumber(
+          row.studio_probability,
+          null
+        ) !== null,
+    },
+    {
+      key: "studio_decision_score",
+      ok:
+        safeNumber(
+          row.studio_decision_score,
+          null
+        ) !== null,
+    },
+    {
+      key: "studio_snapshot",
+      ok:
+        row.studio_snapshot &&
+        typeof row.studio_snapshot === "object",
+    },
+    {
+      key: "confidence",
+      ok:
+        safeNumber(
+          row.confidence,
+          null
+        ) !== null,
+    },
+    {
+      key: "risk",
+      ok:
+        row.risk !== null &&
+        row.risk !== undefined &&
+        String(row.risk).trim() !== "",
+    },
+    {
+      key: "fixture_date",
+      ok:
+        Boolean(row.fixture_date),
+    },
+  ];
+
+  const present =
+    checks.filter(
+      (item) => item.ok
+    ).length;
+
+  const score =
+    Math.round(
+      (present / checks.length) * 100
+    );
+
+  let points = 0;
+
+  if (score >= 90) points = 10;
+  else if (score >= 80) points = 8;
+  else if (score >= 70) points = 6;
+  else if (score >= 60) points = 4;
+  else points = 2;
+
+  return {
+    score,
+    points,
+    present,
+    total:
+      checks.length,
+    missing:
+      checks
+        .filter(
+          (item) => !item.ok
+        )
+        .map(
+          (item) => item.key
+        ),
+  };
+}
+
+function getSafePrimaryMarket(
+  snapshot = {},
+  row = {}
+) {
+  const rawPrimary =
+    snapshot?.primaryMarket ||
+    snapshot?.bestDecision ||
+    {};
+
+  const marketKey =
+    String(
+      row.studio_market_key ||
+      rawPrimary?.key ||
+      rawPrimary?.marketKey ||
+      ""
+    ).trim();
+
+  const marketLabel =
+    String(
+      row.studio_market_label ||
+      rawPrimary?.label ||
+      rawPrimary?.marketLabel ||
+      marketKey ||
+      "Marché"
+    ).trim();
+
+  const probability =
+    safeNumber(
+      row.studio_probability ??
+      rawPrimary?.fairOdds
+        ?.calibratedProbability ??
+      rawPrimary?.calibratedProbability ??
+      rawPrimary?.probability,
+      0
+    );
+
+  const decisionScore =
+    safeNumber(
+      row.studio_decision_score ??
+      rawPrimary?.decision?.score ??
+      rawPrimary?.decisionScore ??
+      rawPrimary?.score,
+      0
+    );
+
+  const manualOdd =
+    safeNumber(
+      row.manual_market_odd,
+      null
+    );
+
+  const storedMarketOdd =
+    safeNumber(
+      row.market_odd,
+      null
+    );
+
+  const snapshotOdd =
+    safeNumber(
+      rawPrimary?.bookmakerOdds ??
+      rawPrimary?.fairOdds
+        ?.bookmakerOdds ??
+      rawPrimary?.fairOdds
+        ?.marketOdd ??
+      rawPrimary?.marketOdd ??
+      rawPrimary?.odd,
+      null
+    );
+
+  const odd =
+    manualOdd !== null &&
+    manualOdd > 1
+      ? manualOdd
+      : storedMarketOdd !== null &&
+        storedMarketOdd > 1
+        ? storedMarketOdd
+        : snapshotOdd !== null &&
+          snapshotOdd > 1
+          ? snapshotOdd
+          : null;
+
+  return {
+    rawPrimary,
+    marketKey,
+    marketLabel,
+    probability,
+    decisionScore,
+    odd,
+    oddSource:
+      manualOdd !== null &&
+      manualOdd > 1
+        ? (
+            row.manual_odd_source ||
+            "MANUAL_ADMIN"
+          )
+        : storedMarketOdd !== null &&
+          storedMarketOdd > 1
+          ? "PREDICTIONS_MARKET_ODD"
+          : snapshotOdd !== null &&
+            snapshotOdd > 1
+            ? "STUDIO_SNAPSHOT"
+            : null,
+  };
+}
+
+function getSafeConsensus(
+  primary = {},
+  row = {}
+) {
+  const snapshotConsensus =
+    safeNumber(
+      primary?.rawPrimary
+        ?.decision
+        ?.marketConsensus
+        ?.score ??
+      primary?.rawPrimary
+        ?.consensusScore,
+      null
+    );
+
+  if (snapshotConsensus !== null) {
+    return {
+      value:
+        safeClamp(
+          snapshotConsensus
+        ),
+      source:
+        "STUDIO_MARKET_CONSENSUS",
+    };
+  }
+
+  /*
+   * buildAutomaticStudioMarket() définit déjà
+   * marketConsensus.score = confidence.
+   *
+   * compactStudioSnapshot() retire ensuite ce champ.
+   * On peut donc utiliser la colonne confidence comme
+   * fallback fidèle à la logique Brain Studio.
+   */
+  const confidence =
+    safeNumber(
+      row.confidence,
+      null
+    );
+
+  if (confidence !== null) {
+    return {
+      value:
+        safeClamp(
+          confidence
+        ),
+      source:
+        "PREDICTION_CONFIDENCE_FALLBACK",
+    };
+  }
+
+  return {
+    value: 0,
+    source: "UNAVAILABLE",
+  };
+}
+
+function evaluateSafeBetV2(
+  snapshot = {},
+  row = {}
+) {
+  const primary =
+    getSafePrimaryMarket(
+      snapshot,
+      row
+    );
+
+  const confidence =
+    safeNumber(
+      row.confidence,
+      0
+    );
+
+  const riskNumeric =
+    safeRiskNumeric(
+      row.risk
+    );
+
+  const consensus =
+    getSafeConsensus(
+      primary,
+      row
+    );
+
+  const dataQuality =
+    safeDataQuality(row);
+
+  const context =
+    safeContextPoints(row);
 
   const probabilityPoints =
-    getSafeProbabilityScore(signals.probability);
+    safeProbabilityPoints(
+      primary.probability
+    );
 
   const consensusPoints =
-    getSafeConsensusScore(signals.consensus);
+    safeConsensusPoints(
+      consensus.value
+    );
 
   const riskPoints =
-    getSafeRiskScore(
-      signals.risk,
-      signals.confidence
+    safeRiskPoints(
+      row.risk,
+      confidence
     );
 
-  const statsPoints =
-    getSafeStatsScore(snapshot);
+  const statisticsPoints =
+    safeDecisionPoints(
+      primary.decisionScore
+    );
 
-  const contextPoints =
-    getSafeContextScore(snapshot);
+  const rawScore =
+    probabilityPoints +
+    consensusPoints +
+    riskPoints +
+    statisticsPoints +
+    context.points +
+    dataQuality.points;
 
-  const dataQualityPoints =
-    getSafeDataQualityScore(snapshot);
+  const score =
+    safeClamp(
+      rawScore,
+      0,
+      100
+    );
 
   const blockers = [];
+  const warnings = [];
 
-  if (signals.probability < 65) {
+  if (
+    primary.probability < 65
+  ) {
     blockers.push(
-      "Probabilité IA inférieure à 65 %."
+      "Probabilité Brain Studio inférieure à 65 %."
     );
   }
 
   if (
-    signals.consensus > 0 &&
-    signals.consensus < 55
+    primary.decisionScore < 60
   ) {
     blockers.push(
-      "Consensus moteurs trop faible."
+      "Decision Score Brain Studio inférieur à 60."
     );
   }
 
   if (
-    normalizeSafeRisk(signals.risk) === "HIGH"
+    consensus.value < 55
   ) {
-    blockers.push("Risque élevé.");
+    blockers.push(
+      "Consensus / confiance inférieur à 55."
+    );
+  }
+
+  if (riskNumeric > 75) {
+    blockers.push(
+      "Risque Brain Studio trop élevé."
+    );
   }
 
   if (
-    signals.odd > 0 &&
-    signals.odd <= 1.01
+    dataQuality.score < 70
+  ) {
+    blockers.push(
+      "Données Brain Studio trop incomplètes."
+    );
+  }
+
+  if (!primary.odd) {
+    warnings.push(
+      "Aucune cote exploitable enregistrée actuellement."
+    );
+  } else if (
+    primary.odd <= 1.01
   ) {
     blockers.push(
       "Cote aberrante ou inexploitable."
     );
   }
 
-  if (dataQualityPoints <= 2) {
-    blockers.push(
-      "Qualité des données insuffisante."
+  /*
+   * Une probabilité exactement à 100 % est possible
+   * dans les données historiques mais ne doit jamais
+   * être interprétée comme certitude sportive.
+   */
+  if (
+    primary.probability >= 99.9
+  ) {
+    warnings.push(
+      "Probabilité extrême : contrôle manuel recommandé."
     );
   }
-
-  const score =
-    clampSafe(
-      probabilityPoints +
-      consensusPoints +
-      riskPoints +
-      statsPoints +
-      contextPoints +
-      dataQualityPoints,
-      0,
-      100
-    );
 
   let status = "REJECTED";
 
@@ -28872,43 +29118,82 @@ function evaluateSafeBet(snapshot = {}) {
   }
 
   return {
-    score,
+    score:
+      Number(
+        score.toFixed(1)
+      ),
+
     status,
+
     blockers,
+    warnings,
+
+    market: {
+      key:
+        primary.marketKey,
+      label:
+        primary.marketLabel,
+      odd:
+        primary.odd,
+      oddSource:
+        primary.oddSource,
+    },
+
     breakdown: {
       probability: {
-        value: signals.probability,
-        points: probabilityPoints,
+        value:
+          primary.probability,
+        points:
+          probabilityPoints,
         max: 30,
+        source:
+          "predictions.studio_probability",
       },
+
       consensus: {
-        value: signals.consensus,
-        points: consensusPoints,
+        value:
+          consensus.value,
+        points:
+          consensusPoints,
         max: 20,
+        source:
+          consensus.source,
       },
+
       risk: {
-        value: signals.risk,
-        confidence: signals.confidence,
-        points: riskPoints,
+        raw:
+          row.risk ?? null,
+        numeric:
+          riskNumeric,
+        confidence,
+        points:
+          riskPoints,
         max: 15,
+        source:
+          "predictions.risk + predictions.confidence",
       },
+
       statistics: {
-        points: statsPoints,
+        decisionScore:
+          primary.decisionScore,
+        points:
+          statisticsPoints,
         max: 15,
+        source:
+          "predictions.studio_decision_score",
       },
+
       context: {
-        points: contextPoints,
+        ...context,
         max: 10,
+        source:
+          "analysis_context + model_inputs + xg_confidence_score",
       },
+
       dataQuality: {
-        points: dataQualityPoints,
+        ...dataQuality,
         max: 10,
       },
-    },
-    market: {
-      key: signals.marketKey,
-      label: signals.marketLabel,
-      odd: signals.odd || null,
     },
   };
 }
@@ -28935,7 +29220,9 @@ app.get(
       );
 
       const statusFilter =
-        String(req.query.status || "")
+        String(
+          req.query.status || ""
+        )
           .trim()
           .toUpperCase();
 
@@ -28950,13 +29237,50 @@ app.get(
               league_name,
               home_team_name,
               away_team_name,
+
+              confidence,
+              risk,
+
+              market_odd,
+              value_percentage,
+
+              studio_market_key,
+              studio_market_label,
+              studio_probability,
+              studio_decision_score,
+              studio_decision_type,
+              studio_decision_grade,
               studio_snapshot,
+              studio_saved_at,
+
+              manual_market_odd,
+              manual_market_key,
+              manual_odd_source,
+              manual_odd_updated_at,
+
+              xg_confidence_score,
+              xg_confidence_level,
+
+              analysis_context,
+              model_inputs,
+              monte_carlo_model,
+              decision_trace,
+
               updated_at
+
             FROM predictions
-            WHERE studio_snapshot IS NOT NULL
-              AND fixture_date > NOW() - INTERVAL '1 day'
-              AND fixture_date < NOW() + INTERVAL '7 days'
-            ORDER BY fixture_date ASC
+
+            WHERE
+              studio_snapshot IS NOT NULL
+              AND fixture_date >
+                NOW() - INTERVAL '1 day'
+              AND fixture_date <
+                NOW() + INTERVAL '7 days'
+
+            ORDER BY
+              fixture_date ASC,
+              id DESC
+
             LIMIT $1
           `,
           [limit]
@@ -28964,71 +29288,170 @@ app.get(
 
       const rows = [];
 
-      for (const row of result.rows) {
-        let snapshot = row.studio_snapshot;
+      for (
+        const row of result.rows
+      ) {
+        let snapshot =
+          row.studio_snapshot;
 
-        if (typeof snapshot === "string") {
+        if (
+          typeof snapshot === "string"
+        ) {
           try {
-            snapshot = JSON.parse(snapshot);
+            snapshot =
+              JSON.parse(snapshot);
           } catch {
             snapshot = {};
           }
         }
 
-        const safe =
-          evaluateSafeBet(snapshot || {});
+        if (
+          !snapshot ||
+          typeof snapshot !== "object"
+        ) {
+          snapshot = {};
+        }
 
-        const item = {
-          predictionId: Number(row.id),
-          fixtureId: Number(row.fixture_id),
-          kickoff: row.kickoff,
-          leagueId:
-            row.league_id === null ||
-            row.league_id === undefined
-              ? null
-              : Number(row.league_id),
-          leagueName: row.league_name || "",
-          homeTeam:
-            row.home_team_name || "",
-          awayTeam:
-            row.away_team_name || "",
-          safe,
-          updatedAt: row.updated_at,
-        };
+        const safe =
+          evaluateSafeBetV2(
+            snapshot,
+            row
+          );
 
         if (
           statusFilter &&
-          safe.status !== statusFilter
+          safe.status !==
+            statusFilter
         ) {
           continue;
         }
 
-        rows.push(item);
+        rows.push({
+          predictionId:
+            Number(row.id),
+
+          fixtureId:
+            Number(
+              row.fixture_id
+            ),
+
+          kickoff:
+            row.fixture_date,
+
+          leagueId:
+            row.league_id === null ||
+            row.league_id === undefined
+              ? null
+              : Number(
+                  row.league_id
+                ),
+
+          leagueName:
+            row.league_name ||
+            "",
+
+          homeTeam:
+            row.home_team_name ||
+            "",
+
+          awayTeam:
+            row.away_team_name ||
+            "",
+
+          safe,
+
+          brainStudio: {
+            probability:
+              row.studio_probability === null
+                ? null
+                : Number(
+                    row.studio_probability
+                  ),
+
+            decisionScore:
+              row.studio_decision_score === null
+                ? null
+                : Number(
+                    row.studio_decision_score
+                  ),
+
+            decisionType:
+              row.studio_decision_type ||
+              null,
+
+            decisionGrade:
+              row.studio_decision_grade ||
+              null,
+
+            confidence:
+              row.confidence === null
+                ? null
+                : Number(
+                    row.confidence
+                  ),
+
+            risk:
+              row.risk ||
+              null,
+
+            xgConfidenceScore:
+              row.xg_confidence_score === null
+                ? null
+                : Number(
+                    row.xg_confidence_score
+                  ),
+
+            xgConfidenceLevel:
+              row.xg_confidence_level ||
+              null,
+
+            savedAt:
+              row.studio_saved_at ||
+              null,
+          },
+
+          updatedAt:
+            row.updated_at,
+        });
       }
 
       const summary = {
         total: rows.length,
-        safePlus: rows.filter(
-          (row) =>
-            row.safe.status === "SAFE_PLUS"
-        ).length,
-        safe: rows.filter(
-          (row) =>
-            row.safe.status === "SAFE"
-        ).length,
-        watch: rows.filter(
-          (row) =>
-            row.safe.status === "WATCH"
-        ).length,
-        rejected: rows.filter(
-          (row) =>
-            row.safe.status === "REJECTED"
-        ).length,
+
+        safePlus:
+          rows.filter(
+            (row) =>
+              row.safe.status ===
+              "SAFE_PLUS"
+          ).length,
+
+        safe:
+          rows.filter(
+            (row) =>
+              row.safe.status ===
+              "SAFE"
+          ).length,
+
+        watch:
+          rows.filter(
+            (row) =>
+              row.safe.status ===
+              "WATCH"
+          ).length,
+
+        rejected:
+          rows.filter(
+            (row) =>
+              row.safe.status ===
+              "REJECTED"
+          ).length,
       };
 
       return res.json({
         ok: true,
         private: true,
+        version:
+          "safe-bet-engine-v2",
         summary,
         rows,
         generatedAt:
@@ -29036,7 +29459,7 @@ app.get(
       });
     } catch (error) {
       console.error(
-        "ERREUR SAFE BET ENGINE :",
+        "ERREUR SAFE BET ENGINE V2 :",
         error
       );
 
@@ -29044,6 +29467,7 @@ app.get(
         .status(500)
         .json({
           ok: false,
+
           error:
             error?.message ||
             "Impossible de calculer les SAFE privés.",
