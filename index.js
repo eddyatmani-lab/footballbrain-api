@@ -28945,7 +28945,7 @@ app.get(
             SELECT
               id,
               fixture_id,
-              kickoff,
+              fixture_date,
               league_id,
               league_name,
               home_team_name,
@@ -28954,9 +28954,9 @@ app.get(
               updated_at
             FROM predictions
             WHERE studio_snapshot IS NOT NULL
-              AND kickoff > NOW() - INTERVAL '1 day'
-              AND kickoff < NOW() + INTERVAL '7 days'
-            ORDER BY kickoff ASC
+              AND fixture_date > NOW() - INTERVAL '1 day'
+              AND fixture_date < NOW() + INTERVAL '7 days'
+            ORDER BY fixture_date ASC
             LIMIT $1
           `,
           [limit]
