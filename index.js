@@ -27143,16 +27143,21 @@ app.get("/public/bilan/detaille", async (req, res) => {
 
 /*
  * ============================================================
- * TRACKED BETS — PARIS RÉELLEMENT JOUÉS
+ * TRACKED BETS V2 — PARIS RÉELLEMENT JOUÉS
  * ============================================================
  *
- * Ces paris sont totalement séparés :
- * - des recommandations FootballBrain ;
- * - des qualified_bets ;
- * - du Bilan IA.
+ * PUBLIC :
+ * GET /public/tracked-bets
  *
- * Ils représentent uniquement les paris réellement saisis
- * manuellement par l'administrateur.
+ * ADMIN :
+ * GET    /internal/tracked-bets
+ * POST   /internal/tracked-bets
+ * PATCH  /internal/tracked-bets/:id
+ * DELETE /internal/tracked-bets/:id
+ * GET    /internal/tracked-bets/stats
+ *
+ * Catégories publiques :
+ * SAFE / FUN / OPPORTUNITY
  */
 
 const TRACKED_BET_STATUSES = new Set([
@@ -27162,13 +27167,18 @@ const TRACKED_BET_STATUSES = new Set([
   "VOID",
 ]);
 
+const TRACKED_BET_CATEGORIES = new Set([
+  "SAFE",
+  "FUN",
+  "OPPORTUNITY",
+]);
+
 async function ensureTrackedBetsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracked_bets (
       id BIGSERIAL PRIMARY KEY,
 
       fixture_id BIGINT,
-
       kickoff TIMESTAMPTZ,
 
       league_id BIGINT,
@@ -27180,13 +27190,14 @@ async function ensureTrackedBetsTable() {
       market_key TEXT NOT NULL,
       market_label TEXT NOT NULL,
 
+      category TEXT NOT NULL DEFAULT 'FUN',
+
       odd NUMERIC(10, 4) NOT NULL,
       stake NUMERIC(12, 4) NOT NULL DEFAULT 1,
 
       bookmaker TEXT,
 
       status TEXT NOT NULL DEFAULT 'PENDING',
-
       profit NUMERIC(12, 4),
 
       note TEXT,
@@ -27213,6 +27224,31 @@ async function ensureTrackedBetsTable() {
     );
   `);
 
+  /*
+   * Migration douce si la table V1 existe déjà.
+   */
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS category TEXT;
+  `);
+
+  await pool.query(`
+    UPDATE tracked_bets
+    SET category = 'FUN'
+    WHERE category IS NULL
+       OR TRIM(category) = '';
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN category SET DEFAULT 'FUN';
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN category SET NOT NULL;
+  `);
+
   await pool.query(`
     CREATE INDEX IF NOT EXISTS
       idx_tracked_bets_fixture_id
@@ -27223,6 +27259,12 @@ async function ensureTrackedBetsTable() {
     CREATE INDEX IF NOT EXISTS
       idx_tracked_bets_status
     ON tracked_bets(status);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_tracked_bets_category
+    ON tracked_bets(category);
   `);
 
   await pool.query(`
@@ -27250,6 +27292,20 @@ function normalizeTrackedBetStatus(value) {
   )
     ? normalized
     : "PENDING";
+}
+
+function normalizeTrackedBetCategory(value) {
+  const normalized = String(
+    value || "FUN"
+  )
+    .trim()
+    .toUpperCase();
+
+  return TRACKED_BET_CATEGORIES.has(
+    normalized
+  )
+    ? normalized
+    : "FUN";
 }
 
 function computeTrackedBetProfit({
@@ -27326,6 +27382,11 @@ function formatTrackedBet(row = {}) {
     marketLabel:
       row.market_label || "",
 
+    category:
+      normalizeTrackedBetCategory(
+        row.category
+      ),
+
     odd:
       row.odd === null
         ? null
@@ -27363,9 +27424,241 @@ function formatTrackedBet(row = {}) {
   };
 }
 
+function buildTrackedBetStats(
+  rows = []
+) {
+  const stats = {
+    total: 0,
+    pending: 0,
+    settled: 0,
+    wins: 0,
+    losses: 0,
+    voids: 0,
+    decisions: 0,
+    totalStake: 0,
+    settledStake: 0,
+    profit: 0,
+    accuracy: null,
+    roi: null,
+    averageOdd: null,
+  };
+
+  let oddSum = 0;
+  let oddCount = 0;
+
+  for (const row of rows) {
+    const status =
+      normalizeTrackedBetStatus(
+        row.status
+      );
+
+    const stake =
+      Number(row.stake || 0);
+
+    const odd =
+      Number(row.odd || 0);
+
+    const profit =
+      row.profit === null
+        ? null
+        : Number(row.profit);
+
+    stats.total += 1;
+    stats.totalStake += stake;
+
+    if (
+      Number.isFinite(odd) &&
+      odd > 1
+    ) {
+      oddSum += odd;
+      oddCount += 1;
+    }
+
+    if (status === "PENDING") {
+      stats.pending += 1;
+    }
+
+    if (
+      ["WIN", "LOSS", "VOID"].includes(
+        status
+      )
+    ) {
+      stats.settled += 1;
+    }
+
+    if (
+      ["WIN", "LOSS"].includes(
+        status
+      )
+    ) {
+      stats.decisions += 1;
+      stats.settledStake += stake;
+    }
+
+    if (status === "WIN") {
+      stats.wins += 1;
+    }
+
+    if (status === "LOSS") {
+      stats.losses += 1;
+    }
+
+    if (status === "VOID") {
+      stats.voids += 1;
+    }
+
+    if (
+      profit !== null &&
+      Number.isFinite(profit)
+    ) {
+      stats.profit += profit;
+    }
+  }
+
+  stats.accuracy =
+    stats.decisions > 0
+      ? Number(
+          (
+            (stats.wins /
+              stats.decisions) *
+            100
+          ).toFixed(2)
+        )
+      : null;
+
+  stats.roi =
+    stats.settledStake > 0
+      ? Number(
+          (
+            (stats.profit /
+              stats.settledStake) *
+            100
+          ).toFixed(2)
+        )
+      : null;
+
+  stats.averageOdd =
+    oddCount > 0
+      ? Number(
+          (oddSum / oddCount).toFixed(2)
+        )
+      : null;
+
+  stats.totalStake =
+    Number(
+      stats.totalStake.toFixed(2)
+    );
+
+  stats.settledStake =
+    Number(
+      stats.settledStake.toFixed(2)
+    );
+
+  stats.profit =
+    Number(
+      stats.profit.toFixed(2)
+    );
+
+  return stats;
+}
+
 /*
  * ============================================================
- * GET — LISTE DES PARIS RÉELS
+ * PUBLIC — résultats des vrais paris
+ * ============================================================
+ */
+
+app.get(
+  "/public/tracked-bets",
+  async (req, res) => {
+    try {
+      await ensureTrackedBetsTable();
+
+      const result =
+        await pool.query(`
+          SELECT *
+          FROM tracked_bets
+          ORDER BY
+            kickoff DESC NULLS LAST,
+            created_at DESC,
+            id DESC
+          LIMIT 3000
+        `);
+
+      const rows =
+        result.rows || [];
+
+      const categories = {
+        SAFE: buildTrackedBetStats(
+          rows.filter(
+            (row) =>
+              normalizeTrackedBetCategory(
+                row.category
+              ) === "SAFE"
+          )
+        ),
+
+        FUN: buildTrackedBetStats(
+          rows.filter(
+            (row) =>
+              normalizeTrackedBetCategory(
+                row.category
+              ) === "FUN"
+          )
+        ),
+
+        OPPORTUNITY:
+          buildTrackedBetStats(
+            rows.filter(
+              (row) =>
+                normalizeTrackedBetCategory(
+                  row.category
+                ) ===
+                "OPPORTUNITY"
+            )
+          ),
+      };
+
+      return res.json({
+        ok: true,
+
+        stats:
+          buildTrackedBetStats(
+            rows
+          ),
+
+        categories,
+
+        bets:
+          rows.map(
+            formatTrackedBet
+          ),
+
+        generatedAt:
+          new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /public/tracked-bets :",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "Impossible de charger les paris publics.",
+        });
+    }
+  }
+);
+
+/*
+ * ============================================================
+ * ADMIN — liste
  * ============================================================
  */
 
@@ -27384,56 +27677,21 @@ app.get(
     try {
       await ensureTrackedBetsTable();
 
-      const status = String(
-        req.query.status || ""
-      )
-        .trim()
-        .toUpperCase();
-
-      const values = [];
-      const where = [];
-
-      if (
-        status &&
-        TRACKED_BET_STATUSES.has(status)
-      ) {
-        values.push(status);
-
-        where.push(
-          `status = $${values.length}`
-        );
-      }
-
       const result =
-        await pool.query(
-          `
-            SELECT *
-            FROM tracked_bets
-
-            ${
-              where.length > 0
-                ? `WHERE ${where.join(
-                    " AND "
-                  )}`
-                : ""
-            }
-
-            ORDER BY
-              kickoff DESC NULLS LAST,
-              created_at DESC,
-              id DESC
-
-            LIMIT 2000
-          `,
-          values
-        );
+        await pool.query(`
+          SELECT *
+          FROM tracked_bets
+          ORDER BY
+            kickoff DESC NULLS LAST,
+            created_at DESC,
+            id DESC
+          LIMIT 3000
+        `);
 
       return res.json({
         ok: true,
-
         count:
           result.rows.length,
-
         bets:
           result.rows.map(
             formatTrackedBet
@@ -27449,7 +27707,6 @@ app.get(
         .status(500)
         .json({
           ok: false,
-
           error:
             error?.message ||
             "Impossible de charger les paris suivis.",
@@ -27460,7 +27717,7 @@ app.get(
 
 /*
  * ============================================================
- * POST — AJOUTER UN PARI RÉEL
+ * ADMIN — ajout
  * ============================================================
  */
 
@@ -27530,6 +27787,11 @@ app.post(
           .trim()
           .slice(0, 300);
 
+      const category =
+        normalizeTrackedBetCategory(
+          req.body?.category
+        );
+
       const odd =
         Number(req.body?.odd);
 
@@ -27561,42 +27823,6 @@ app.post(
               req.body.kickoff
             )
           : null;
-
-      if (
-        fixtureId !== null &&
-        (
-          !Number.isInteger(
-            fixtureId
-          ) ||
-          fixtureId <= 0
-        )
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "fixtureId invalide.",
-          });
-      }
-
-      if (
-        leagueId !== null &&
-        (
-          !Number.isInteger(
-            leagueId
-          ) ||
-          leagueId <= 0
-        )
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "leagueId invalide.",
-          });
-      }
 
       if (
         !homeTeam ||
@@ -27685,6 +27911,8 @@ app.post(
               market_key,
               market_label,
 
+              category,
+
               odd,
               stake,
 
@@ -27715,17 +27943,19 @@ app.post(
               $8,
 
               $9,
-              $10,
 
+              $10,
               $11,
 
               $12,
-              $13,
 
+              $13,
               $14,
 
+              $15,
+
               CASE
-                WHEN $12 = 'PENDING'
+                WHEN $13 = 'PENDING'
                   THEN NULL
                 ELSE NOW()
               END,
@@ -27751,6 +27981,8 @@ app.post(
             marketKey,
             marketLabel,
 
+            category,
+
             odd,
             stake,
 
@@ -27767,7 +27999,6 @@ app.post(
         .status(201)
         .json({
           ok: true,
-
           bet:
             formatTrackedBet(
               result.rows[0]
@@ -27783,7 +28014,6 @@ app.post(
         .status(500)
         .json({
           ok: false,
-
           error:
             error?.message ||
             "Impossible d'ajouter le pari.",
@@ -27794,7 +28024,7 @@ app.post(
 
 /*
  * ============================================================
- * PATCH — MODIFIER / RÉGLER UN PARI
+ * ADMIN — modification/résultat
  * ============================================================
  */
 
@@ -27876,6 +28106,26 @@ app.patch(
               current.stake
             );
 
+      const status =
+        req.body?.status !==
+          undefined
+          ? normalizeTrackedBetStatus(
+              req.body.status
+            )
+          : normalizeTrackedBetStatus(
+              current.status
+            );
+
+      const category =
+        req.body?.category !==
+          undefined
+          ? normalizeTrackedBetCategory(
+              req.body.category
+            )
+          : normalizeTrackedBetCategory(
+              current.category
+            );
+
       if (
         !Number.isFinite(odd) ||
         odd <= 1
@@ -27902,16 +28152,6 @@ app.patch(
           });
       }
 
-      const status =
-        req.body?.status !==
-          undefined
-          ? normalizeTrackedBetStatus(
-              req.body.status
-            )
-          : normalizeTrackedBetStatus(
-              current.status
-            );
-
       const profit =
         computeTrackedBetProfit({
           status,
@@ -27935,46 +28175,19 @@ app.patch(
             ).trim()
           : current.away_team_name;
 
-      if (
-        !homeTeam ||
-        !awayTeam
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Les deux équipes sont obligatoires.",
-          });
-      }
-
-      const rawMarketKey =
+      const marketKey =
         req.body?.marketKey !==
           undefined
-          ? req.body.marketKey
+          ? normalizeManualOddsMarketKey(
+              req.body.marketKey
+            )
           : current.market_key;
-
-      const marketKey =
-        normalizeManualOddsMarketKey(
-          rawMarketKey
-        );
-
-      if (!marketKey) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Le marché est obligatoire.",
-          });
-      }
 
       const marketLabel =
         req.body?.marketLabel !==
           undefined
           ? String(
-              req.body
-                .marketLabel || ""
+              req.body.marketLabel || ""
             )
               .trim()
               .slice(0, 300)
@@ -28020,8 +28233,7 @@ app.patch(
 
           if (
             Number.isNaN(
-              parsedKickoff
-                .getTime()
+              parsedKickoff.getTime()
             )
           ) {
             return res
@@ -28038,6 +28250,17 @@ app.patch(
         }
       }
 
+      const leagueName =
+        req.body?.leagueName !==
+          undefined
+          ? String(
+              req.body.leagueName || ""
+            )
+              .trim()
+              .slice(0, 300) ||
+            null
+          : current.league_name;
+
       const result =
         await pool.query(
           `
@@ -28045,7 +28268,6 @@ app.patch(
 
             SET
               kickoff = $2,
-
               league_name = $3,
 
               home_team_name = $4,
@@ -28054,19 +28276,21 @@ app.patch(
               market_key = $6,
               market_label = $7,
 
-              odd = $8,
-              stake = $9,
+              category = $8,
 
-              bookmaker = $10,
+              odd = $9,
+              stake = $10,
 
-              status = $11,
-              profit = $12,
+              bookmaker = $11,
 
-              note = $13,
+              status = $12,
+              profit = $13,
+
+              note = $14,
 
               settled_at =
                 CASE
-                  WHEN $11 = 'PENDING'
+                  WHEN $12 = 'PENDING'
                     THEN NULL
 
                   WHEN status = 'PENDING'
@@ -28085,22 +28309,15 @@ app.patch(
           [
             id,
             kickoff,
-            req.body?.leagueName !==
-              undefined
-              ? String(
-                  req.body
-                    .leagueName || ""
-                )
-                  .trim()
-                  .slice(0, 300) ||
-                null
-              : current.league_name,
+            leagueName,
 
             homeTeam,
             awayTeam,
 
             marketKey,
             marketLabel,
+
+            category,
 
             odd,
             stake,
@@ -28116,7 +28333,6 @@ app.patch(
 
       return res.json({
         ok: true,
-
         bet:
           formatTrackedBet(
             result.rows[0]
@@ -28132,7 +28348,6 @@ app.patch(
         .status(500)
         .json({
           ok: false,
-
           error:
             error?.message ||
             "Impossible de modifier le pari.",
@@ -28143,7 +28358,7 @@ app.patch(
 
 /*
  * ============================================================
- * DELETE — SUPPRIMER UN PARI
+ * ADMIN — suppression
  * ============================================================
  */
 
@@ -28215,7 +28430,6 @@ app.delete(
         .status(500)
         .json({
           ok: false,
-
           error:
             error?.message ||
             "Impossible de supprimer le pari.",
@@ -28226,7 +28440,7 @@ app.delete(
 
 /*
  * ============================================================
- * GET — STATISTIQUES DES PARIS RÉELS
+ * ADMIN — stats
  * ============================================================
  */
 
@@ -28247,212 +28461,16 @@ app.get(
 
       const result =
         await pool.query(`
-          SELECT
-            COUNT(*)::INTEGER
-              AS total,
-
-            COUNT(*) FILTER (
-              WHERE status = 'PENDING'
-            )::INTEGER
-              AS pending,
-
-            COUNT(*) FILTER (
-              WHERE status = 'WIN'
-            )::INTEGER
-              AS wins,
-
-            COUNT(*) FILTER (
-              WHERE status = 'LOSS'
-            )::INTEGER
-              AS losses,
-
-            COUNT(*) FILTER (
-              WHERE status = 'VOID'
-            )::INTEGER
-              AS voids,
-
-            COUNT(*) FILTER (
-              WHERE status IN (
-                'WIN',
-                'LOSS'
-              )
-            )::INTEGER
-              AS decisions,
-
-            COUNT(*) FILTER (
-              WHERE status IN (
-                'WIN',
-                'LOSS',
-                'VOID'
-              )
-            )::INTEGER
-              AS settled,
-
-            COALESCE(
-              SUM(stake) FILTER (
-                WHERE status IN (
-                  'WIN',
-                  'LOSS'
-                )
-              ),
-              0
-            )::NUMERIC
-              AS settled_stake,
-
-            COALESCE(
-              SUM(stake),
-              0
-            )::NUMERIC
-              AS total_stake,
-
-            COALESCE(
-              SUM(profit) FILTER (
-                WHERE status IN (
-                  'WIN',
-                  'LOSS',
-                  'VOID'
-                )
-              ),
-              0
-            )::NUMERIC
-              AS profit,
-
-            COALESCE(
-              AVG(odd),
-              0
-            )::NUMERIC
-              AS average_odd,
-
-            COALESCE(
-              AVG(odd) FILTER (
-                WHERE status IN (
-                  'WIN',
-                  'LOSS'
-                )
-              ),
-              0
-            )::NUMERIC
-              AS settled_average_odd
-
+          SELECT *
           FROM tracked_bets
         `);
 
-      const row =
-        result.rows[0] || {};
-
-      const total =
-        Number(row.total || 0);
-
-      const wins =
-        Number(row.wins || 0);
-
-      const losses =
-        Number(row.losses || 0);
-
-      const decisions =
-        Number(
-          row.decisions || 0
-        );
-
-      const settledStake =
-        Number(
-          row.settled_stake ||
-            0
-        );
-
-      const profit =
-        Number(
-          row.profit || 0
-        );
-
-      const accuracy =
-        decisions > 0
-          ? (
-              wins /
-              decisions
-            ) *
-            100
-          : 0;
-
-      const roi =
-        settledStake > 0
-          ? (
-              profit /
-              settledStake
-            ) *
-            100
-          : 0;
-
       return res.json({
         ok: true,
-
-        stats: {
-          total,
-
-          pending:
-            Number(
-              row.pending || 0
-            ),
-
-          settled:
-            Number(
-              row.settled || 0
-            ),
-
-          wins,
-          losses,
-
-          voids:
-            Number(
-              row.voids || 0
-            ),
-
-          decisions,
-
-          accuracy:
-            Number(
-              accuracy.toFixed(2)
-            ),
-
-          totalStake:
-            Number(
-              Number(
-                row.total_stake || 0
-              ).toFixed(2)
-            ),
-
-          settledStake:
-            Number(
-              settledStake.toFixed(2)
-            ),
-
-          profit:
-            Number(
-              profit.toFixed(2)
-            ),
-
-          roi:
-            Number(
-              roi.toFixed(2)
-            ),
-
-          averageOdd:
-            Number(
-              Number(
-                row.average_odd ||
-                  0
-              ).toFixed(2)
-            ),
-
-          settledAverageOdd:
-            Number(
-              Number(
-                row
-                  .settled_average_odd ||
-                  0
-              ).toFixed(2)
-            ),
-        },
+        stats:
+          buildTrackedBetStats(
+            result.rows || []
+          ),
       });
     } catch (error) {
       console.error(
@@ -28464,7 +28482,6 @@ app.get(
         .status(500)
         .json({
           ok: false,
-
           error:
             error?.message ||
             "Impossible de calculer les statistiques des paris.",
@@ -28472,74 +28489,6 @@ app.get(
     }
   }
 );
-app.get("/public/bilan/paris", async (req, res) => {
-  try {
-    await ensureBetQualificationCalibrationTables();
-
-    const result = await pool.query(`
-      SELECT
-        qb.*,
-        p.fixture_date,
-        p.home_team_name,
-        p.away_team_name,
-        p.league_name
-      FROM qualified_bets qb
-      LEFT JOIN predictions p
-        ON p.fixture_id = qb.fixture_id
-      ORDER BY qb.frozen_at DESC, qb.id DESC
-      LIMIT 1000
-    `);
-
-    const rows = result.rows;
-    const categories = {};
-
-    for (const category of ["SAFE", "VALUE", "OPPORTUNITY", "IA_PICK"]) {
-      categories[category] = summarizeQualifiedBetRows(
-        rows.filter(
-          (row) =>
-            String(row.category || "").toUpperCase() === category
-        )
-      );
-    }
-
-    const trackingStartedAt =
-      rows.length > 0
-        ? rows.reduce((oldest, row) => {
-            const current = row.frozen_at
-              ? new Date(row.frozen_at)
-              : null;
-            if (!current || Number.isNaN(current.getTime())) {
-              return oldest;
-            }
-            if (!oldest || current < oldest) return current;
-            return oldest;
-          }, null)?.toISOString() || null
-        : null;
-
-    return res.json({
-      ok: true,
-      overall: summarizeQualifiedBetRows(rows),
-      categories,
-      recent: rows.slice(0, 250).map(formatQualifiedBetForPublic),
-      trackingStartedAt,
-      freezeRule: {
-        normalFreezeMinutesBeforeKickoff: 30,
-        latestFreezeMinutesBeforeKickoff: 10,
-      },
-      generatedAt: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error("ERREUR /public/bilan/paris :", error);
-
-    return res.status(500).json({
-      ok: false,
-      error:
-        error?.message ||
-        "Impossible de charger /public/bilan/paris.",
-    });
-  }
-});
-
 
 /*
  * ============================================================
