@@ -29042,6 +29042,21 @@ function evaluateSafeBetV2(
   const blockers = [];
   const warnings = [];
 
+  const decisionType =
+    String(
+      row.studio_decision_type || ""
+    )
+      .trim()
+      .toUpperCase();
+
+  if (
+    decisionType === "NO_BET"
+  ) {
+    blockers.push(
+      "Brain Studio classe ce marché NO_BET."
+    );
+  }
+
   if (
     primary.probability < 65
   ) {
@@ -29176,6 +29191,10 @@ function evaluateSafeBetV2(
       statistics: {
         decisionScore:
           primary.decisionScore,
+        decisionType:
+          row.studio_decision_type || null,
+        decisionGrade:
+          row.studio_decision_grade || null,
         points:
           statisticsPoints,
         max: 15,
@@ -29272,8 +29291,7 @@ app.get(
 
             WHERE
               studio_snapshot IS NOT NULL
-              AND fixture_date >
-                NOW() - INTERVAL '1 day'
+              AND fixture_date > NOW()
               AND fixture_date <
                 NOW() + INTERVAL '7 days'
 
@@ -29451,7 +29469,7 @@ app.get(
         ok: true,
         private: true,
         version:
-          "safe-bet-engine-v2",
+          "safe-bet-engine-v3",
         summary,
         rows,
         generatedAt:
