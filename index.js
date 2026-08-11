@@ -29469,6 +29469,249 @@ app.get(
 );
 
 
+/*
+ * ============================================================
+ * FUN BET ENGINE V1 — PRIVÉ ADMIN
+ * ============================================================
+ *
+ * Objectif : détecter des paris plus audacieux mais encore défendables
+ * par Brain Studio. Aucune publication automatique.
+ *
+ * Barème /100 :
+ * - attractivité de la cote : 25
+ * - value estimée : 25
+ * - crédibilité Brain Studio : 20
+ * - consensus / confiance : 15
+ * - potentiel du scénario : 10
+ * - qualité des données : 5
+ */
+
+function funOddPoints(odd) {
+  const o = safeNumber(odd, 0);
+  if (o >= 3.00 && o <= 8.00) return 25;
+  if (o >= 2.50) return 22;
+  if (o >= 2.00) return 18;
+  if (o >= 1.70) return 14;
+  if (o >= 1.45) return 8;
+  if (o > 1.01) return 3;
+  return 0;
+}
+
+function getFunValue(primary = {}, row = {}) {
+  const stored = safeNumber(row.value_percentage, null);
+  if (stored !== null) return stored;
+  const odd = safeNumber(primary.odd, null);
+  const probability = safeNumber(primary.probability, null);
+  if (!odd || probability === null) return null;
+  return Number(((probability / 100 - 1 / odd) * 100).toFixed(2));
+}
+
+function funValuePoints(value) {
+  const v = safeNumber(value, null);
+  if (v === null) return 0;
+  if (v >= 20) return 25;
+  if (v >= 15) return 22;
+  if (v >= 10) return 18;
+  if (v >= 6) return 14;
+  if (v >= 3) return 9;
+  if (v >= 0) return 4;
+  return 0;
+}
+
+function funCredibilityPoints(decisionScore) {
+  const s = safeNumber(decisionScore, 0);
+  if (s >= 90) return 20;
+  if (s >= 82) return 18;
+  if (s >= 75) return 15;
+  if (s >= 65) return 12;
+  if (s >= 55) return 8;
+  if (s >= 45) return 4;
+  return 0;
+}
+
+function funConsensusPoints(consensus) {
+  const c = safeNumber(consensus, 0);
+  if (c >= 85) return 15;
+  if (c >= 75) return 13;
+  if (c >= 65) return 10;
+  if (c >= 55) return 7;
+  if (c >= 45) return 4;
+  return 0;
+}
+
+function funScenarioPoints(primary = {}) {
+  const p = safeNumber(primary.probability, 0);
+  const o = safeNumber(primary.odd, 0);
+  if (p >= 60 && o >= 2.00) return 10;
+  if (p >= 55 && o >= 1.80) return 8;
+  if (p >= 50 && o >= 1.65) return 6;
+  if (p >= 45 && o > 1.01) return 4;
+  if (p >= 35 && o > 1.01) return 2;
+  return 0;
+}
+
+function funDataQualityPoints(dataQuality = {}) {
+  const q = safeNumber(dataQuality.score, 0);
+  if (q >= 90) return 5;
+  if (q >= 80) return 4;
+  if (q >= 70) return 3;
+  if (q >= 60) return 2;
+  return 0;
+}
+
+function evaluateFunBetV1(snapshot = {}, row = {}) {
+  const primary = getSafePrimaryMarket(snapshot, row);
+  const consensus = getSafeConsensus(primary, row);
+  const dataQuality = safeDataQuality(row);
+  const value = getFunValue(primary, row);
+
+  const oddPoints = funOddPoints(primary.odd);
+  const valuePoints = funValuePoints(value);
+  const credibilityPoints = funCredibilityPoints(primary.decisionScore);
+  const consensusPoints = funConsensusPoints(consensus.value);
+  const scenarioPoints = funScenarioPoints(primary);
+  const qualityPoints = funDataQualityPoints(dataQuality);
+
+  const score = safeClamp(
+    oddPoints + valuePoints + credibilityPoints + consensusPoints + scenarioPoints + qualityPoints,
+    0,
+    100
+  );
+
+  const blockers = [];
+  const warnings = [];
+  const decisionType = String(row.studio_decision_type || "").trim().toUpperCase();
+
+  if (decisionType === "NO_BET") blockers.push("Brain Studio classe ce marché NO_BET.");
+  if (!primary.odd) blockers.push("Aucune cote exploitable enregistrée.");
+  else if (primary.odd <= 1.01 || primary.odd > 50) blockers.push("Cote aberrante ou inexploitable.");
+  if (primary.probability < 35) blockers.push("Probabilité Brain Studio trop faible (< 35 %).");
+  if (primary.decisionScore < 45) blockers.push("Decision Score Brain Studio trop faible (< 45).");
+  if (consensus.value < 40) blockers.push("Consensus / confiance trop faible (< 40).");
+  if (dataQuality.score < 60) blockers.push("Données Brain Studio trop incomplètes (< 60 %).");
+  if (value !== null && value < -5) blockers.push("Value estimée fortement négative.");
+
+  if (primary.odd && primary.odd < 1.45) warnings.push("Cote peu attractive pour un pari FUN.");
+  if (primary.odd && primary.odd > 8) warnings.push("Très grosse cote : variance particulièrement élevée.");
+  if (value === null) warnings.push("Value indisponible : score FUN pénalisé.");
+  if (primary.probability >= 99.9) warnings.push("Probabilité extrême : contrôle manuel recommandé.");
+
+  let status = "REJECTED";
+  if (blockers.length === 0) {
+    if (score >= 85) status = "FUN_PLUS";
+    else if (score >= 75) status = "FUN";
+    else if (score >= 65) status = "WATCH";
+  }
+
+  return {
+    score: Number(score.toFixed(1)),
+    status,
+    blockers,
+    warnings,
+    market: {
+      key: primary.marketKey,
+      label: primary.marketLabel,
+      odd: primary.odd,
+      oddSource: primary.oddSource,
+    },
+    breakdown: {
+      odd: { value: primary.odd, points: oddPoints, max: 25 },
+      value: { value, points: valuePoints, max: 25, source: row.value_percentage !== null ? "predictions.value_percentage" : "probability_vs_odd" },
+      credibility: { value: primary.decisionScore, points: credibilityPoints, max: 20, source: "predictions.studio_decision_score" },
+      consensus: { value: consensus.value, points: consensusPoints, max: 15, source: consensus.source },
+      scenario: { probability: primary.probability, odd: primary.odd, points: scenarioPoints, max: 10 },
+      dataQuality: { ...dataQuality, points: qualityPoints, max: 5 },
+    },
+  };
+}
+
+app.get(
+  "/internal/admin/fun-bets",
+  async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) return;
+    try {
+      const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+      const statusFilter = String(req.query.status || "").trim().toUpperCase();
+      const mode = String(req.query.mode || "current").trim().toLowerCase();
+      const historyMode = mode === "history";
+      const dateFilter = historyMode
+        ? `fixture_date <= NOW() AND fixture_date > NOW() - INTERVAL '30 days'`
+        : `fixture_date > NOW() AND fixture_date < NOW() + INTERVAL '7 days'`;
+
+      const result = await pool.query(`
+        SELECT
+          id, fixture_id, fixture_date, league_id, league_name,
+          home_team_name, away_team_name, confidence, risk,
+          market_odd, value_percentage,
+          studio_market_key, studio_market_label, studio_probability,
+          studio_decision_score, studio_decision_type, studio_decision_grade,
+          studio_snapshot, studio_saved_at,
+          manual_market_odd, manual_market_key, manual_odd_source, manual_odd_updated_at,
+          xg_confidence_score, xg_confidence_level,
+          analysis_context, model_inputs, monte_carlo_model, decision_trace,
+          updated_at
+        FROM predictions
+        WHERE studio_snapshot IS NOT NULL AND ${dateFilter}
+        ORDER BY fixture_date ${historyMode ? "DESC" : "ASC"}, id DESC
+        LIMIT $1
+      `, [limit]);
+
+      const rows = [];
+      for (const row of result.rows) {
+        let snapshot = row.studio_snapshot;
+        if (typeof snapshot === "string") {
+          try { snapshot = JSON.parse(snapshot); } catch { snapshot = {}; }
+        }
+        if (!snapshot || typeof snapshot !== "object") snapshot = {};
+        const fun = evaluateFunBetV1(snapshot, row);
+        if (statusFilter && fun.status !== statusFilter) continue;
+        rows.push({
+          predictionId: Number(row.id),
+          fixtureId: Number(row.fixture_id),
+          kickoff: row.fixture_date,
+          leagueId: row.league_id == null ? null : Number(row.league_id),
+          leagueName: row.league_name || "",
+          homeTeam: row.home_team_name || "",
+          awayTeam: row.away_team_name || "",
+          fun,
+          brainStudio: {
+            probability: row.studio_probability == null ? null : Number(row.studio_probability),
+            decisionScore: row.studio_decision_score == null ? null : Number(row.studio_decision_score),
+            decisionType: row.studio_decision_type || null,
+            decisionGrade: row.studio_decision_grade || null,
+            confidence: row.confidence == null ? null : Number(row.confidence),
+            risk: row.risk || null,
+            valuePercentage: row.value_percentage == null ? null : Number(row.value_percentage),
+            savedAt: row.studio_saved_at || null,
+          },
+          updatedAt: row.updated_at,
+        });
+      }
+
+      const summary = {
+        total: rows.length,
+        funPlus: rows.filter((row) => row.fun.status === "FUN_PLUS").length,
+        fun: rows.filter((row) => row.fun.status === "FUN").length,
+        watch: rows.filter((row) => row.fun.status === "WATCH").length,
+        rejected: rows.filter((row) => row.fun.status === "REJECTED").length,
+      };
+
+      return res.json({
+        ok: true, private: true, version: "fun-bet-engine-v1",
+        mode: historyMode ? "history" : "current",
+        summary, rows, generatedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("ERREUR FUN BET ENGINE V1 :", error);
+      return res.status(500).json({
+        ok: false,
+        error: error?.message || "Impossible de calculer les FUN privés.",
+      });
+    }
+  }
+);
+
+
 app.listen(
   PORT,
   "0.0.0.0",
