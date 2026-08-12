@@ -16,7 +16,7 @@
  */
 
 const GOALSCORER_VERSION =
-  "goalscorer-engine-v2.3.0-recommendation";
+  "goalscorer-engine-v2.4.0-brain-studio-public";
 
 const MARKET_TYPES = Object.freeze({
   ANYTIME: "ANYTIME_GOALSCORER",
@@ -1137,7 +1137,7 @@ function createGoalscorerEngine({
 
       await pool.query(`
         DELETE FROM goalscorer_learning_stats
-        WHERE learning_version <> 'goalscorer-engine-v2.3.0-recommendation';
+        WHERE learning_version <> 'goalscorer-engine-v2.4.0-brain-studio-public';
       `);
 
       tablesReady = true;
@@ -2181,7 +2181,7 @@ function createGoalscorerEngine({
 
     await pool.query(`
       DELETE FROM goalscorer_learning_stats
-      WHERE learning_version = 'goalscorer-engine-v2.3.0-recommendation';
+      WHERE learning_version = 'goalscorer-engine-v2.4.0-brain-studio-public';
     `);
 
     for (const row of result.rows) {
@@ -2383,7 +2383,332 @@ function createGoalscorerEngine({
     };
   }
 
+  function publicRecommendationRank(tier) {
+    const ranks = {
+      TOP_SCORER: 4,
+      RECOMMENDED: 3,
+      WATCH: 2,
+      REJECTED: 1,
+    };
+
+    return ranks[String(tier || "").toUpperCase()] || 0;
+  }
+
+  function publicRecommendationLabel(tier) {
+    const labels = {
+      TOP_SCORER: "TOP BUTEUR",
+      RECOMMENDED: "RECOMMANDÉ",
+      WATCH: "À SURVEILLER",
+      REJECTED: "NON CONSEILLÉ",
+    };
+
+    return labels[String(tier || "").toUpperCase()] || "INDISPONIBLE";
+  }
+
+  function publicReasonLabel(reason) {
+    const labels = {
+      HIGH_GOAL_PROBABILITY: "Forte probabilité de but",
+      WATCH_GOAL_PROBABILITY: "Probabilité de but intéressante",
+      LOW_GOAL_PROBABILITY: "Probabilité de but limitée",
+      HIGH_EXPECTED_MINUTES: "Temps de jeu attendu élevé",
+      LOW_EXPECTED_MINUTES: "Temps de jeu attendu limité",
+      LIKELY_STARTER: "Titularisation probable",
+      STARTER_UNCERTAINTY: "Titularisation incertaine",
+      HIGH_DATA_QUALITY: "Données de bonne qualité",
+      LIMITED_DATA_QUALITY: "Qualité des données limitée",
+      LOW_SAMPLE_RELIABILITY: "Échantillon encore limité",
+      DATA_ANOMALY: "Anomalie détectée dans les données",
+      INJURED: "Joueur signalé blessé",
+    };
+
+    return labels[String(reason || "").toUpperCase()] || null;
+  }
+
+  function buildPublicGoalscorerPlayer(rows) {
+    const anytime =
+      rows.find(
+        (row) =>
+          row.market_type === MARKET_TYPES.ANYTIME
+      ) || null;
+
+    const replacement =
+      rows.find(
+        (row) =>
+          row.market_type === MARKET_TYPES.REPLACEMENT
+      ) || null;
+
+    const candidates = [anytime, replacement].filter(Boolean);
+
+    const best =
+      [...candidates].sort(
+        (a, b) => {
+          const tierDiff =
+            publicRecommendationRank(b.recommendation_tier) -
+            publicRecommendationRank(a.recommendation_tier);
+
+          if (tierDiff !== 0) return tierDiff;
+
+          return (
+            numberOr(b.recommendation_score) -
+            numberOr(a.recommendation_score)
+          );
+        }
+      )[0] || null;
+
+    if (!best) return null;
+
+    const rawReasons =
+      Array.isArray(best.recommendation_reasons)
+        ? best.recommendation_reasons
+        : [];
+
+    return {
+      playerId: Number(best.player_id),
+      playerName: best.player_name,
+      position: best.position,
+      positionGroup: best.position_group,
+      teamId: Number(best.team_id),
+      homeAway: best.home_away,
+
+      tier: best.recommendation_tier,
+      tierLabel: publicRecommendationLabel(
+        best.recommendation_tier
+      ),
+      score:
+        best.recommendation_score != null
+          ? Number(best.recommendation_score)
+          : null,
+
+      reasons: rawReasons
+        .map(publicReasonLabel)
+        .filter(Boolean),
+
+      sampleReliability:
+        best.sample_reliability || null,
+      dataQuality:
+        best.data_quality != null
+          ? Number(best.data_quality)
+          : null,
+      starterProbability:
+        best.starter_probability != null
+          ? Number(best.starter_probability)
+          : null,
+      expectedMinutes:
+        best.expected_minutes != null
+          ? Number(best.expected_minutes)
+          : null,
+
+      anytime: anytime
+        ? {
+            probability:
+              anytime.predicted_probability != null
+                ? Number(anytime.predicted_probability)
+                : null,
+            fairOdd:
+              anytime.fair_odd != null
+                ? Number(anytime.fair_odd)
+                : null,
+            tier: anytime.recommendation_tier,
+            tierLabel: publicRecommendationLabel(
+              anytime.recommendation_tier
+            ),
+            score:
+              anytime.recommendation_score != null
+                ? Number(anytime.recommendation_score)
+                : null,
+          }
+        : null,
+
+      scorerOrReplacement: replacement
+        ? {
+            probability:
+              replacement.predicted_probability != null
+                ? Number(replacement.predicted_probability)
+                : null,
+            fairOdd:
+              replacement.fair_odd != null
+                ? Number(replacement.fair_odd)
+                : null,
+            tier: replacement.recommendation_tier,
+            tierLabel: publicRecommendationLabel(
+              replacement.recommendation_tier
+            ),
+            score:
+              replacement.recommendation_score != null
+                ? Number(replacement.recommendation_score)
+                : null,
+          }
+        : null,
+    };
+  }
+
   function registerRoutes() {
+    /*
+     * ============================================================
+     * BRAIN STUDIO — BUTEURS (PUBLIC, LECTURE SEULE)
+     * ============================================================
+     *
+     * IMPORTANT :
+     * - aucune clé admin n'est exposée au frontend ;
+     * - aucune donnée raw/API interne n'est renvoyée ;
+     * - cette route ne déclenche AUCUNE analyse coûteuse ;
+     * - elle lit uniquement les prédictions déjà calculées.
+     */
+    app.get(
+      "/public/goalscorer/:fixtureId",
+      async (req, res) => {
+        try {
+          await ensureTables();
+
+          const fixtureId = Number(req.params.fixtureId);
+
+          if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+            return res.status(400).json({
+              ok: false,
+              error: "fixtureId invalide",
+            });
+          }
+
+          const [predictionResult, matchResult] = await Promise.all([
+            pool.query(
+              `
+                SELECT
+                  fixture_id,
+                  fixture_date,
+                  team_id,
+                  opponent_id,
+                  home_away,
+                  player_id,
+                  player_name,
+                  position,
+                  position_group,
+                  market_type,
+                  predicted_probability,
+                  fair_odd,
+                  starter_probability,
+                  expected_minutes,
+                  data_quality,
+                  sample_reliability,
+                  recommendation_score,
+                  recommendation_tier,
+                  recommendation_reasons
+                FROM goalscorer_predictions
+                WHERE fixture_id = $1
+                  AND model_version = $2
+                ORDER BY
+                  recommendation_score DESC NULLS LAST,
+                  predicted_probability DESC
+              `,
+              [fixtureId, GOALSCORER_VERSION]
+            ),
+            pool.query(
+              `
+                SELECT
+                  fixture_id,
+                  fixture_date,
+                  home_team_id,
+                  home_team_name,
+                  away_team_id,
+                  away_team_name,
+                  official_xg_home,
+                  official_xg_away
+                FROM predictions
+                WHERE fixture_id = $1
+                LIMIT 1
+              `,
+              [fixtureId]
+            ),
+          ]);
+
+          const grouped = new Map();
+
+          for (const row of predictionResult.rows) {
+            const playerId = Number(row.player_id);
+
+            if (!grouped.has(playerId)) {
+              grouped.set(playerId, []);
+            }
+
+            grouped.get(playerId).push(row);
+          }
+
+          const players =
+            [...grouped.values()]
+              .map(buildPublicGoalscorerPlayer)
+              .filter(Boolean)
+              .filter(
+                (player) =>
+                  publicRecommendationRank(player.tier) >=
+                  publicRecommendationRank("WATCH")
+              )
+              .sort((a, b) => {
+                const tierDiff =
+                  publicRecommendationRank(b.tier) -
+                  publicRecommendationRank(a.tier);
+
+                if (tierDiff !== 0) return tierDiff;
+
+                return numberOr(b.score) - numberOr(a.score);
+              });
+
+          const match = matchResult.rows[0] || null;
+
+          return res.json({
+            ok: true,
+            available: predictionResult.rows.length > 0,
+            version: GOALSCORER_VERSION,
+            fixtureId,
+            match: match
+              ? {
+                  kickoff: match.fixture_date,
+                  homeTeam: {
+                    id: Number(match.home_team_id),
+                    name: match.home_team_name,
+                    expectedGoals:
+                      match.official_xg_home != null
+                        ? Number(match.official_xg_home)
+                        : null,
+                  },
+                  awayTeam: {
+                    id: Number(match.away_team_id),
+                    name: match.away_team_name,
+                    expectedGoals:
+                      match.official_xg_away != null
+                        ? Number(match.official_xg_away)
+                        : null,
+                  },
+                }
+              : null,
+            summary: {
+              topScorers: players.filter(
+                (player) => player.tier === "TOP_SCORER"
+              ).length,
+              recommended: players.filter(
+                (player) => player.tier === "RECOMMENDED"
+              ).length,
+              watch: players.filter(
+                (player) => player.tier === "WATCH"
+              ).length,
+            },
+            players,
+            generatedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          console.error(
+            "GOALSCORER PUBLIC ROUTE :",
+            error
+          );
+
+          return res.status(500).json({
+            ok: false,
+            error:
+              error?.message ||
+              "Impossible de charger les recommandations buteur.",
+          });
+        }
+      }
+    );
+
     app.get(
       "/internal/goalscorer/status",
       ...guards,
