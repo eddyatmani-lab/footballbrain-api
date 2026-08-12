@@ -374,8 +374,8 @@ function createEngineLearningCore({
                 settlement.settlement_status,
                 settlement.ignored_reason,
                 settlement.won,
-                settlement.actual_home_goals,
-                settlement.actual_away_goals
+                settlement.home_goals,
+                settlement.away_goals
               FROM engine_prediction_logs log
               LEFT JOIN engine_prediction_settlements settlement
                 ON settlement.prediction_log_id = log.id
@@ -429,10 +429,10 @@ function createEngineLearningCore({
                 ignoredReason: row.ignored_reason || null,
                 won: row.won,
                 score:
-                  row.actual_home_goals === null ||
-                  row.actual_away_goals === null
+                  row.home_goals === null ||
+                  row.away_goals === null
                     ? null
-                    : `${row.actual_home_goals}-${row.actual_away_goals}`,
+                    : `${row.home_goals}-${row.away_goals}`,
               },
               rawKeys: Object.keys(raw),
               rawOutput: raw,
@@ -470,7 +470,7 @@ function createEngineLearningCore({
           return res.json({
             ok: true,
             readOnly: true,
-            version: "engine-learning-v1.3-raw-diagnostics",
+            version: "engine-learning-v1.3.1-raw-diagnostics-fix",
             engines,
             limitPerEngine: limit,
             summaries,
