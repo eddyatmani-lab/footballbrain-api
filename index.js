@@ -47,6 +47,9 @@ const {
   createEngineLearningCore,
 } = require("./src/learning");
 const {
+  createGoalscorerEngine,
+} = require("./src/goalscorer");
+const {
   createOddsSyncService,
 } = require("./src/services/OddsSyncService");
 const {
@@ -152,6 +155,11 @@ function stableApiFootballCacheKey(endpoint, params = {}) {
 
 function getApiFootballCacheTtl(endpoint, params = {}) {
   if (endpoint === "/fixtures/lineups") return 5 * 60 * 1000;
+  if (endpoint === "/fixtures/players") return 24 * 60 * 60 * 1000;
+  if (endpoint === "/fixtures/events") return 30 * 60 * 1000;
+  if (endpoint === "/players") return 6 * 60 * 60 * 1000;
+  if (endpoint === "/players/squads") return 24 * 60 * 60 * 1000;
+  if (endpoint === "/odds/bets") return 24 * 60 * 60 * 1000;
   if (endpoint === "/injuries") return 20 * 60 * 1000;
   if (endpoint === "/odds") return 10 * 60 * 1000;
   if (endpoint === "/fixtures/headtohead") return 6 * 60 * 60 * 1000;
@@ -329,6 +337,45 @@ async function callApiFootball(
 
   return response;
 }
+
+/*
+ * ============================================================
+ * GOALSCORER ENGINE V1
+ * ============================================================
+ *
+ * Marchés :
+ * - ANYTIME_GOALSCORER
+ * - SCORER_OR_REPLACEMENT
+ *
+ * La garantie remplaçant est modélisée avant composition,
+ * mais le settlement reste conservateur si la règle bookmaker
+ * ne peut pas être résolue avec les événements du match.
+ */
+const goalscorerEngine =
+  createGoalscorerEngine({
+    app,
+    pool,
+    callApiFootball,
+
+    adminGuard(req, res, next) {
+      if (
+        !requireOptionalAdminKey(
+          req,
+          res
+        )
+      ) {
+        return;
+      }
+
+      next();
+    },
+
+    schedulersEnabled:
+      AUTOMATIC_SCHEDULERS_ENABLED,
+  });
+
+goalscorerEngine.registerRoutes();
+
 /*
  * ============================================================
  * ODDS SYNC SERVICE
@@ -29991,6 +30038,9 @@ oddsSyncService
       .ensureTables()
       .then(() => {
         engineLearningCore
+          .startScheduler();
+
+        goalscorerEngine
           .startScheduler();
 
         setTimeout(() => {
