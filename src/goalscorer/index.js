@@ -16,7 +16,7 @@
  */
 
 const GOALSCORER_VERSION =
-  "goalscorer-engine-v2.0.0";
+  "goalscorer-engine-v2.1.0-deduplicated-stats";
 
 const MARKET_TYPES = Object.freeze({
   ANYTIME: "ANYTIME_GOALSCORER",
@@ -661,9 +661,62 @@ async function fetchPagedPlayers({
   return rows;
 }
 
+function statIdentity(stat) {
+  const teamId = Number(stat?.team?.id) || 0;
+  const leagueId = Number(stat?.league?.id) || 0;
+  const season = Number(stat?.league?.season) || 0;
+
+  /*
+   * API-Football peut renvoyer le même bloc statistique :
+   * - dans /players?team=...&season=...
+   * - puis à nouveau dans /players?team=...&season=...&league=...
+   *
+   * Pour le même joueur, la combinaison équipe + compétition + saison
+   * doit donc être unique dans notre profil agrégé.
+   */
+  return `${teamId}:${leagueId}:${season}`;
+}
+
+function statCompletenessScore(stat) {
+  const games = stat?.games || {};
+  const goals = stat?.goals || {};
+  const shots = stat?.shots || {};
+  const penalty = stat?.penalty || {};
+  const substitutes = stat?.substitutes || {};
+
+  const values = [
+    games.appearences ?? games.appearances,
+    games.lineups,
+    games.minutes,
+    games.position,
+    goals.total,
+    shots.total,
+    shots.on,
+    penalty.scored,
+    substitutes.in,
+    substitutes.out,
+  ];
+
+  return values.reduce(
+    (score, value) =>
+      score +
+      (value !== null &&
+      value !== undefined &&
+      value !== ""
+        ? 1
+        : 0),
+    0
+  );
+}
+
 function mergePlayerResponses(primary, secondary) {
   const byPlayer = new Map();
 
+  /*
+   * IMPORTANT V2.1 :
+   * on fusionne les deux endpoints sans additionner deux fois
+   * le même bloc de compétition.
+   */
   for (const source of [primary, secondary]) {
     for (const row of source || []) {
       const id = Number(row?.player?.id);
@@ -672,18 +725,55 @@ function mergePlayerResponses(primary, secondary) {
       if (!byPlayer.has(id)) {
         byPlayer.set(id, {
           player: row.player,
-          statistics: [],
+          statisticsByKey: new Map(),
         });
       }
 
       const entry = byPlayer.get(id);
-      entry.statistics.push(
-        ...(Array.isArray(row?.statistics) ? row.statistics : [])
-      );
+
+      /*
+       * Conserve les infos joueur les plus complètes si l'un
+       * des deux appels API en retourne davantage.
+       */
+      if (
+        row?.player &&
+        Object.keys(row.player).length >
+          Object.keys(entry.player || {}).length
+      ) {
+        entry.player = row.player;
+      }
+
+      for (const stat of Array.isArray(row?.statistics)
+        ? row.statistics
+        : []) {
+        const key = statIdentity(stat);
+
+        if (!entry.statisticsByKey.has(key)) {
+          entry.statisticsByKey.set(key, stat);
+          continue;
+        }
+
+        /*
+         * Si deux blocs ont la même identité mais ne sont pas
+         * strictement identiques, on garde le plus complet au lieu
+         * de les additionner.
+         */
+        const existing = entry.statisticsByKey.get(key);
+
+        if (
+          statCompletenessScore(stat) >
+          statCompletenessScore(existing)
+        ) {
+          entry.statisticsByKey.set(key, stat);
+        }
+      }
     }
   }
 
-  return [...byPlayer.values()];
+  return [...byPlayer.values()].map((entry) => ({
+    player: entry.player,
+    statistics: [...entry.statisticsByKey.values()],
+  }));
 }
 
 function allocateTeamXg({
@@ -983,14 +1073,17 @@ function createGoalscorerEngine({
       await pool.query(
         `
           DELETE FROM goalscorer_predictions
-          WHERE model_version = $1
+          WHERE model_version IN ($1, $2)
         `,
-        ["goalscorer-engine-v1.0.0"]
+        [
+          "goalscorer-engine-v1.0.0",
+          "goalscorer-engine-v2.0.0",
+        ]
       );
 
       await pool.query(`
         DELETE FROM goalscorer_learning_stats
-        WHERE learning_version <> 'goalscorer-engine-v2.0.0';
+        WHERE learning_version <> 'goalscorer-engine-v2.1.0-deduplicated-stats';
       `);
 
       tablesReady = true;
@@ -2002,7 +2095,7 @@ function createGoalscorerEngine({
 
     await pool.query(`
       DELETE FROM goalscorer_learning_stats
-      WHERE learning_version = 'goalscorer-engine-v2.0.0';
+      WHERE learning_version = 'goalscorer-engine-v2.1.0-deduplicated-stats';
     `);
 
     for (const row of result.rows) {
