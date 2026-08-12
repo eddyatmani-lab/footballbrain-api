@@ -16,7 +16,15 @@
  */
 
 const GOALSCORER_VERSION =
-  "goalscorer-engine-v2.4.0-brain-studio-public";
+  "goalscorer-engine-v2.5.0-auto-learning";
+
+const GOALSCORER_LEARNING_GENERATION =
+  "goalscorer-probability-v2";
+
+const GOALSCORER_RECOMMENDATION_GENERATION =
+  "goalscorer-recommendation-v1";
+
+const LEARNING_APPLICATION_MIN_SAMPLE = 150;
 
 const MARKET_TYPES = Object.freeze({
   ANYTIME: "ANYTIME_GOALSCORER",
@@ -1078,6 +1086,20 @@ function createGoalscorerEngine({
       `);
 
       await pool.query(`
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS learning_generation TEXT;
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_goalscorer_predictions_learning_generation
+        ON goalscorer_predictions (
+          learning_generation,
+          result_status,
+          fixture_date
+        );
+      `);
+
+      await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_goalscorer_predictions_fixture
         ON goalscorer_predictions (fixture_id);
       `);
@@ -1118,6 +1140,85 @@ function createGoalscorerEngine({
         );
       `);
 
+
+      await pool.query(`
+        ALTER TABLE goalscorer_learning_stats
+        ADD COLUMN IF NOT EXISTS suggested_probability_adjustment NUMERIC(10,5);
+      `);
+
+      await pool.query(`
+        ALTER TABLE goalscorer_learning_stats
+        ADD COLUMN IF NOT EXISTS application_ready BOOLEAN NOT NULL DEFAULT FALSE;
+      `);
+
+      await pool.query(`
+        ALTER TABLE goalscorer_learning_stats
+        ADD COLUMN IF NOT EXISTS learning_generation TEXT;
+      `);
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS goalscorer_recommendation_learning (
+          id BIGSERIAL PRIMARY KEY,
+
+          market_type TEXT NOT NULL,
+          recommendation_tier TEXT NOT NULL,
+
+          sample_size INTEGER NOT NULL DEFAULT 0,
+          wins INTEGER NOT NULL DEFAULT 0,
+          losses INTEGER NOT NULL DEFAULT 0,
+
+          average_predicted_probability NUMERIC(10,5),
+          actual_score_rate NUMERIC(10,5),
+          calibration_gap NUMERIC(10,5),
+          brier_score NUMERIC(10,6),
+
+          reliability_level TEXT NOT NULL,
+          application_ready BOOLEAN NOT NULL DEFAULT FALSE,
+
+          learning_generation TEXT NOT NULL,
+          calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+          UNIQUE (
+            market_type,
+            recommendation_tier,
+            learning_generation
+          )
+        );
+      `);
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS goalscorer_learning_runs (
+          id BIGSERIAL PRIMARY KEY,
+          run_type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          rows_processed INTEGER NOT NULL DEFAULT 0,
+          summary JSONB,
+          error_message TEXT,
+          started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          finished_at TIMESTAMPTZ
+        );
+      `);
+
+      /*
+       * V2.4 est la première génération publique stable du modèle.
+       * On la rattache à la génération probabiliste V2 pour ne pas
+       * perdre ses résultats au prochain déploiement.
+       */
+      await pool.query(
+        `
+          UPDATE goalscorer_predictions
+          SET learning_generation = $1
+          WHERE learning_generation IS NULL
+            AND model_version IN ($2, $3)
+        `,
+        [
+          GOALSCORER_LEARNING_GENERATION,
+          "goalscorer-engine-v2.4.0-brain-studio-public",
+          GOALSCORER_VERSION,
+        ]
+      );
+
       /*
        * Les prédictions V1 étaient des tests exploratoires.
        * On les retire pour éviter de contaminer le Learning V2
@@ -1135,10 +1236,6 @@ function createGoalscorerEngine({
         ]
       );
 
-      await pool.query(`
-        DELETE FROM goalscorer_learning_stats
-        WHERE learning_version <> 'goalscorer-engine-v2.4.0-brain-studio-public';
-      `);
 
       tablesReady = true;
     })();
@@ -1800,6 +1897,7 @@ function createGoalscorerEngine({
                   recommendation_score = $4,
                   recommendation_tier = $5,
                   recommendation_reasons = $6::jsonb,
+                  learning_generation = $7,
                   updated_at = NOW()
                 WHERE fixture_id = $1
                   AND player_id = $2
@@ -1812,6 +1910,7 @@ function createGoalscorerEngine({
                 row.recommendationScore,
                 row.recommendationTier,
                 safeJson(row.recommendationReasons),
+                GOALSCORER_LEARNING_GENERATION,
               ]
             );
           }
@@ -1944,10 +2043,10 @@ function createGoalscorerEngine({
         SELECT *
         FROM goalscorer_predictions
         WHERE fixture_id = $1
-          AND model_version = $2
+          AND learning_generation = $2
           AND result_status = 'PENDING'
       `,
-      [fixtureId, GOALSCORER_VERSION]
+      [fixtureId, GOALSCORER_LEARNING_GENERATION]
     );
 
     let settled = 0;
@@ -2055,7 +2154,7 @@ function createGoalscorerEngine({
         JOIN predictions p
           ON p.fixture_id = g.fixture_id
         WHERE
-          g.model_version = $1
+          g.learning_generation = $1
           AND g.result_status = 'PENDING'
           AND (
             p.result_status = 'COMPLETED'
@@ -2067,7 +2166,7 @@ function createGoalscorerEngine({
         ORDER BY g.fixture_id ASC
         LIMIT 100
       `,
-      [GOALSCORER_VERSION]
+      [GOALSCORER_LEARNING_GENERATION]
     );
 
     let settled = 0;
@@ -2097,24 +2196,93 @@ function createGoalscorerEngine({
     };
   }
 
-  async function rebuildLearning() {
-    await ensureTables();
+  async function recordLearningRun({
+    runType,
+    status,
+    rowsProcessed = 0,
+    summary = null,
+    errorMessage = null,
+    startedAt = new Date(),
+  }) {
+    try {
+      await pool.query(
+        `
+          INSERT INTO goalscorer_learning_runs (
+            run_type,
+            status,
+            rows_processed,
+            summary,
+            error_message,
+            started_at,
+            finished_at
+          )
+          VALUES (
+            $1,$2,$3,$4::jsonb,$5,$6,NOW()
+          )
+        `,
+        [
+          runType,
+          status,
+          rowsProcessed,
+          safeJson(summary),
+          errorMessage,
+          startedAt,
+        ]
+      );
+    } catch (error) {
+      console.error(
+        "GOALSCORER LEARNING RUN LOG :",
+        error?.message || error
+      );
+    }
+  }
 
+  function learningReliability(sample) {
+    const n = numberOr(sample);
+
+    if (n >= 300) return "RELIABLE";
+    if (n >= 150) return "DEVELOPING";
+    if (n >= 50) return "OBSERVATION";
+
+    return "INSUFFICIENT_DATA";
+  }
+
+  function suggestedCalibrationAdjustment({
+    sample,
+    predicted,
+    actual,
+  }) {
+    const n = numberOr(sample);
+
+    if (n < 50) return 0;
+
+    const raw =
+      numberOr(actual) -
+      numberOr(predicted);
+
+    /*
+     * Shrinkage de la correction :
+     * - à 50 observations, correction très prudente ;
+     * - à 300+, la correction peut atteindre le plafond.
+     */
+    const sampleWeight =
+      clamp(n / 300, 0.15, 1);
+
+    return round(
+      clamp(raw * sampleWeight, -8, 8),
+      4
+    );
+  }
+
+  async function rebuildRecommendationLearning() {
     const result = await pool.query(
       `
         SELECT
           market_type,
-          CASE
-            WHEN predicted_probability < 10 THEN '00_10'
-            WHEN predicted_probability < 20 THEN '10_20'
-            WHEN predicted_probability < 30 THEN '20_30'
-            WHEN predicted_probability < 40 THEN '30_40'
-            WHEN predicted_probability < 50 THEN '40_50'
-            ELSE '50_PLUS'
-          END AS probability_bucket,
-
-          COALESCE(NULLIF(position_group, ''), 'UNKNOWN')
-            AS position_group,
+          COALESCE(
+            NULLIF(recommendation_tier, ''),
+            'UNKNOWN'
+          ) AS recommendation_tier,
 
           COUNT(*)::INTEGER AS sample_size,
 
@@ -2146,70 +2314,48 @@ function createGoalscorerEngine({
               END,
               2
             )
-          )::NUMERIC AS brier_score,
-
-          COUNT(*) FILTER (
-            WHERE market_odd > 1
-              AND profit_units IS NOT NULL
-          )::INTEGER AS bets_with_odds,
-
-          COALESCE(
-            SUM(profit_units) FILTER (
-              WHERE market_odd > 1
-            ),
-            0
-          )::NUMERIC AS profit_units
+          )::NUMERIC AS brier_score
 
         FROM goalscorer_predictions
         WHERE
-          model_version = $1
+          learning_generation = $1
           AND result_status = 'SETTLED'
           AND scored IS NOT NULL
+          AND recommendation_tier IS NOT NULL
 
         GROUP BY
           market_type,
-          probability_bucket,
-          position_group
+          recommendation_tier
 
         ORDER BY
           market_type,
-          probability_bucket,
-          position_group
+          recommendation_tier
       `,
-      [GOALSCORER_VERSION]
+      [GOALSCORER_LEARNING_GENERATION]
     );
 
-    await pool.query(`
-      DELETE FROM goalscorer_learning_stats
-      WHERE learning_version = 'goalscorer-engine-v2.4.0-brain-studio-public';
-    `);
+    await pool.query(
+      `
+        DELETE FROM goalscorer_recommendation_learning
+        WHERE learning_generation = $1
+      `,
+      [GOALSCORER_RECOMMENDATION_GENERATION]
+    );
 
     for (const row of result.rows) {
       const sample = numberOr(row.sample_size);
-      const predicted = numberOr(row.average_predicted_probability);
-      const actual = numberOr(row.actual_score_rate);
-      const gap = round(predicted - actual, 4);
-
-      const bets = numberOr(row.bets_with_odds);
-      const profit = numberOr(row.profit_units);
-      const roi =
-        bets > 0 ? round((profit / bets) * 100, 4) : null;
-
-      const reliability =
-        sample >= 300
-          ? "RELIABLE"
-          : sample >= 150
-            ? "DEVELOPING"
-            : sample >= 50
-              ? "OBSERVATION"
-              : "INSUFFICIENT_DATA";
+      const predicted =
+        numberOr(row.average_predicted_probability);
+      const actual =
+        numberOr(row.actual_score_rate);
+      const gap =
+        round(predicted - actual, 4);
 
       await pool.query(
         `
-          INSERT INTO goalscorer_learning_stats (
+          INSERT INTO goalscorer_recommendation_learning (
             market_type,
-            probability_bucket,
-            position_group,
+            recommendation_tier,
             sample_size,
             wins,
             losses,
@@ -2217,23 +2363,20 @@ function createGoalscorerEngine({
             actual_score_rate,
             calibration_gap,
             brier_score,
-            bets_with_odds,
-            profit_units,
-            roi_percentage,
             reliability_level,
-            learning_version,
+            application_ready,
+            learning_generation,
             calculated_at,
             updated_at
           )
           VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-            $11,$12,$13,$14,$15,NOW(),NOW()
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,
+            $10,$11,$12,NOW(),NOW()
           )
         `,
         [
           row.market_type,
-          row.probability_bucket,
-          row.position_group,
+          row.recommendation_tier,
           sample,
           numberOr(row.wins),
           numberOr(row.losses),
@@ -2241,11 +2384,9 @@ function createGoalscorerEngine({
           actual,
           gap,
           numberOrNull(row.brier_score),
-          bets,
-          profit,
-          roi,
-          reliability,
-          GOALSCORER_VERSION,
+          learningReliability(sample),
+          sample >= LEARNING_APPLICATION_MIN_SAMPLE,
+          GOALSCORER_RECOMMENDATION_GENERATION,
         ]
       );
     }
@@ -2253,8 +2394,395 @@ function createGoalscorerEngine({
     return {
       ok: true,
       groups: result.rows.length,
+    };
+  }
+
+  async function rebuildLearning() {
+    await ensureTables();
+
+    const startedAt = new Date();
+
+    try {
+      const result = await pool.query(
+        `
+          SELECT
+            market_type,
+            CASE
+              WHEN predicted_probability < 10 THEN '00_10'
+              WHEN predicted_probability < 20 THEN '10_20'
+              WHEN predicted_probability < 30 THEN '20_30'
+              WHEN predicted_probability < 40 THEN '30_40'
+              WHEN predicted_probability < 50 THEN '40_50'
+              ELSE '50_PLUS'
+            END AS probability_bucket,
+
+            COALESCE(
+              NULLIF(position_group, ''),
+              'UNKNOWN'
+            ) AS position_group,
+
+            COUNT(*)::INTEGER AS sample_size,
+
+            COUNT(*) FILTER (
+              WHERE scored = TRUE
+            )::INTEGER AS wins,
+
+            COUNT(*) FILTER (
+              WHERE scored = FALSE
+            )::INTEGER AS losses,
+
+            AVG(predicted_probability)::NUMERIC
+              AS average_predicted_probability,
+
+            (
+              COUNT(*) FILTER (
+                WHERE scored = TRUE
+              )::NUMERIC /
+              NULLIF(COUNT(*), 0)
+            ) * 100
+              AS actual_score_rate,
+
+            AVG(
+              POWER(
+                (predicted_probability / 100.0) -
+                CASE
+                  WHEN scored = TRUE THEN 1.0
+                  ELSE 0.0
+                END,
+                2
+              )
+            )::NUMERIC AS brier_score,
+
+            COUNT(*) FILTER (
+              WHERE market_odd > 1
+                AND profit_units IS NOT NULL
+            )::INTEGER AS bets_with_odds,
+
+            COALESCE(
+              SUM(profit_units) FILTER (
+                WHERE market_odd > 1
+              ),
+              0
+            )::NUMERIC AS profit_units
+
+          FROM goalscorer_predictions
+          WHERE
+            learning_generation = $1
+            AND result_status = 'SETTLED'
+            AND scored IS NOT NULL
+
+          GROUP BY
+            market_type,
+            probability_bucket,
+            position_group
+
+          ORDER BY
+            market_type,
+            probability_bucket,
+            position_group
+        `,
+        [GOALSCORER_LEARNING_GENERATION]
+      );
+
+      await pool.query(
+        `
+          DELETE FROM goalscorer_learning_stats
+          WHERE learning_generation = $1
+        `,
+        [GOALSCORER_LEARNING_GENERATION]
+      );
+
+      for (const row of result.rows) {
+        const sample =
+          numberOr(row.sample_size);
+
+        const predicted =
+          numberOr(
+            row.average_predicted_probability
+          );
+
+        const actual =
+          numberOr(row.actual_score_rate);
+
+        const gap =
+          round(predicted - actual, 4);
+
+        const bets =
+          numberOr(row.bets_with_odds);
+
+        const profit =
+          numberOr(row.profit_units);
+
+        const roi =
+          bets > 0
+            ? round(
+                (profit / bets) * 100,
+                4
+              )
+            : null;
+
+        const adjustment =
+          suggestedCalibrationAdjustment({
+            sample,
+            predicted,
+            actual,
+          });
+
+        const applicationReady =
+          sample >=
+          LEARNING_APPLICATION_MIN_SAMPLE;
+
+        await pool.query(
+          `
+            INSERT INTO goalscorer_learning_stats (
+              market_type,
+              probability_bucket,
+              position_group,
+              sample_size,
+              wins,
+              losses,
+              average_predicted_probability,
+              actual_score_rate,
+              calibration_gap,
+              brier_score,
+              bets_with_odds,
+              profit_units,
+              roi_percentage,
+              reliability_level,
+              learning_version,
+              suggested_probability_adjustment,
+              application_ready,
+              learning_generation,
+              calculated_at,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+              $11,$12,$13,$14,$15,$16,$17,$18,
+              NOW(),NOW()
+            )
+          `,
+          [
+            row.market_type,
+            row.probability_bucket,
+            row.position_group,
+            sample,
+            numberOr(row.wins),
+            numberOr(row.losses),
+            predicted,
+            actual,
+            gap,
+            numberOrNull(row.brier_score),
+            bets,
+            profit,
+            roi,
+            learningReliability(sample),
+            GOALSCORER_VERSION,
+            adjustment,
+            applicationReady,
+            GOALSCORER_LEARNING_GENERATION,
+          ]
+        );
+      }
+
+      const recommendation =
+        await rebuildRecommendationLearning();
+
+      const summary = {
+        ok: true,
+        groups: result.rows.length,
+        recommendationGroups:
+          recommendation.groups,
+        learningGeneration:
+          GOALSCORER_LEARNING_GENERATION,
+        applicationMinSample:
+          LEARNING_APPLICATION_MIN_SAMPLE,
+      };
+
+      await recordLearningRun({
+        runType: "LEARNING_REBUILD",
+        status: "COMPLETED",
+        rowsProcessed:
+          result.rows.length +
+          recommendation.groups,
+        summary,
+        startedAt,
+      });
+
+      return {
+        ...summary,
+        version: GOALSCORER_VERSION,
+        generatedAt:
+          new Date().toISOString(),
+      };
+    } catch (error) {
+      await recordLearningRun({
+        runType: "LEARNING_REBUILD",
+        status: "FAILED",
+        rowsProcessed: 0,
+        errorMessage:
+          error?.message || String(error),
+        startedAt,
+      });
+
+      throw error;
+    }
+  }
+
+  async function getLearningHealth() {
+    await ensureTables();
+
+    const [
+      predictionCounts,
+      learningGroups,
+      recommendationGroups,
+      lastRun,
+    ] = await Promise.all([
+      pool.query(
+        `
+          SELECT
+            COUNT(*)::INTEGER AS total,
+            COUNT(*) FILTER (
+              WHERE result_status = 'PENDING'
+            )::INTEGER AS pending,
+            COUNT(*) FILTER (
+              WHERE result_status = 'SETTLED'
+            )::INTEGER AS settled,
+            COUNT(*) FILTER (
+              WHERE result_status = 'REVIEW'
+            )::INTEGER AS review,
+            COUNT(DISTINCT fixture_id)::INTEGER
+              AS fixtures,
+            MAX(settled_at) AS last_settled_at
+          FROM goalscorer_predictions
+          WHERE learning_generation = $1
+        `,
+        [GOALSCORER_LEARNING_GENERATION]
+      ),
+      pool.query(
+        `
+          SELECT
+            COUNT(*)::INTEGER AS groups,
+            COALESCE(
+              SUM(sample_size),
+              0
+            )::INTEGER AS grouped_samples,
+            COUNT(*) FILTER (
+              WHERE application_ready = TRUE
+            )::INTEGER AS application_ready_groups
+          FROM goalscorer_learning_stats
+          WHERE learning_generation = $1
+        `,
+        [GOALSCORER_LEARNING_GENERATION]
+      ),
+      pool.query(
+        `
+          SELECT
+            COUNT(*)::INTEGER AS groups,
+            COALESCE(
+              SUM(sample_size),
+              0
+            )::INTEGER AS grouped_samples,
+            COUNT(*) FILTER (
+              WHERE application_ready = TRUE
+            )::INTEGER AS application_ready_groups
+          FROM goalscorer_recommendation_learning
+          WHERE learning_generation = $1
+        `,
+        [GOALSCORER_RECOMMENDATION_GENERATION]
+      ),
+      pool.query(
+        `
+          SELECT
+            run_type,
+            status,
+            rows_processed,
+            summary,
+            error_message,
+            started_at,
+            finished_at
+          FROM goalscorer_learning_runs
+          ORDER BY id DESC
+          LIMIT 1
+        `
+      ),
+    ]);
+
+    const counts =
+      predictionCounts.rows[0] || {};
+
+    return {
+      ok: true,
       version: GOALSCORER_VERSION,
-      generatedAt: new Date().toISOString(),
+      learningGeneration:
+        GOALSCORER_LEARNING_GENERATION,
+      recommendationGeneration:
+        GOALSCORER_RECOMMENDATION_GENERATION,
+      applicationMinSample:
+        LEARNING_APPLICATION_MIN_SAMPLE,
+
+      predictions: {
+        total: numberOr(counts.total),
+        fixtures:
+          numberOr(counts.fixtures),
+        pending:
+          numberOr(counts.pending),
+        settled:
+          numberOr(counts.settled),
+        review:
+          numberOr(counts.review),
+        lastSettledAt:
+          counts.last_settled_at || null,
+      },
+
+      probabilityLearning: {
+        groups:
+          numberOr(
+            learningGroups.rows[0]
+              ?.groups
+          ),
+        groupedSamples:
+          numberOr(
+            learningGroups.rows[0]
+              ?.grouped_samples
+          ),
+        applicationReadyGroups:
+          numberOr(
+            learningGroups.rows[0]
+              ?.application_ready_groups
+          ),
+      },
+
+      recommendationLearning: {
+        groups:
+          numberOr(
+            recommendationGroups.rows[0]
+              ?.groups
+          ),
+        groupedSamples:
+          numberOr(
+            recommendationGroups.rows[0]
+              ?.grouped_samples
+          ),
+        applicationReadyGroups:
+          numberOr(
+            recommendationGroups.rows[0]
+              ?.application_ready_groups
+          ),
+      },
+
+      lastLearningRun:
+        lastRun.rows[0] || null,
+
+      calibrationPolicy: {
+        automaticMeasurement: true,
+        automaticApplication: false,
+        reason:
+          "Les corrections sont calculées automatiquement mais ne sont appliquées aux probabilités qu'après validation d'un échantillon suffisant.",
+      },
+
+      generatedAt:
+        new Date().toISOString(),
     };
   }
 
@@ -2378,6 +2906,10 @@ function createGoalscorerEngine({
         teamLambdaConstraint: true,
         recommendationEngine: true,
         recommendationTiers: ["TOP_SCORER", "RECOMMENDED", "WATCH", "REJECTED"],
+        automaticSettlement: true,
+        automaticLearning: true,
+        learningGeneration: GOALSCORER_LEARNING_GENERATION,
+        calibrationApplicationMinSample: LEARNING_APPLICATION_MIN_SAMPLE,
       },
       generatedAt: new Date().toISOString(),
     };
@@ -2896,6 +3428,69 @@ function createGoalscorerEngine({
     );
 
     app.get(
+      "/internal/goalscorer/learning-health",
+      ...guards,
+      async (req, res) => {
+        try {
+          return res.json(
+            await getLearningHealth()
+          );
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error:
+              error?.message ||
+              String(error),
+          });
+        }
+      }
+    );
+
+    app.get(
+      "/internal/goalscorer/recommendation-learning",
+      ...guards,
+      async (req, res) => {
+        try {
+          await ensureTables();
+
+          const result =
+            await pool.query(
+              `
+                SELECT *
+                FROM goalscorer_recommendation_learning
+                WHERE learning_generation = $1
+                ORDER BY
+                  market_type,
+                  recommendation_tier
+              `,
+              [
+                GOALSCORER_RECOMMENDATION_GENERATION,
+              ]
+            );
+
+          return res.json({
+            ok: true,
+            version:
+              GOALSCORER_VERSION,
+            count:
+              result.rows.length,
+            stats:
+              result.rows,
+            generatedAt:
+              new Date().toISOString(),
+          });
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error:
+              error?.message ||
+              String(error),
+          });
+        }
+      }
+    );
+
+    app.get(
       "/internal/goalscorer/learning",
       ...guards,
       async (req, res) => {
@@ -2906,13 +3501,13 @@ function createGoalscorerEngine({
             `
               SELECT *
               FROM goalscorer_learning_stats
-              WHERE learning_version = $1
+              WHERE learning_generation = $1
               ORDER BY
                 market_type,
                 probability_bucket,
                 position_group
             `,
-            [GOALSCORER_VERSION]
+            [GOALSCORER_LEARNING_GENERATION]
           );
 
           return res.json({
@@ -3054,24 +3649,66 @@ function createGoalscorerEngine({
     );
   }
 
+  let lastUpcomingAnalysisAt = 0;
+
   async function schedulerTick() {
     if (!schedulersEnabled || schedulerRunning) return;
 
     schedulerRunning = true;
 
     try {
-      await analyzeUpcoming({
-        hours: 36,
-        limit: 12,
-      });
+      const now = Date.now();
 
-      await settleFinished();
-      await rebuildLearning();
+      /*
+       * L'analyse des matchs à venir consomme des appels API.
+       * Elle reste donc limitée à une fois toutes les 6 heures.
+       */
+      if (
+        now - lastUpcomingAnalysisAt >=
+        6 * 60 * 60 * 1000
+      ) {
+        await analyzeUpcoming({
+          hours: 36,
+          limit: 12,
+        });
+
+        lastUpcomingAnalysisAt = now;
+      }
+
+      /*
+       * Settlement + Learning : toutes les heures.
+       * Aucun recalcul API n'est effectué si aucun match
+       * terminé n'est en attente.
+       */
+      const settlement =
+        await settleFinished();
+
+      const learning =
+        await rebuildLearning();
+
+      await recordLearningRun({
+        runType: "AUTO_CYCLE",
+        status: "COMPLETED",
+        rowsProcessed:
+          numberOr(settlement.settled) +
+          numberOr(settlement.review),
+        summary: {
+          settlement,
+          learning,
+        },
+      });
     } catch (error) {
       console.error(
-        "GOALSCORER V2 SCHEDULER :",
+        "GOALSCORER V2.5 SCHEDULER :",
         error?.message || error
       );
+
+      await recordLearningRun({
+        runType: "AUTO_CYCLE",
+        status: "FAILED",
+        errorMessage:
+          error?.message || String(error),
+      });
     } finally {
       schedulerRunning = false;
     }
@@ -3080,11 +3717,14 @@ function createGoalscorerEngine({
   function startScheduler() {
     if (!schedulersEnabled || schedulerTimer) return;
 
-    setTimeout(() => schedulerTick(), 3 * 60 * 1000);
+    setTimeout(
+      () => schedulerTick(),
+      3 * 60 * 1000
+    );
 
     schedulerTimer = setInterval(
       schedulerTick,
-      6 * 60 * 60 * 1000
+      60 * 60 * 1000
     );
   }
 
@@ -3102,6 +3742,7 @@ function createGoalscorerEngine({
     analyzeUpcoming,
     settleFinished,
     rebuildLearning,
+    getLearningHealth,
     getStatus,
     version: GOALSCORER_VERSION,
   };
