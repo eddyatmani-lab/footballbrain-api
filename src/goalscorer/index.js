@@ -16,7 +16,7 @@
  */
 
 const GOALSCORER_VERSION =
-  "goalscorer-engine-v2.1.0-deduplicated-stats";
+  "goalscorer-engine-v2.2.0-raw-odds-diagnostics";
 
 const MARKET_TYPES = Object.freeze({
   ANYTIME: "ANYTIME_GOALSCORER",
@@ -1073,17 +1073,18 @@ function createGoalscorerEngine({
       await pool.query(
         `
           DELETE FROM goalscorer_predictions
-          WHERE model_version IN ($1, $2)
+          WHERE model_version IN ($1, $2, $3)
         `,
         [
           "goalscorer-engine-v1.0.0",
           "goalscorer-engine-v2.0.0",
+          "goalscorer-engine-v2.1.0-deduplicated-stats",
         ]
       );
 
       await pool.query(`
         DELETE FROM goalscorer_learning_stats
-        WHERE learning_version <> 'goalscorer-engine-v2.1.0-deduplicated-stats';
+        WHERE learning_version <> 'goalscorer-engine-v2.2.0-raw-odds-diagnostics';
       `);
 
       tablesReady = true;
@@ -2095,7 +2096,7 @@ function createGoalscorerEngine({
 
     await pool.query(`
       DELETE FROM goalscorer_learning_stats
-      WHERE learning_version = 'goalscorer-engine-v2.1.0-deduplicated-stats';
+      WHERE learning_version = 'goalscorer-engine-v2.2.0-raw-odds-diagnostics';
     `);
 
     for (const row of result.rows) {
@@ -2507,6 +2508,82 @@ function createGoalscorerEngine({
             version: GOALSCORER_VERSION,
             count: result.rows.length,
             stats: result.rows,
+            generatedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
+        }
+      }
+    );
+
+    /*
+     * Diagnostic brut des cotes d'un fixture.
+     * Sert à vérifier quels bet IDs sont réellement proposés
+     * sur un match précis (ex: 92 / 218 / 231).
+     */
+    app.get(
+      "/internal/goalscorer/raw-odds/:fixtureId",
+      ...guards,
+      async (req, res) => {
+        try {
+          const fixtureId = Number(req.params.fixtureId);
+
+          if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+            return res.status(400).json({
+              ok: false,
+              error: "fixtureId invalide",
+            });
+          }
+
+          const response = await callApiFootball(
+            "/odds",
+            {
+              fixture: fixtureId,
+            }
+          );
+
+          const raw = Array.isArray(response?.data?.response)
+            ? response.data.response
+            : [];
+
+          const anytimeBetIds = new Set([92, 218, 231]);
+
+          const anytimeMarkets = [];
+
+          for (const fixture of raw) {
+            for (const bookmaker of fixture?.bookmakers || []) {
+              for (const bet of bookmaker?.bets || []) {
+                const betId = Number(bet?.id);
+
+                if (!anytimeBetIds.has(betId)) {
+                  continue;
+                }
+
+                anytimeMarkets.push({
+                  bookmakerId: bookmaker?.id ?? null,
+                  bookmakerName: bookmaker?.name ?? null,
+                  betId,
+                  betName: bet?.name ?? null,
+                  values: Array.isArray(bet?.values)
+                    ? bet.values
+                    : [],
+                });
+              }
+            }
+          }
+
+          return res.json({
+            ok: true,
+            version: GOALSCORER_VERSION,
+            fixtureId,
+            apiResults: raw.length,
+            anytimeMarketCount: anytimeMarkets.length,
+            anytimeBetIds: [92, 218, 231],
+            anytimeMarkets,
+            raw,
             generatedAt: new Date().toISOString(),
           });
         } catch (error) {
