@@ -235,7 +235,8 @@ function fatigueContextSignal(raw = {}) {
 function roleForEngine(engineName) {
   return (
     ENGINE_ROLE_BY_NAME?.[engineName] ||
-    ENGINE_ROLES.DIRECTIONAL
+    ENGINE_ROLES?.DIRECTIONAL ||
+    "DIRECTIONAL"
   );
 }
 
@@ -737,6 +738,32 @@ function createEnginePredictionLog({ pool }) {
             END
         )
       WHERE engine_name = 'FatigueEngine';
+    `);
+
+    /*
+     * V1.5 : classification persistante de tous les moteurs.
+     * Les anciens logs sont reclassés sans toucher à leurs prédictions.
+     */
+    await pool.query(`
+      UPDATE engine_prediction_logs
+      SET engine_role =
+        CASE engine_name
+          WHEN 'ProbabilityEngine'
+            THEN 'PROBABILISTIC'
+          WHEN 'MonteCarloEngine'
+            THEN 'PROBABILISTIC'
+
+          WHEN 'GoalMarketEngine'
+            THEN 'MARKET'
+          WHEN 'BTTSProfile'
+            THEN 'MARKET'
+
+          WHEN 'FatigueEngine'
+            THEN 'CONTEXTUAL'
+
+          ELSE 'DIRECTIONAL'
+        END
+      WHERE engine_name IS NOT NULL;
     `);
 
     await pool.query(`

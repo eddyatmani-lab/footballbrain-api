@@ -3,6 +3,9 @@
 const {
   ENGINE_LEARNING_VERSION,
   PERFORMANCE_THRESHOLDS,
+  ENGINE_ROLES,
+  ENGINE_ROLE_BY_NAME,
+  ENGINE_METRIC_FOCUS,
 } = require("./LearningConfig");
 
 function reliabilityLevel(sampleSize, brierScore) {
@@ -36,6 +39,49 @@ function reliabilityLevel(sampleSize, brierScore) {
   return sample >= PERFORMANCE_THRESHOLDS.reliableSample
     ? "STABLE"
     : "DEVELOPING";
+}
+
+
+function roleForEngine(engineName) {
+  return (
+    ENGINE_ROLE_BY_NAME?.[engineName] ||
+    ENGINE_ROLES?.DIRECTIONAL ||
+    "DIRECTIONAL"
+  );
+}
+
+function metricFocusForRole(role) {
+  return (
+    ENGINE_METRIC_FOCUS?.[role] ||
+    "ACCURACY"
+  );
+}
+
+function contextualReliability(sampleSize) {
+  const sample = Number(sampleSize) || 0;
+
+  if (
+    sample <
+    PERFORMANCE_THRESHOLDS.contextualObservationSample
+  ) {
+    return "INSUFFICIENT_DATA";
+  }
+
+  if (
+    sample <
+    PERFORMANCE_THRESHOLDS.contextualLimitedSample
+  ) {
+    return "OBSERVATION";
+  }
+
+  if (
+    sample <
+    PERFORMANCE_THRESHOLDS.contextualReliableSample
+  ) {
+    return "DEVELOPING";
+  }
+
+  return "RELIABLE";
 }
 
 function createEnginePerformanceService({ pool }) {
@@ -339,7 +385,7 @@ function createEnginePerformanceService({ pool }) {
             homeRate - baselineHome,
             drawRate - baselineDraw,
             awayRate - baselineAway,
-            reliabilityLevel(sampleSize, null),
+            contextualReliability(sampleSize),
             ENGINE_LEARNING_VERSION,
           ]
         );
@@ -599,6 +645,256 @@ function createEnginePerformanceService({ pool }) {
     };
   }
 
+  async function getRolePerformance() {
+    const standardResult =
+      await pool.query(`
+        SELECT
+          engine_name,
+          SUM(sample_size)::INTEGER
+            AS sample_size,
+
+          CASE
+            WHEN SUM(sample_size) > 0
+            THEN
+              SUM(
+                COALESCE(accuracy, 0)
+                * sample_size
+              ) / SUM(sample_size)
+            ELSE NULL
+          END AS accuracy,
+
+          CASE
+            WHEN SUM(sample_size) > 0
+            THEN
+              SUM(
+                COALESCE(
+                  average_probability,
+                  0
+                ) * sample_size
+              ) / SUM(sample_size)
+            ELSE NULL
+          END AS average_probability,
+
+          CASE
+            WHEN SUM(sample_size) > 0
+            THEN
+              SUM(
+                COALESCE(
+                  actual_frequency,
+                  0
+                ) * sample_size
+              ) / SUM(sample_size)
+            ELSE NULL
+          END AS actual_frequency,
+
+          CASE
+            WHEN SUM(sample_size) > 0
+            THEN
+              SUM(
+                COALESCE(
+                  calibration_gap,
+                  0
+                ) * sample_size
+              ) / SUM(sample_size)
+            ELSE NULL
+          END AS calibration_gap,
+
+          CASE
+            WHEN SUM(sample_size) > 0
+            THEN
+              SUM(
+                COALESCE(
+                  brier_score,
+                  0.25
+                ) * sample_size
+              ) / SUM(sample_size)
+            ELSE NULL
+          END AS brier_score,
+
+          CASE
+            WHEN SUM(sample_size) > 0
+            THEN
+              SUM(
+                COALESCE(log_loss, 0)
+                * sample_size
+              ) / SUM(sample_size)
+            ELSE NULL
+          END AS log_loss
+
+        FROM engine_performance_stats
+        GROUP BY engine_name
+        ORDER BY engine_name
+      `);
+
+    const contextualResult =
+      await pool.query(`
+        SELECT
+          engine_name,
+          SUM(sample_size)::INTEGER
+            AS sample_size,
+          MAX(calculated_at)
+            AS calculated_at
+        FROM
+          engine_contextual_performance_stats
+        GROUP BY engine_name
+        ORDER BY engine_name
+      `);
+
+    const contextualByEngine =
+      new Map(
+        contextualResult.rows.map(
+          (row) => [
+            row.engine_name,
+            row,
+          ]
+        )
+      );
+
+    const engines =
+      standardResult.rows.map((row) => {
+        const role =
+          roleForEngine(
+            row.engine_name
+          );
+
+        return {
+          engineName:
+            row.engine_name,
+          role,
+          metricFocus:
+            metricFocusForRole(role),
+          sampleSize:
+            Number(
+              row.sample_size || 0
+            ),
+          accuracy:
+            row.accuracy == null
+              ? null
+              : Number(row.accuracy),
+          averageProbability:
+            row.average_probability == null
+              ? null
+              : Number(
+                  row.average_probability
+                ),
+          actualFrequency:
+            row.actual_frequency == null
+              ? null
+              : Number(
+                  row.actual_frequency
+                ),
+          calibrationGap:
+            row.calibration_gap == null
+              ? null
+              : Number(
+                  row.calibration_gap
+                ),
+          brierScore:
+            row.brier_score == null
+              ? null
+              : Number(
+                  row.brier_score
+                ),
+          logLoss:
+            row.log_loss == null
+              ? null
+              : Number(
+                  row.log_loss
+                ),
+          eligibleForGlobalWeight:
+            role ===
+              ENGINE_ROLES.DIRECTIONAL ||
+            role ===
+              ENGINE_ROLES.PROBABILISTIC,
+        };
+      });
+
+    for (
+      const [
+        engineName,
+        row,
+      ] of contextualByEngine.entries()
+    ) {
+      const role =
+        roleForEngine(engineName);
+
+      engines.push({
+        engineName,
+        role,
+        metricFocus:
+          metricFocusForRole(role),
+        sampleSize:
+          Number(
+            row.sample_size || 0
+          ),
+        accuracy: null,
+        averageProbability: null,
+        actualFrequency: null,
+        calibrationGap: null,
+        brierScore: null,
+        logLoss: null,
+        eligibleForGlobalWeight:
+          false,
+        contextualReliability:
+          contextualReliability(
+            row.sample_size
+          ),
+      });
+    }
+
+    /*
+     * Evite un doublon si un ancien moteur contextuel
+     * possédait encore de vieilles stats directionnelles.
+     */
+    const deduplicated =
+      new Map();
+
+    for (const engine of engines) {
+      const existing =
+        deduplicated.get(
+          engine.engineName
+        );
+
+      if (
+        !existing ||
+        engine.role ===
+          ENGINE_ROLES.CONTEXTUAL
+      ) {
+        deduplicated.set(
+          engine.engineName,
+          engine
+        );
+      }
+    }
+
+    return {
+      ok: true,
+      version:
+        ENGINE_LEARNING_VERSION,
+      engines:
+        [...deduplicated.values()]
+          .sort(
+            (a, b) =>
+              a.engineName
+                .localeCompare(
+                  b.engineName
+                )
+          ),
+      roles: {
+        directional:
+          ENGINE_ROLES.DIRECTIONAL,
+        probabilistic:
+          ENGINE_ROLES.PROBABILISTIC,
+        market:
+          ENGINE_ROLES.MARKET,
+        contextual:
+          ENGINE_ROLES.CONTEXTUAL,
+      },
+      generatedAt:
+        new Date().toISOString(),
+    };
+  }
+
   async function getPerformance() {
     const result = await pool.query(`
       SELECT *
@@ -621,6 +917,7 @@ function createEnginePerformanceService({ pool }) {
     ensureTables,
     rebuildPerformance,
     getPerformance,
+    getRolePerformance,
     getContextualPerformance,
     rebuildContextualPerformance,
     reliabilityLevel,

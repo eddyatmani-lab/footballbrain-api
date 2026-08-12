@@ -3,10 +3,13 @@
 const {
   ENGINE_LEARNING_VERSION,
   LEARNING_MODE,
+  ENGINE_ROLES,
+  ENGINE_ROLE_BY_NAME,
+  ENGINE_METRIC_FOCUS,
 } = require("./LearningConfig");
 
 const RECOMMENDATION_VERSION =
-  "engine-weight-recommendations-v1.0.0";
+  "engine-weight-recommendations-v1.5-role-aware";
 
 /*
  * Poids de référence uniquement destinés aux recommandations.
@@ -18,9 +21,9 @@ const BASELINE_WEIGHTS = Object.freeze({
   TransitionEngine: 10,
   MentalEngine: 10,
   TacticalProfileEngine: 10,
-  FatigueEngine: 5,
   XGProfile: 10,
   MonteCarloEngine: 10,
+  FatigueEngine: 5,
   GoalMarketEngine: 3,
   BTTSProfile: 2,
 });
@@ -40,6 +43,29 @@ function clamp(value, minimum = 0, maximum = 100) {
 function round(value, decimals = 2) {
   const factor = 10 ** decimals;
   return Math.round(numberOr(value) * factor) / factor;
+}
+
+
+function roleForEngine(engineName) {
+  return (
+    ENGINE_ROLE_BY_NAME?.[engineName] ||
+    ENGINE_ROLES?.DIRECTIONAL ||
+    "DIRECTIONAL"
+  );
+}
+
+function metricFocusForRole(role) {
+  return (
+    ENGINE_METRIC_FOCUS?.[role] ||
+    "ACCURACY"
+  );
+}
+
+function roleAllowsGlobalWeight(role) {
+  return (
+    role === ENGINE_ROLES.DIRECTIONAL ||
+    role === ENGINE_ROLES.PROBABILISTIC
+  );
 }
 
 function samplePolicy(sampleSize) {
@@ -100,33 +126,66 @@ function samplePolicy(sampleSize) {
 }
 
 function qualityScore({
+  role,
   accuracy,
   brierScore,
   calibrationGap,
   sampleSize,
 }) {
-  const normalizedAccuracy = clamp(accuracy);
+  const normalizedAccuracy =
+    clamp(accuracy);
+
+  const brierQuality = clamp(
+    100 -
+      numberOr(
+        brierScore,
+        0.25
+      ) * 300
+  );
+
+  const calibrationQuality =
+    clamp(
+      100 -
+        Math.abs(
+          numberOr(
+            calibrationGap
+          )
+        ) * 5
+    );
+
+  const sampleQuality =
+    clamp(
+      (
+        numberOr(sampleSize) /
+        250
+      ) * 100
+    );
 
   /*
-   * Brier : 0 est excellent, 0,25 est faible.
-   * Le score est plafonné pour éviter qu'une très petite série parfaite
-   * produise une recommandation excessive.
+   * Un moteur probabiliste doit surtout être récompensé
+   * pour sa calibration et son Brier, pas pour un simple
+   * taux de réussite directionnel.
    */
-  const brierQuality = clamp(
-    100 - numberOr(brierScore, 0.25) * 300
-  );
+  if (
+    role ===
+    ENGINE_ROLES.PROBABILISTIC
+  ) {
+    return round(
+      brierQuality * 0.4 +
+        calibrationQuality * 0.35 +
+        normalizedAccuracy * 0.15 +
+        sampleQuality * 0.1,
+      2
+    );
+  }
 
-  const calibrationQuality = clamp(
-    100 - Math.abs(numberOr(calibrationGap)) * 5
-  );
-
-  const sampleQuality = clamp(
-    (numberOr(sampleSize) / 250) * 100
-  );
-
+  /*
+   * Les moteurs directionnels restent principalement
+   * évalués sur leur capacité à choisir le bon côté.
+   */
   return round(
-    normalizedAccuracy * 0.4 +
-      brierQuality * 0.3 +
+    normalizedAccuracy * 0.5 +
+      brierQuality * 0.2 +
       calibrationQuality * 0.2 +
       sampleQuality * 0.1,
     2
@@ -143,12 +202,40 @@ function buildRecommendation({
   brierScore,
   logLoss,
 }) {
+  const role =
+    roleForEngine(engineName);
+
+  const metricFocus =
+    metricFocusForRole(role);
+
   const currentWeight =
     BASELINE_WEIGHTS[engineName] ?? 5;
 
-  const policy = samplePolicy(sampleSize);
+  const basePolicy =
+    samplePolicy(sampleSize);
+
+  const roleEligible =
+    roleAllowsGlobalWeight(role);
+
+  const policy =
+    roleEligible
+      ? basePolicy
+      : {
+          ...basePolicy,
+          stage:
+            "ROLE_BLOCKED",
+          maximumChange: 0,
+          applicable: false,
+          reason:
+            role === ENGINE_ROLES.MARKET
+              ? "Moteur de marché : il doit être pondéré dans son marché, pas dans le poids global 1X2."
+              : role === ENGINE_ROLES.CONTEXTUAL
+                ? "Moteur contextuel : son impact doit être appris comme correction conditionnelle, pas comme poids directionnel."
+                : "Rôle moteur non éligible au poids global.",
+        };
 
   const quality = qualityScore({
+    role,
     accuracy,
     brierScore,
     calibrationGap,
@@ -188,6 +275,10 @@ function buildRecommendation({
 
   return {
     engineName,
+    role,
+    metricFocus,
+    eligibleForGlobalWeight:
+      roleEligible,
     currentWeight,
     recommendedWeight,
     proposedChange,
@@ -220,13 +311,17 @@ function buildRecommendation({
     applicable: policy.applicable,
     applicationBlocked:
       LEARNING_MODE === "SHADOW" ||
+      !roleEligible ||
       !policy.applicable,
+
     applicationBlockedReason:
       LEARNING_MODE === "SHADOW"
         ? "Mode SHADOW : application automatique désactivée."
-        : !policy.applicable
+        : !roleEligible
           ? policy.reason
-          : null,
+          : !policy.applicable
+            ? policy.reason
+            : null,
   };
 }
 
@@ -244,6 +339,9 @@ function createEngineWeightRecommendationService({
       CREATE TABLE IF NOT EXISTS engine_weight_recommendations (
         id BIGSERIAL PRIMARY KEY,
         engine_name TEXT NOT NULL UNIQUE,
+        engine_role TEXT NOT NULL DEFAULT 'DIRECTIONAL',
+        metric_focus TEXT,
+        eligible_for_global_weight BOOLEAN NOT NULL DEFAULT FALSE,
 
         current_weight NUMERIC(8, 4) NOT NULL,
         recommended_weight NUMERIC(8, 4) NOT NULL,
@@ -274,6 +372,26 @@ function createEngineWeightRecommendationService({
         calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await pool.query(`
+      ALTER TABLE engine_weight_recommendations
+      ADD COLUMN IF NOT EXISTS
+        engine_role TEXT
+        NOT NULL DEFAULT 'DIRECTIONAL';
+    `);
+
+    await pool.query(`
+      ALTER TABLE engine_weight_recommendations
+      ADD COLUMN IF NOT EXISTS
+        metric_focus TEXT;
+    `);
+
+    await pool.query(`
+      ALTER TABLE engine_weight_recommendations
+      ADD COLUMN IF NOT EXISTS
+        eligible_for_global_weight BOOLEAN
+        NOT NULL DEFAULT FALSE;
     `);
   }
 
@@ -388,6 +506,9 @@ function createEngineWeightRecommendationService({
             `
               INSERT INTO engine_weight_recommendations (
                 engine_name,
+                engine_role,
+                metric_focus,
+                eligible_for_global_weight,
                 current_weight,
                 recommended_weight,
                 proposed_change,
@@ -414,15 +535,23 @@ function createEngineWeightRecommendationService({
                 updated_at
               )
               VALUES (
-                $1, $2, $3, $4, $5,
-                $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15,
-                $16, $17, $18, $19, $20,
-                $21, $22, $23,
+                $1, $2, $3, $4,
+                $5, $6, $7, $8,
+                $9, $10, $11, $12,
+                $13, $14, $15, $16,
+                $17, $18, $19, $20,
+                $21, $22, $23, $24,
+                $25, $26,
                 NOW(), NOW()
               )
               ON CONFLICT (engine_name)
               DO UPDATE SET
+                engine_role =
+                  EXCLUDED.engine_role,
+                metric_focus =
+                  EXCLUDED.metric_focus,
+                eligible_for_global_weight =
+                  EXCLUDED.eligible_for_global_weight,
                 current_weight =
                   EXCLUDED.current_weight,
                 recommended_weight =
@@ -472,6 +601,9 @@ function createEngineWeightRecommendationService({
             `,
             [
               item.engineName,
+              item.role,
+              item.metricFocus,
+              item.eligibleForGlobalWeight,
               item.currentWeight,
               item.recommendedWeight,
               item.proposedChange,

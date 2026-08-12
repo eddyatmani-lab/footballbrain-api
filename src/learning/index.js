@@ -510,7 +510,7 @@ function createEngineLearningCore({
           return res.json({
             ok: true,
             readOnly: true,
-            version: "engine-learning-v1.3.1-raw-diagnostics-fix",
+            version: "engine-learning-v1.5-engine-roles",
             engines,
             limitPerEngine: limit,
             summaries,
@@ -583,6 +583,27 @@ function createEngineLearningCore({
           return res.status(500).json({
             ok: false,
             error: error?.message || String(error),
+          });
+        }
+      })
+    );
+
+    app.get(
+      "/internal/learning/engines/role-performance",
+      ...withAdminGuard(async (req, res) => {
+        try {
+          await ensureTables();
+
+          return res.json(
+            await performanceService
+              .getRolePerformance()
+          );
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error:
+              error?.message ||
+              String(error),
           });
         }
       })
