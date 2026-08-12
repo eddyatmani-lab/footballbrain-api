@@ -6,10 +6,11 @@ const {
   ENGINE_ROLES,
   ENGINE_ROLE_BY_NAME,
   ENGINE_METRIC_FOCUS,
+  PERFORMANCE_THRESHOLDS,
 } = require("./LearningConfig");
 
 const RECOMMENDATION_VERSION =
-  "engine-weight-recommendations-v1.5-role-aware";
+  "engine-weight-recommendations-v1.6-probability-integrity";
 
 /*
  * Poids de référence uniquement destinés aux recommandations.
@@ -131,27 +132,10 @@ function qualityScore({
   brierScore,
   calibrationGap,
   sampleSize,
+  probabilitySampleSize,
 }) {
   const normalizedAccuracy =
     clamp(accuracy);
-
-  const brierQuality = clamp(
-    100 -
-      numberOr(
-        brierScore,
-        0.25
-      ) * 300
-  );
-
-  const calibrationQuality =
-    clamp(
-      100 -
-        Math.abs(
-          numberOr(
-            calibrationGap
-          )
-        ) * 5
-    );
 
   const sampleQuality =
     clamp(
@@ -161,35 +145,78 @@ function qualityScore({
       ) * 100
     );
 
-  /*
-   * Un moteur probabiliste doit surtout être récompensé
-   * pour sa calibration et son Brier, pas pour un simple
-   * taux de réussite directionnel.
-   */
   if (
     role ===
     ENGINE_ROLES.PROBABILISTIC
   ) {
+    /*
+     * V1.6 : aucune valeur par défaut n'est injectée.
+     * Une probabilité manquante reste une preuve manquante.
+     */
+    if (
+      brierScore == null ||
+      calibrationGap == null ||
+      numberOr(probabilitySampleSize) <= 0
+    ) {
+      return null;
+    }
+
+    const brierQuality = clamp(
+      100 -
+        Number(brierScore) * 300
+    );
+
+    const calibrationQuality =
+      clamp(
+        100 -
+          Math.abs(
+            Number(calibrationGap)
+          ) * 5
+      );
+
     return round(
-      brierQuality * 0.4 +
+      brierQuality * 0.45 +
         calibrationQuality * 0.35 +
-        normalizedAccuracy * 0.15 +
+        normalizedAccuracy * 0.1 +
         sampleQuality * 0.1,
       2
     );
   }
 
   /*
-   * Les moteurs directionnels restent principalement
-   * évalués sur leur capacité à choisir le bon côté.
+   * Les moteurs directionnels sont évalués
+   * principalement par leur accuracy.
+   * Brier/calibration n'interviennent que s'ils existent.
    */
-  return round(
-    normalizedAccuracy * 0.5 +
-      brierQuality * 0.2 +
-      calibrationQuality * 0.2 +
-      sampleQuality * 0.1,
-    2
-  );
+  let score =
+    normalizedAccuracy * 0.8 +
+    sampleQuality * 0.2;
+
+  if (
+    brierScore != null &&
+    calibrationGap != null
+  ) {
+    const brierQuality = clamp(
+      100 -
+        Number(brierScore) * 300
+    );
+
+    const calibrationQuality =
+      clamp(
+        100 -
+          Math.abs(
+            Number(calibrationGap)
+          ) * 5
+      );
+
+    score =
+      normalizedAccuracy * 0.55 +
+      brierQuality * 0.15 +
+      calibrationQuality * 0.15 +
+      sampleQuality * 0.15;
+  }
+
+  return round(score, 2);
 }
 
 function buildRecommendation({
@@ -234,12 +261,48 @@ function buildRecommendation({
                 : "Rôle moteur non éligible au poids global.",
         };
 
+  const probabilitySampleSize =
+    numberOr(
+      arguments[0]?.probabilitySampleSize,
+      0
+    );
+
+  const probabilityCoverage =
+    numberOr(sampleSize) > 0
+      ? probabilitySampleSize /
+        numberOr(sampleSize)
+      : 0;
+
+  const minimumApplicationSample =
+    role === ENGINE_ROLES.PROBABILISTIC
+      ? PERFORMANCE_THRESHOLDS
+          .probabilisticApplicationSample
+      : PERFORMANCE_THRESHOLDS
+          .directionalApplicationSample;
+
+  const evidenceReady =
+    role === ENGINE_ROLES.DIRECTIONAL
+      ? numberOr(sampleSize) >=
+        minimumApplicationSample
+      : role === ENGINE_ROLES.PROBABILISTIC
+        ? (
+            numberOr(sampleSize) >=
+              minimumApplicationSample &&
+            probabilityCoverage >=
+              PERFORMANCE_THRESHOLDS
+                .probabilisticMinimumProbabilityCoverage &&
+            brierScore != null &&
+            calibrationGap != null
+          )
+        : false;
+
   const quality = qualityScore({
     role,
     accuracy,
     brierScore,
     calibrationGap,
     sampleSize,
+    probabilitySampleSize,
   });
 
   /*
@@ -279,6 +342,14 @@ function buildRecommendation({
     metricFocus,
     eligibleForGlobalWeight:
       roleEligible,
+    applicationReady:
+      roleEligible && evidenceReady,
+    probabilitySampleSize,
+    probabilityCoverage:
+      round(
+        probabilityCoverage,
+        4
+      ),
     currentWeight,
     recommendedWeight,
     proposedChange,
@@ -312,6 +383,7 @@ function buildRecommendation({
     applicationBlocked:
       LEARNING_MODE === "SHADOW" ||
       !roleEligible ||
+      !evidenceReady ||
       !policy.applicable,
 
     applicationBlockedReason:
@@ -319,9 +391,18 @@ function buildRecommendation({
         ? "Mode SHADOW : application automatique désactivée."
         : !roleEligible
           ? policy.reason
-          : !policy.applicable
-            ? policy.reason
-            : null,
+          : !evidenceReady
+            ? (
+                role === ENGINE_ROLES.PROBABILISTIC &&
+                probabilityCoverage <
+                  PERFORMANCE_THRESHOLDS
+                    .probabilisticMinimumProbabilityCoverage
+                  ? "Couverture probabiliste insuffisante : aucune modification automatique."
+                  : `Échantillon insuffisant : ${numberOr(sampleSize)} / ${minimumApplicationSample} minimum.`
+              )
+            : !policy.applicable
+              ? policy.reason
+              : null,
   };
 }
 

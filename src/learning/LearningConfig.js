@@ -28,7 +28,7 @@ const LEARNING_MODE = String(
   .toUpperCase();
 
 const ENGINE_LEARNING_VERSION =
-  "engine-learning-v1.5-engine-roles";
+  "engine-learning-v1.6-probability-integrity";
 
 const ENGINE_ROLES = Object.freeze({
   DIRECTIONAL: "DIRECTIONAL",
@@ -112,6 +112,14 @@ const PERFORMANCE_THRESHOLDS = Object.freeze({
   contextualObservationSample: 50,
   contextualLimitedSample: 150,
   contextualReliableSample: 300,
+
+  /*
+   * V1.6 : un moteur ne peut agir sur son poids global
+   * que si les preuves statistiques sont suffisantes.
+   */
+  directionalApplicationSample: 200,
+  probabilisticApplicationSample: 200,
+  probabilisticMinimumProbabilityCoverage: 0.80,
 });
 
 const SETTLEMENT_INTERVAL_MINUTES = Math.max(

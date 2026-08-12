@@ -664,14 +664,31 @@ function createEnginePerformanceService({ pool }) {
           END AS accuracy,
 
           CASE
-            WHEN SUM(sample_size) > 0
+            WHEN SUM(
+              CASE
+                WHEN average_probability IS NOT NULL
+                  AND average_probability > 0
+                THEN sample_size
+                ELSE 0
+              END
+            ) > 0
             THEN
               SUM(
-                COALESCE(
-                  average_probability,
-                  0
-                ) * sample_size
-              ) / SUM(sample_size)
+                CASE
+                  WHEN average_probability IS NOT NULL
+                    AND average_probability > 0
+                  THEN average_probability * sample_size
+                  ELSE 0
+                END
+              ) /
+              SUM(
+                CASE
+                  WHEN average_probability IS NOT NULL
+                    AND average_probability > 0
+                  THEN sample_size
+                  ELSE 0
+                END
+              )
             ELSE NULL
           END AS average_probability,
 
@@ -688,38 +705,100 @@ function createEnginePerformanceService({ pool }) {
           END AS actual_frequency,
 
           CASE
-            WHEN SUM(sample_size) > 0
+            WHEN SUM(
+              CASE
+                WHEN average_probability IS NOT NULL
+                  AND average_probability > 0
+                THEN sample_size
+                ELSE 0
+              END
+            ) > 0
             THEN
               SUM(
-                COALESCE(
-                  calibration_gap,
-                  0
-                ) * sample_size
-              ) / SUM(sample_size)
+                CASE
+                  WHEN average_probability IS NOT NULL
+                    AND average_probability > 0
+                  THEN calibration_gap * sample_size
+                  ELSE 0
+                END
+              ) /
+              SUM(
+                CASE
+                  WHEN average_probability IS NOT NULL
+                    AND average_probability > 0
+                  THEN sample_size
+                  ELSE 0
+                END
+              )
             ELSE NULL
           END AS calibration_gap,
 
           CASE
-            WHEN SUM(sample_size) > 0
+            WHEN SUM(
+              CASE
+                WHEN average_probability IS NOT NULL
+                  AND average_probability > 0
+                THEN sample_size
+                ELSE 0
+              END
+            ) > 0
             THEN
               SUM(
-                COALESCE(
-                  brier_score,
-                  0.25
-                ) * sample_size
-              ) / SUM(sample_size)
+                CASE
+                  WHEN average_probability IS NOT NULL
+                    AND average_probability > 0
+                  THEN brier_score * sample_size
+                  ELSE 0
+                END
+              ) /
+              SUM(
+                CASE
+                  WHEN average_probability IS NOT NULL
+                    AND average_probability > 0
+                  THEN sample_size
+                  ELSE 0
+                END
+              )
             ELSE NULL
           END AS brier_score,
 
           CASE
-            WHEN SUM(sample_size) > 0
+            WHEN SUM(
+              CASE
+                WHEN average_probability IS NOT NULL
+                  AND average_probability > 0
+                THEN sample_size
+                ELSE 0
+              END
+            ) > 0
             THEN
               SUM(
-                COALESCE(log_loss, 0)
-                * sample_size
-              ) / SUM(sample_size)
+                CASE
+                  WHEN average_probability IS NOT NULL
+                    AND average_probability > 0
+                  THEN log_loss * sample_size
+                  ELSE 0
+                END
+              ) /
+              SUM(
+                CASE
+                  WHEN average_probability IS NOT NULL
+                    AND average_probability > 0
+                  THEN sample_size
+                  ELSE 0
+                END
+              )
             ELSE NULL
-          END AS log_loss
+          END AS log_loss,
+
+          SUM(
+            CASE
+              WHEN average_probability IS NOT NULL
+                AND average_probability > 0
+              THEN sample_size
+              ELSE 0
+            END
+          )::INTEGER AS probability_sample_size
 
         FROM engine_performance_stats
         GROUP BY engine_name
@@ -757,16 +836,48 @@ function createEnginePerformanceService({ pool }) {
             row.engine_name
           );
 
+        const sampleSize =
+          Number(row.sample_size || 0);
+
+        const probabilitySampleSize =
+          Number(
+            row.probability_sample_size || 0
+          );
+
+        const probabilityCoverage =
+          sampleSize > 0
+            ? probabilitySampleSize / sampleSize
+            : 0;
+
+        const minimumSample =
+          role === ENGINE_ROLES.PROBABILISTIC
+            ? PERFORMANCE_THRESHOLDS
+                .probabilisticApplicationSample
+            : PERFORMANCE_THRESHOLDS
+                .directionalApplicationSample;
+
+        const applicationReady =
+          (
+            role === ENGINE_ROLES.DIRECTIONAL &&
+            sampleSize >= minimumSample
+          ) ||
+          (
+            role === ENGINE_ROLES.PROBABILISTIC &&
+            sampleSize >= minimumSample &&
+            probabilityCoverage >=
+              PERFORMANCE_THRESHOLDS
+                .probabilisticMinimumProbabilityCoverage &&
+            row.brier_score != null &&
+            row.calibration_gap != null
+          );
+
         return {
           engineName:
             row.engine_name,
           role,
           metricFocus:
             metricFocusForRole(role),
-          sampleSize:
-            Number(
-              row.sample_size || 0
-            ),
+          sampleSize,
           accuracy:
             row.accuracy == null
               ? null
@@ -801,11 +912,28 @@ function createEnginePerformanceService({ pool }) {
               : Number(
                   row.log_loss
                 ),
+          probabilitySampleSize,
+          probabilityCoverage:
+            Number(
+              probabilityCoverage.toFixed(4)
+            ),
           eligibleForGlobalWeight:
             role ===
               ENGINE_ROLES.DIRECTIONAL ||
             role ===
               ENGINE_ROLES.PROBABILISTIC,
+          applicationReady,
+          applicationReadinessReason:
+            applicationReady
+              ? "READY"
+              : role === ENGINE_ROLES.PROBABILISTIC &&
+                  probabilityCoverage <
+                    PERFORMANCE_THRESHOLDS
+                      .probabilisticMinimumProbabilityCoverage
+                ? "INSUFFICIENT_PROBABILITY_COVERAGE"
+                : sampleSize < minimumSample
+                  ? "INSUFFICIENT_SAMPLE"
+                  : "INSUFFICIENT_STATISTICAL_EVIDENCE",
         };
       });
 
