@@ -2,119 +2,152 @@
 
 /*
  * ============================================================
- * FOOTBALL AI PRO — GOALSCORER ENGINE V1
+ * FOOTBALL AI PRO — GOALSCORER ENGINE V2
  * ============================================================
  *
- * Objectifs :
- * - analyser les joueurs AVANT les compositions officielles ;
- * - supporter BUTEUR et BUTEUR_OU_REMPLACANT ;
- * - calculer une probabilité individuelle et une fair odd ;
- * - utiliser API-Football sans hardcoder un bet-id "buteur" ;
- * - stocker les prédictions avant coup d'envoi ;
- * - régler les résultats après match ;
- * - construire un Learning dédié calibration/Brier/ROI.
- *
- * IMPORTANT :
- * "Buteur ou remplaçant" dépend des règles du bookmaker.
- * Le modèle estime l'avantage de couverture avant compo, mais le
- * settlement passe en REVIEW si la chaîne de remplacement ne peut
- * pas être démontrée dans les events API-Football.
+ * Principes V2 :
+ * 1) Brain Studio / xG équipe = ancre principale.
+ * 2) Les xG équipe sont répartis entre les joueurs.
+ * 3) Les petits échantillons sont shrinkés vers un prior par poste.
+ * 4) Les données incohérentes sont dégradées ou rejetées.
+ * 5) Les cotes sont appariées STRICTEMENT au bon marché.
+ * 6) La garantie remplaçant reste distincte et prudente.
+ * 7) Le Learning n'utilise QUE les prédictions V2.
  */
 
 const GOALSCORER_VERSION =
-  "goalscorer-engine-v1.0.0";
+  "goalscorer-engine-v2.0.0";
 
 const MARKET_TYPES = Object.freeze({
   ANYTIME: "ANYTIME_GOALSCORER",
-  REPLACEMENT:
-    "SCORER_OR_REPLACEMENT",
+  REPLACEMENT: "SCORER_OR_REPLACEMENT",
 });
 
-const FINISHED_STATUSES =
-  new Set(["FT", "AET", "PEN"]);
+const FINISHED_90 = new Set(["FT"]);
+const FINISHED_EXTRA = new Set(["AET", "PEN"]);
+
+const POSITION_PRIORS = Object.freeze({
+  ATTACKER: {
+    goalsPer90: 0.34,
+    shotsPer90: 2.4,
+    shotsOnPer90: 1.0,
+    expectedMinutesStarter: 76,
+  },
+  MIDFIELDER: {
+    goalsPer90: 0.14,
+    shotsPer90: 1.35,
+    shotsOnPer90: 0.48,
+    expectedMinutesStarter: 78,
+  },
+  DEFENDER: {
+    goalsPer90: 0.055,
+    shotsPer90: 0.55,
+    shotsOnPer90: 0.18,
+    expectedMinutesStarter: 82,
+  },
+  UNKNOWN: {
+    goalsPer90: 0.12,
+    shotsPer90: 1.0,
+    shotsOnPer90: 0.35,
+    expectedMinutesStarter: 75,
+  },
+});
+
+const SHRINKAGE_PRIOR_MINUTES = 900;
 
 function numberOrNull(value) {
   const n = Number(value);
-  return Number.isFinite(n)
-    ? n
-    : null;
+  return Number.isFinite(n) ? n : null;
 }
 
 function numberOr(value, fallback = 0) {
   const n = Number(value);
-  return Number.isFinite(n)
-    ? n
-    : fallback;
+  return Number.isFinite(n) ? n : fallback;
 }
 
 function clamp(value, min, max) {
-  return Math.min(
-    max,
-    Math.max(min, numberOr(value))
-  );
+  return Math.min(max, Math.max(min, numberOr(value)));
 }
 
 function round(value, digits = 4) {
   const factor = 10 ** digits;
-  return (
-    Math.round(
-      (Number(value) +
-        Number.EPSILON) *
-        factor
-    ) / factor
-  );
+  return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
 }
 
 function normalizeToken(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function normalizeText(value) {
   return String(value || "")
-    .trim()
-    .toUpperCase();
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function safeJson(value) {
   try {
-    return JSON.stringify(
-      value ?? {}
-    );
+    return JSON.stringify(value ?? {});
   } catch {
     return "{}";
   }
 }
 
 function probabilityFromLambda(lambda) {
-  const safeLambda =
-    clamp(lambda, 0, 3);
-
-  return clamp(
-    (1 - Math.exp(-safeLambda)) *
-      100,
-    0.5,
-    85
-  );
+  return clamp((1 - Math.exp(-clamp(lambda, 0, 2.5))) * 100, 0.1, 88);
 }
 
 function impliedProbability(odd) {
   const n = numberOrNull(odd);
-
-  if (!n || n <= 1) {
-    return null;
-  }
-
+  if (!n || n <= 1) return null;
   return 100 / n;
 }
 
 function fairOdd(probability) {
-  const p =
-    numberOr(probability) / 100;
-
+  const p = numberOr(probability) / 100;
   if (p <= 0) return null;
-
   return round(1 / p, 2);
+}
+
+function positionGroup(position) {
+  const normalized = normalizeToken(position);
+
+  if (
+    normalized.includes("ATT") ||
+    normalized.includes("FORWARD") ||
+    normalized === "F"
+  ) {
+    return "ATTACKER";
+  }
+
+  if (
+    normalized.includes("MID") ||
+    normalized === "M"
+  ) {
+    return "MIDFIELDER";
+  }
+
+  if (
+    normalized.includes("DEF") ||
+    normalized === "D"
+  ) {
+    return "DEFENDER";
+  }
+
+  if (
+    normalized.includes("GOAL") ||
+    normalized === "G"
+  ) {
+    return "GOALKEEPER";
+  }
+
+  return "UNKNOWN";
 }
 
 function probabilityBucket(probability) {
   const p = numberOr(probability);
-
   if (p < 10) return "00_10";
   if (p < 20) return "10_20";
   if (p < 30) return "20_30";
@@ -123,541 +156,423 @@ function probabilityBucket(probability) {
   return "50_PLUS";
 }
 
-function positionGroup(position) {
-  const normalized =
-    normalizeToken(position);
+function dataReliability(sampleMinutes, anomalyCount) {
+  const minutes = numberOr(sampleMinutes);
+  const anomalies = numberOr(anomalyCount);
 
-  if (
-    normalized.includes("ATT") ||
-    normalized.includes("FORWARD")
-  ) {
-    return "ATTACKER";
+  if (anomalies >= 2) return "LOW";
+  if (minutes >= 900 && anomalies === 0) return "HIGH";
+  if (minutes >= 450) return "MEDIUM";
+  return "LOW";
+}
+
+function validatePlayerSample({
+  appearances,
+  starts,
+  minutes,
+  goals,
+  shots,
+  shotsOnTarget,
+}) {
+  const anomalies = [];
+
+  if (minutes < 0 || appearances < 0 || starts < 0) {
+    anomalies.push("NEGATIVE_SAMPLE");
   }
 
-  if (
-    normalized.includes("MID")
-  ) {
-    return "MIDFIELDER";
+  if (starts > appearances && appearances > 0) {
+    anomalies.push("STARTS_GT_APPEARANCES");
   }
 
-  if (
-    normalized.includes("DEF")
-  ) {
-    return "DEFENDER";
+  if (appearances >= 3 && starts >= 3 && minutes / Math.max(starts, 1) < 35) {
+    anomalies.push("START_MINUTES_TOO_LOW");
   }
 
-  if (
-    normalized.includes("GOAL")
-  ) {
-    return "GOALKEEPER";
+  if (minutes > appearances * 130) {
+    anomalies.push("MINUTES_TOO_HIGH");
   }
 
-  return "UNKNOWN";
+  if (goals > Math.max(appearances * 3, 10)) {
+    anomalies.push("GOALS_IMPLAUSIBLE");
+  }
+
+  if (shotsOnTarget > shots && shots > 0) {
+    anomalies.push("SHOTS_ON_GT_SHOTS");
+  }
+
+  return anomalies;
+}
+
+function shrinkRate({
+  observedCount,
+  observedMinutes,
+  priorRatePer90,
+  priorMinutes = SHRINKAGE_PRIOR_MINUTES,
+}) {
+  const obsMinutes = Math.max(0, numberOr(observedMinutes));
+  const obsCount = Math.max(0, numberOr(observedCount));
+  const priorGoals = priorRatePer90 * priorMinutes / 90;
+
+  return (
+    (obsCount + priorGoals) /
+    Math.max(1, obsMinutes + priorMinutes)
+  ) * 90;
+}
+
+function shrinkContinuousRate({
+  observedRatePer90,
+  observedMinutes,
+  priorRatePer90,
+  priorMinutes = SHRINKAGE_PRIOR_MINUTES,
+}) {
+  const obsMinutes = Math.max(0, numberOr(observedMinutes));
+  const obsRate = Math.max(0, numberOr(observedRatePer90));
+  return (
+    obsRate * obsMinutes +
+    priorRatePer90 * priorMinutes
+  ) / Math.max(1, obsMinutes + priorMinutes);
+}
+
+function aggregatePlayerStats(playerResponse, teamId) {
+  const statistics = Array.isArray(playerResponse?.statistics)
+    ? playerResponse.statistics
+    : [];
+
+  const relevant = statistics.filter((stat) => {
+    const statTeamId = Number(stat?.team?.id);
+    return !teamId || !statTeamId || statTeamId === Number(teamId);
+  });
+
+  const rows = relevant.length > 0 ? relevant : statistics;
+
+  let appearances = 0;
+  let starts = 0;
+  let minutes = 0;
+  let goals = 0;
+  let shots = 0;
+  let shotsOnTarget = 0;
+  let penaltyGoals = 0;
+  let substituteIns = 0;
+  let position = null;
+
+  for (const stat of rows) {
+    const games = stat?.games || {};
+    const goal = stat?.goals || {};
+    const shot = stat?.shots || {};
+    const penalty = stat?.penalty || {};
+    const substitutes = stat?.substitutes || {};
+
+    appearances += Math.max(
+      0,
+      numberOr(games.appearences ?? games.appearances)
+    );
+    starts += Math.max(0, numberOr(games.lineups));
+    minutes += Math.max(0, numberOr(games.minutes));
+    goals += Math.max(0, numberOr(goal.total));
+    shots += Math.max(0, numberOr(shot.total));
+    shotsOnTarget += Math.max(0, numberOr(shot.on));
+    penaltyGoals += Math.max(0, numberOr(penalty.scored));
+    substituteIns += Math.max(0, numberOr(substitutes.in));
+
+    if (!position && games.position) {
+      position = games.position;
+    }
+  }
+
+  return {
+    appearances,
+    starts,
+    minutes,
+    goals,
+    shots,
+    shotsOnTarget,
+    penaltyGoals,
+    substituteIns,
+    position,
+  };
+}
+
+function buildPlayerProfile({
+  playerResponse,
+  teamId,
+  injured,
+  lineupState,
+}) {
+  const player = playerResponse?.player || {};
+  const agg = aggregatePlayerStats(playerResponse, teamId);
+  const group = positionGroup(agg.position || player.position);
+  const prior = POSITION_PRIORS[group] || POSITION_PRIORS.UNKNOWN;
+
+  const anomalies = validatePlayerSample(agg);
+
+  const observedAvgMinutes =
+    agg.appearances > 0 ? agg.minutes / agg.appearances : 0;
+
+  const observedGoalsPer90 =
+    agg.minutes > 0 ? (agg.goals * 90) / agg.minutes : 0;
+
+  const observedShotsPer90 =
+    agg.minutes > 0 ? (agg.shots * 90) / agg.minutes : 0;
+
+  const observedShotsOnPer90 =
+    agg.minutes > 0 ? (agg.shotsOnTarget * 90) / agg.minutes : 0;
+
+  const posteriorGoalsPer90 = shrinkRate({
+    observedCount: agg.goals,
+    observedMinutes: agg.minutes,
+    priorRatePer90: prior.goalsPer90,
+  });
+
+  const posteriorShotsPer90 = shrinkContinuousRate({
+    observedRatePer90: observedShotsPer90,
+    observedMinutes: agg.minutes,
+    priorRatePer90: prior.shotsPer90,
+  });
+
+  const posteriorShotsOnPer90 = shrinkContinuousRate({
+    observedRatePer90: observedShotsOnPer90,
+    observedMinutes: agg.minutes,
+    priorRatePer90: prior.shotsOnPer90,
+  });
+
+  const starterRate =
+    agg.appearances > 0
+      ? clamp(agg.starts / agg.appearances, 0, 1)
+      : 0.5;
+
+  let starterProbability =
+    clamp(
+      (starterRate * 0.72 +
+        clamp(observedAvgMinutes / 90, 0, 1) * 0.28) *
+        100,
+      8,
+      98
+    );
+
+  if (anomalies.includes("START_MINUTES_TOO_LOW")) {
+    starterProbability = clamp(
+      starterRate * 65 + 20,
+      20,
+      80
+    );
+  }
+
+  if (lineupState === "STARTER") {
+    starterProbability = 100;
+  } else if (lineupState === "SUBSTITUTE") {
+    starterProbability = 2;
+  }
+
+  if (injured) {
+    starterProbability = Math.min(starterProbability, 12);
+  }
+
+  const starterMinutesBase =
+    agg.minutes >= 270 && anomalies.length === 0
+      ? clamp(observedAvgMinutes, 55, 90)
+      : prior.expectedMinutesStarter;
+
+  let expectedMinutes;
+
+  if (lineupState === "STARTER") {
+    expectedMinutes = clamp(starterMinutesBase, 55, 90);
+  } else if (lineupState === "SUBSTITUTE") {
+    expectedMinutes = 24;
+  } else {
+    expectedMinutes = clamp(
+      (starterProbability / 100) * starterMinutesBase +
+        (1 - starterProbability / 100) * 22,
+      18,
+      88
+    );
+  }
+
+  if (injured) {
+    expectedMinutes *= 0.35;
+  }
+
+  const sampleReliability = dataReliability(
+    agg.minutes,
+    anomalies.length
+  );
+
+  const attackingIndex =
+    clamp(
+      posteriorGoalsPer90 * 0.52 +
+        posteriorShotsOnPer90 * 0.20 +
+        posteriorShotsPer90 * 0.055 +
+        (agg.penaltyGoals > 0 ? 0.08 : 0) +
+        (group === "ATTACKER"
+          ? 0.08
+          : group === "MIDFIELDER"
+            ? 0.03
+            : 0),
+      0.03,
+      2.0
+    );
+
+  let dataQuality = 100;
+
+  if (agg.minutes < 900) dataQuality -= 10;
+  if (agg.minutes < 450) dataQuality -= 10;
+  if (agg.minutes < 180) dataQuality -= 12;
+  if (lineupState === "UNKNOWN") dataQuality -= 8;
+  if (anomalies.length > 0) dataQuality -= anomalies.length * 12;
+  if (injured) dataQuality -= 20;
+
+  dataQuality = clamp(dataQuality, 20, 100);
+
+  return {
+    playerId: Number(player.id),
+    playerName:
+      player.name ||
+      `${player.firstname || ""} ${player.lastname || ""}`.trim(),
+    position: agg.position || player.position || null,
+    positionGroup: group,
+
+    appearances: agg.appearances,
+    starts: agg.starts,
+    minutes: agg.minutes,
+    avgMinutes: round(observedAvgMinutes, 2),
+
+    goals: agg.goals,
+    goalsPer90: round(observedGoalsPer90, 4),
+    posteriorGoalsPer90: round(posteriorGoalsPer90, 4),
+
+    shots: agg.shots,
+    shotsPer90: round(observedShotsPer90, 4),
+    posteriorShotsPer90: round(posteriorShotsPer90, 4),
+
+    shotsOnTarget: agg.shotsOnTarget,
+    shotsOnTargetPer90: round(observedShotsOnPer90, 4),
+    posteriorShotsOnTargetPer90: round(posteriorShotsOnPer90, 4),
+
+    penaltyGoals: agg.penaltyGoals,
+    substituteIns: agg.substituteIns,
+
+    injured: Boolean(injured),
+    lineupState,
+    starterProbability: round(starterProbability, 2),
+    expectedMinutes: round(expectedMinutes, 1),
+
+    attackingIndex: round(attackingIndex, 5),
+    sampleReliability,
+    anomalies,
+    dataQuality: round(dataQuality, 1),
+  };
 }
 
 function scorerStatus({
   probability,
   dataQuality,
+  sampleReliability,
+  anomalies,
 }) {
   const p = numberOr(probability);
-  const quality =
-    numberOr(dataQuality);
+  const quality = numberOr(dataQuality);
+  const anomalyCount = Array.isArray(anomalies) ? anomalies.length : 0;
 
-  if (quality < 45) {
+  if (quality < 45 || anomalyCount >= 2) {
     return "REJECTED";
   }
 
-  if (p >= 40 && quality >= 70) {
+  if (
+    p >= 38 &&
+    quality >= 72 &&
+    sampleReliability !== "LOW"
+  ) {
     return "GOALSCORER_PLUS";
   }
 
-  if (p >= 30 && quality >= 60) {
+  if (p >= 27 && quality >= 60) {
     return "GOALSCORER";
   }
 
-  if (p >= 20) {
+  if (p >= 17) {
     return "WATCH";
   }
 
   return "REJECTED";
 }
 
-function extractStatBlock(
-  playerResponse,
-  leagueId,
-  teamId
-) {
-  const statistics =
-    Array.isArray(
-      playerResponse?.statistics
-    )
-      ? playerResponse.statistics
-      : [];
-
-  return (
-    statistics.find(
-      (stat) =>
-        Number(stat?.league?.id) ===
-          Number(leagueId) &&
-        Number(stat?.team?.id) ===
-          Number(teamId)
-    ) ||
-    statistics.find(
-      (stat) =>
-        Number(stat?.team?.id) ===
-        Number(teamId)
-    ) ||
-    statistics[0] ||
-    null
-  );
+function teamGoalAverage(stats, side) {
+  const goals = stats?.goals?.for?.average || {};
+  return numberOr(goals?.[side] ?? goals?.total, 1.35);
 }
 
-function buildPlayerFeatures({
-  playerResponse,
-  stat,
-  teamExpectedGoals,
-  teamAverageGoals,
-  injured,
-  lineupState,
-  marketType,
-  replacementPoolProbability,
-}) {
-  const player =
-    playerResponse?.player || {};
-
-  const games =
-    stat?.games || {};
-
-  const goals =
-    stat?.goals || {};
-
-  const shots =
-    stat?.shots || {};
-
-  const penalty =
-    stat?.penalty || {};
-
-  const substitutes =
-    stat?.substitutes || {};
-
-  const appearances =
-    Math.max(
-      0,
-      numberOr(
-        games.appearences ??
-          games.appearances
-      )
-    );
-
-  const starts =
-    Math.max(
-      0,
-      numberOr(games.lineups)
-    );
-
-  const minutes =
-    Math.max(
-      0,
-      numberOr(games.minutes)
-    );
-
-  const goalsTotal =
-    Math.max(
-      0,
-      numberOr(goals.total)
-    );
-
-  const shotsTotal =
-    Math.max(
-      0,
-      numberOr(shots.total)
-    );
-
-  const shotsOn =
-    Math.max(
-      0,
-      numberOr(shots.on)
-    );
-
-  const penaltyGoals =
-    Math.max(
-      0,
-      numberOr(penalty.scored)
-    );
-
-  const subIn =
-    Math.max(
-      0,
-      numberOr(substitutes.in)
-    );
-
-  const goalsPer90 =
-    minutes > 0
-      ? (goalsTotal * 90) / minutes
-      : 0;
-
-  const shotsPer90 =
-    minutes > 0
-      ? (shotsTotal * 90) / minutes
-      : 0;
-
-  const shotsOnPer90 =
-    minutes > 0
-      ? (shotsOn * 90) / minutes
-      : 0;
-
-  const starterRate =
-    appearances > 0
-      ? clamp(
-          starts / appearances,
-          0,
-          1
-        )
-      : 0;
-
-  const avgMinutes =
-    appearances > 0
-      ? minutes / appearances
-      : 0;
-
-  let starterProbability =
-    clamp(
-      starterRate * 0.65 +
-        clamp(
-          avgMinutes / 90,
-          0,
-          1
-        ) *
-          0.35,
-      0.08,
-      0.98
-    );
-
-  if (
-    lineupState === "STARTER"
-  ) {
-    starterProbability = 1;
-  } else if (
-    lineupState === "SUBSTITUTE"
-  ) {
-    starterProbability = 0.02;
-  }
-
-  if (injured) {
-    starterProbability *= 0.25;
-  }
-
-  let expectedMinutes;
-
-  if (
-    lineupState === "STARTER"
-  ) {
-    expectedMinutes =
-      clamp(avgMinutes || 78, 55, 90);
-  } else if (
-    lineupState === "SUBSTITUTE"
-  ) {
-    expectedMinutes =
-      clamp(
-        avgMinutes > 0
-          ? Math.min(avgMinutes, 35)
-          : 25,
-        10,
-        40
-      );
-  } else {
-    expectedMinutes =
-      clamp(
-        starterProbability *
-          clamp(
-            avgMinutes || 75,
-            55,
-            88
-          ) +
-          (1 -
-            starterProbability) *
-            22,
-        15,
-        88
-      );
-  }
-
-  const teamGoalScaling =
-    clamp(
-      numberOr(
-        teamExpectedGoals,
-        1.35
-      ) /
-        Math.max(
-          0.55,
-          numberOr(
-            teamAverageGoals,
-            1.35
-          )
-        ),
-      0.65,
-      1.65
-    );
-
-  const shotSignal =
-    clamp(
-      0.85 +
-        shotsOnPer90 * 0.035 +
-        shotsPer90 * 0.012,
-      0.85,
-      1.22
-    );
-
-  const penaltySignal =
-    penaltyGoals > 0
-      ? clamp(
-          1 +
-            Math.min(
-              0.12,
-              penaltyGoals * 0.025
-            ),
-          1,
-          1.12
-        )
-      : 1;
-
-  const injurySignal =
-    injured ? 0.35 : 1;
-
-  const rawLambda =
-    Math.max(
-      0.015,
-      goalsPer90 *
-        (expectedMinutes / 90) *
-        teamGoalScaling *
-        shotSignal *
-        penaltySignal *
-        injurySignal
-    );
-
-  const anytimeProbability =
-    probabilityFromLambda(
-      rawLambda
-    );
-
-  /*
-   * Garantie remplaçant :
-   * on ne prétend pas connaître le futur remplaçant avant compo.
-   * On ajoute uniquement la couverture liée à la probabilité
-   * que le joueur ne porte pas toute l'exposition du poste.
-   */
-  const nonStarterExposure =
-    clamp(
-      1 - starterProbability,
-      0,
-      1
-    );
-
-  const replacementProbability =
-    clamp(
-      numberOr(
-        replacementPoolProbability,
-        10
-      ),
-      2,
-      30
-    );
-
-  const guaranteeBoost =
-    marketType ===
-    MARKET_TYPES.REPLACEMENT
-      ? nonStarterExposure *
-        replacementProbability
-      : 0;
-
-  const finalProbability =
-    marketType ===
-    MARKET_TYPES.REPLACEMENT
-      ? clamp(
-          100 -
-            ((100 -
-              anytimeProbability) *
-              (100 -
-                guaranteeBoost)) /
-              100,
-          anytimeProbability,
-          85
-        )
-      : anytimeProbability;
-
-  const dataPoints = [
-    appearances >= 3,
-    minutes >= 180,
-    goalsTotal !== null,
-    shotsTotal > 0,
-    numberOr(
-      teamExpectedGoals
-    ) > 0,
-    numberOr(
-      teamAverageGoals
-    ) > 0,
-    lineupState !== "UNKNOWN",
-    !injured,
-  ];
-
-  const dataQuality =
-    round(
-      (
-        dataPoints.filter(Boolean)
-          .length /
-        dataPoints.length
-      ) *
-        100,
-      1
-    );
-
-  return {
-    playerId:
-      Number(player.id),
-    playerName:
-      player.name ||
-      `${player.firstname || ""} ${
-        player.lastname || ""
-      }`.trim(),
-    position:
-      games.position ||
-      player.position ||
-      null,
-    positionGroup:
-      positionGroup(
-        games.position ||
-          player.position
-      ),
-
-    appearances,
-    starts,
-    minutes,
-    avgMinutes:
-      round(avgMinutes, 2),
-    goals: goalsTotal,
-    goalsPer90:
-      round(goalsPer90, 4),
-    shots: shotsTotal,
-    shotsPer90:
-      round(shotsPer90, 4),
-    shotsOnTarget: shotsOn,
-    shotsOnTargetPer90:
-      round(shotsOnPer90, 4),
-    penaltyGoals,
-    substituteIns: subIn,
-
-    injured:
-      Boolean(injured),
-    lineupState,
-    starterProbability:
-      round(
-        starterProbability * 100,
-        2
-      ),
-    expectedMinutes:
-      round(expectedMinutes, 1),
-
-    teamGoalScaling:
-      round(teamGoalScaling, 4),
-    rawLambda:
-      round(rawLambda, 5),
-    anytimeProbability:
-      round(anytimeProbability, 2),
-    replacementProbabilityEstimate:
-      round(
-        replacementProbability,
-        2
-      ),
-    guaranteeBoost:
-      round(
-        guaranteeBoost,
-        2
-      ),
-    probability:
-      round(finalProbability, 2),
-    fairOdd:
-      fairOdd(finalProbability),
-    dataQuality,
-  };
+function opponentConcededAverage(stats, side) {
+  const conceded = stats?.goals?.against?.average || {};
+  return numberOr(conceded?.[side] ?? conceded?.total, 1.35);
 }
 
-function teamGoalAverage(
-  stats,
-  side
-) {
-  const goals =
-    stats?.goals?.for?.average || {};
-
-  return numberOr(
-    goals?.[side] ??
-      goals?.total,
-    1.35
-  );
-}
-
-function opponentConcededAverage(
-  stats,
-  side
-) {
-  const conceded =
-    stats?.goals?.against
-      ?.average || {};
-
-  return numberOr(
-    conceded?.[side] ??
-      conceded?.total,
-    1.35
-  );
-}
-
-function expectedTeamGoals({
+function fallbackExpectedTeamGoals({
   teamStats,
   opponentStats,
   homeAway,
 }) {
-  const ownSide =
-    homeAway === "HOME"
-      ? "home"
-      : "away";
+  const ownSide = homeAway === "HOME" ? "home" : "away";
+  const opponentSide = homeAway === "HOME" ? "away" : "home";
 
-  const opponentSide =
-    homeAway === "HOME"
-      ? "away"
-      : "home";
+  const own = teamGoalAverage(teamStats, ownSide);
+  const conceded = opponentConcededAverage(opponentStats, opponentSide);
 
-  const own =
-    teamGoalAverage(
-      teamStats,
-      ownSide
-    );
-
-  const opponentConceded =
-    opponentConcededAverage(
-      opponentStats,
-      opponentSide
-    );
-
-  return clamp(
-    own * 0.55 +
-      opponentConceded * 0.45,
-    0.45,
-    3.25
-  );
+  return clamp(own * 0.55 + conceded * 0.45, 0.35, 3.5);
 }
 
-function normalizePlayerName(value) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(
-      /[\u0300-\u036f]/g,
-      ""
-    )
-    .toLowerCase()
-    .replace(
-      /[^a-z0-9]+/g,
-      " "
-    )
-    .trim();
+function resolveBrainTeamXg({
+  dbRow,
+  homeAway,
+  fallback,
+}) {
+  const brainValue =
+    homeAway === "HOME"
+      ? numberOrNull(dbRow?.official_xg_home)
+      : numberOrNull(dbRow?.official_xg_away);
+
+  if (brainValue !== null && brainValue > 0) {
+    return {
+      value: clamp(brainValue, 0.2, 4.5),
+      source: "BRAIN_STUDIO_OFFICIAL_XG",
+    };
+  }
+
+  return {
+    value: fallback,
+    source: "TEAM_STATS_FALLBACK",
+  };
+}
+
+function exactMarketNameMatch(betName, marketType) {
+  const name = normalizeText(betName);
+
+  const scorerWord =
+    /\b(goal ?scorer|goalscorer|buteur|to score)\b/.test(name);
+
+  if (!scorerWord) return false;
+
+  const firstLast =
+    /\b(first|1st|premier|last|dernier)\b/.test(name);
+
+  const sideSpecific =
+    /\b(home first|away first|home last|away last)\b/.test(name);
+
+  if (marketType === MARKET_TYPES.ANYTIME) {
+    if (firstLast || sideSpecific) return false;
+
+    return (
+      /\b(anytime|any time|tout moment)\b/.test(name) ||
+      /\b(player to score)\b/.test(name)
+    );
+  }
+
+  if (marketType === MARKET_TYPES.REPLACEMENT) {
+    return (
+      !firstLast &&
+      /\b(replacement|substitute|remplacant|remplacante|coaching)\b/.test(name)
+    );
+  }
+
+  return false;
 }
 
 function scanOddsForPlayer({
@@ -665,173 +580,233 @@ function scanOddsForPlayer({
   playerName,
   marketType,
 }) {
-  const normalizedPlayer =
-    normalizePlayerName(playerName);
-
-  if (!normalizedPlayer) {
-    return null;
-  }
-
-  const fixtures =
-    Array.isArray(oddsResponse)
-      ? oddsResponse
-      : [];
+  const normalizedPlayer = normalizeText(playerName);
+  if (!normalizedPlayer) return null;
 
   const matches = [];
 
-  for (const fixture of fixtures) {
-    for (
-      const bookmaker of
-        fixture?.bookmakers || []
-    ) {
-      for (
-        const bet of
-          bookmaker?.bets || []
-      ) {
-        const betName =
-          String(
-            bet?.name || ""
-          ).toLowerCase();
-
-        const isScorerBet =
-          /scor|buteur|goal scorer|goalscorer/.test(
-            betName
-          );
-
-        if (!isScorerBet) {
+  for (const fixture of Array.isArray(oddsResponse) ? oddsResponse : []) {
+    for (const bookmaker of fixture?.bookmakers || []) {
+      for (const bet of bookmaker?.bets || []) {
+        if (!exactMarketNameMatch(bet?.name, marketType)) {
           continue;
         }
 
-        const isReplacement =
-          /replac|substitut|rempla|coaching/.test(
-            betName
-          );
-
-        if (
-          marketType ===
-            MARKET_TYPES.REPLACEMENT &&
-          !isReplacement
-        ) {
-          continue;
-        }
-
-        if (
-          marketType ===
-            MARKET_TYPES.ANYTIME &&
-          isReplacement
-        ) {
-          continue;
-        }
-
-        for (
-          const value of
-            bet?.values || []
-        ) {
-          const valueName =
-            normalizePlayerName(
-              value?.value
-            );
+        for (const value of bet?.values || []) {
+          const valueName = normalizeText(value?.value);
 
           if (
             !valueName ||
             !(
-              valueName.includes(
-                normalizedPlayer
-              ) ||
-              normalizedPlayer.includes(
-                valueName
-              )
+              valueName.includes(normalizedPlayer) ||
+              normalizedPlayer.includes(valueName)
             )
           ) {
             continue;
           }
 
-          const odd =
-            numberOrNull(value?.odd);
-
-          if (!odd || odd <= 1) {
-            continue;
-          }
+          const odd = numberOrNull(value?.odd);
+          if (!odd || odd <= 1) continue;
 
           matches.push({
             odd,
-            bookmakerId:
-              bookmaker?.id ?? null,
-            bookmakerName:
-              bookmaker?.name ?? null,
-            betId:
-              bet?.id ?? null,
-            betName:
-              bet?.name ?? null,
-            value:
-              value?.value ?? null,
+            bookmakerId: bookmaker?.id ?? null,
+            bookmakerName: bookmaker?.name ?? null,
+            betId: bet?.id ?? null,
+            betName: bet?.name ?? null,
+            value: value?.value ?? null,
           });
         }
       }
     }
   }
 
-  if (matches.length === 0) {
-    return null;
-  }
+  if (matches.length === 0) return null;
 
-  return [...matches].sort(
-    (a, b) => b.odd - a.odd
-  )[0];
+  return [...matches].sort((a, b) => b.odd - a.odd)[0];
 }
 
 async function fetchPagedPlayers({
   callApiFootball,
   teamId,
-  leagueId,
   season,
+  leagueId = null,
 }) {
   const rows = [];
-
   let page = 1;
   let totalPages = 1;
 
-  while (
-    page <= totalPages &&
-    page <= 5
-  ) {
-    const response =
-      await callApiFootball(
-        "/players",
-        {
-          team: teamId,
-          league: leagueId,
-          season,
-          page,
-        }
-      );
+  while (page <= totalPages && page <= 8) {
+    const params = {
+      team: teamId,
+      season,
+      page,
+    };
 
-    const payload =
-      response?.data || {};
+    if (leagueId) {
+      params.league = leagueId;
+    }
+
+    const response = await callApiFootball("/players", params);
+    const payload = response?.data || {};
 
     rows.push(
-      ...(
-        Array.isArray(
-          payload.response
-        )
-          ? payload.response
-          : []
-      )
+      ...(Array.isArray(payload.response) ? payload.response : [])
     );
 
-    totalPages =
-      Math.max(
-        1,
-        numberOr(
-          payload?.paging?.total,
-          1
-        )
-      );
-
+    totalPages = Math.max(1, numberOr(payload?.paging?.total, 1));
     page += 1;
   }
 
   return rows;
+}
+
+function mergePlayerResponses(primary, secondary) {
+  const byPlayer = new Map();
+
+  for (const source of [primary, secondary]) {
+    for (const row of source || []) {
+      const id = Number(row?.player?.id);
+      if (!id) continue;
+
+      if (!byPlayer.has(id)) {
+        byPlayer.set(id, {
+          player: row.player,
+          statistics: [],
+        });
+      }
+
+      const entry = byPlayer.get(id);
+      entry.statistics.push(
+        ...(Array.isArray(row?.statistics) ? row.statistics : [])
+      );
+    }
+  }
+
+  return [...byPlayer.values()];
+}
+
+function allocateTeamXg({
+  profiles,
+  teamExpectedGoals,
+}) {
+  const eligible = profiles.filter(
+    (p) =>
+      p.positionGroup !== "GOALKEEPER" &&
+      p.expectedMinutes >= 10 &&
+      p.dataQuality >= 35
+  );
+
+  const rawWeights = eligible.map((profile) => {
+    const minutesShare = clamp(profile.expectedMinutes / 90, 0.08, 1);
+    const starterExposure = clamp(
+      0.35 + profile.starterProbability / 100 * 0.65,
+      0.35,
+      1
+    );
+
+    const reliabilityPenalty =
+      profile.sampleReliability === "LOW"
+        ? 0.88
+        : profile.sampleReliability === "MEDIUM"
+          ? 0.96
+          : 1;
+
+    const anomalyPenalty =
+      Math.max(0.65, 1 - profile.anomalies.length * 0.12);
+
+    const weight =
+      profile.attackingIndex *
+      minutesShare *
+      starterExposure *
+      reliabilityPenalty *
+      anomalyPenalty;
+
+    return Math.max(0.01, weight);
+  });
+
+  const totalWeight = rawWeights.reduce((sum, n) => sum + n, 0);
+
+  return eligible.map((profile, index) => {
+    const share =
+      totalWeight > 0
+        ? rawWeights[index] / totalWeight
+        : 1 / Math.max(1, eligible.length);
+
+    /*
+     * Contrôle de cohérence :
+     * la somme des lambda individuels est égale à l'xG équipe.
+     */
+    const lambda = clamp(teamExpectedGoals * share, 0.005, 1.35);
+    const probability = probabilityFromLambda(lambda);
+
+    return {
+      ...profile,
+      allocationShare: round(share * 100, 3),
+      rawLambda: round(lambda, 5),
+      anytimeProbability: round(probability, 2),
+    };
+  });
+}
+
+function replacementCoverageProbability({
+  player,
+  teamProfiles,
+}) {
+  /*
+   * V2 : couverture prudente.
+   * On estime seulement l'exposition au scénario "joueur non titulaire".
+   * Le moteur n'invente pas un remplaçant spécifique.
+   */
+  const notStarter = clamp(1 - player.starterProbability / 100, 0, 1);
+
+  const replacementPool = teamProfiles
+    .filter(
+      (p) =>
+        p.playerId !== player.playerId &&
+        (p.positionGroup === "ATTACKER" ||
+          p.positionGroup === "MIDFIELDER") &&
+        p.expectedMinutes >= 15
+    )
+    .sort((a, b) => b.anytimeProbability - a.anytimeProbability)
+    .slice(0, 4);
+
+  if (replacementPool.length === 0) {
+    return {
+      conditionalReplacementProbability: 0,
+      boost: 0,
+    };
+  }
+
+  const average =
+    replacementPool.reduce(
+      (sum, p) => sum + p.anytimeProbability,
+      0
+    ) / replacementPool.length;
+
+  const conditionalReplacementProbability = clamp(
+    average * 0.45,
+    2,
+    18
+  );
+
+  /*
+   * Boost plafonné : on reste conservateur tant qu'on ne connaît
+   * pas la règle exacte et le remplaçant réel.
+   */
+  const boost = clamp(
+    notStarter * conditionalReplacementProbability,
+    0,
+    8
+  );
+
+  return {
+    conditionalReplacementProbability: round(
+      conditionalReplacementProbability,
+      2
+    ),
+    boost: round(boost, 2),
+  };
 }
 
 function createGoalscorerEngine({
@@ -847,19 +822,11 @@ function createGoalscorerEngine({
   let schedulerRunning = false;
 
   const guards =
-    typeof adminGuard ===
-    "function"
-      ? [adminGuard]
-      : [];
+    typeof adminGuard === "function" ? [adminGuard] : [];
 
   async function ensureTables() {
-    if (tablesReady) {
-      return;
-    }
-
-    if (ensurePromise) {
-      return ensurePromise;
-    }
+    if (tablesReady) return;
+    if (ensurePromise) return ensurePromise;
 
     ensurePromise = (async () => {
       await pool.query(`
@@ -881,8 +848,7 @@ function createGoalscorerEngine({
           position_group TEXT,
 
           market_type TEXT NOT NULL,
-          replacement_guarantee BOOLEAN
-            NOT NULL DEFAULT FALSE,
+          replacement_guarantee BOOLEAN NOT NULL DEFAULT FALSE,
 
           starter_probability NUMERIC(8,4),
           expected_minutes NUMERIC(8,3),
@@ -904,8 +870,7 @@ function createGoalscorerEngine({
 
           anytime_probability NUMERIC(8,4),
           guarantee_boost NUMERIC(8,4),
-          predicted_probability NUMERIC(8,4)
-            NOT NULL,
+          predicted_probability NUMERIC(8,4) NOT NULL,
           fair_odd NUMERIC(10,4),
 
           market_odd NUMERIC(10,4),
@@ -940,29 +905,43 @@ function createGoalscorerEngine({
           settled_at TIMESTAMPTZ,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-          UNIQUE (
-            fixture_id,
-            player_id,
-            market_type
-          )
+          UNIQUE (fixture_id, player_id, market_type)
         );
       `);
 
       await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-          idx_goalscorer_predictions_fixture
-        ON goalscorer_predictions (
-          fixture_id
-        );
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS sample_reliability TEXT;
       `);
 
       await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-          idx_goalscorer_predictions_pending
-        ON goalscorer_predictions (
-          result_status,
-          fixture_date
-        );
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS anomaly_flags JSONB;
+      `);
+
+      await pool.query(`
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS xg_source TEXT;
+      `);
+
+      await pool.query(`
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS allocation_share NUMERIC(10,5);
+      `);
+
+      await pool.query(`
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS posterior_goals_per90 NUMERIC(10,5);
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_goalscorer_predictions_fixture
+        ON goalscorer_predictions (fixture_id);
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_goalscorer_predictions_pending
+        ON goalscorer_predictions (result_status, fixture_date);
       `);
 
       await pool.query(`
@@ -977,14 +956,10 @@ function createGoalscorerEngine({
           wins INTEGER NOT NULL DEFAULT 0,
           losses INTEGER NOT NULL DEFAULT 0,
 
-          average_predicted_probability
-            NUMERIC(10,5),
-          actual_score_rate
-            NUMERIC(10,5),
-          calibration_gap
-            NUMERIC(10,5),
-          brier_score
-            NUMERIC(10,6),
+          average_predicted_probability NUMERIC(10,5),
+          actual_score_rate NUMERIC(10,5),
+          calibration_gap NUMERIC(10,5),
+          brier_score NUMERIC(10,6),
 
           bets_with_odds INTEGER NOT NULL DEFAULT 0,
           profit_units NUMERIC(12,5),
@@ -996,12 +971,26 @@ function createGoalscorerEngine({
           calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-          UNIQUE (
-            market_type,
-            probability_bucket,
-            position_group
-          )
+          UNIQUE (market_type, probability_bucket, position_group)
         );
+      `);
+
+      /*
+       * Les prédictions V1 étaient des tests exploratoires.
+       * On les retire pour éviter de contaminer le Learning V2
+       * et pour libérer la contrainte UNIQUE fixture/player/market.
+       */
+      await pool.query(
+        `
+          DELETE FROM goalscorer_predictions
+          WHERE model_version = $1
+        `,
+        ["goalscorer-engine-v1.0.0"]
+      );
+
+      await pool.query(`
+        DELETE FROM goalscorer_learning_stats
+        WHERE learning_version <> 'goalscorer-engine-v2.0.0';
       `);
 
       tablesReady = true;
@@ -1014,175 +1003,96 @@ function createGoalscorerEngine({
     }
   }
 
-  async function getFixtureContext(
-    fixtureId
-  ) {
-    const dbResult =
-      await pool.query(
-        `
-          SELECT
-            fixture_id,
-            fixture_date,
-            league_id,
-            league_name,
-            home_team_id,
-            home_team_name,
-            away_team_id,
-            away_team_name,
-            official_xg_home,
-            official_xg_away,
-            result_status,
-            home_goals,
-            away_goals
-          FROM predictions
-          WHERE fixture_id = $1
-          LIMIT 1
-        `,
-        [fixtureId]
-      );
+  async function getFixtureContext(fixtureId) {
+    const dbResult = await pool.query(
+      `
+        SELECT
+          fixture_id,
+          fixture_date,
+          league_id,
+          league_name,
+          home_team_id,
+          home_team_name,
+          away_team_id,
+          away_team_name,
+          official_xg_home,
+          official_xg_away,
+          result_status,
+          home_goals,
+          away_goals
+        FROM predictions
+        WHERE fixture_id = $1
+        LIMIT 1
+      `,
+      [fixtureId]
+    );
 
-    const dbRow =
-      dbResult.rows[0] || null;
+    const dbRow = dbResult.rows[0] || null;
 
-    const fixtureResponse =
-      await callApiFootball(
-        "/fixtures",
-        { id: fixtureId }
-      );
+    const fixtureResponse = await callApiFootball("/fixtures", {
+      id: fixtureId,
+    });
 
-    const fixture =
-      fixtureResponse?.data
-        ?.response?.[0];
+    const fixture = fixtureResponse?.data?.response?.[0];
 
     if (!fixture && !dbRow) {
-      throw new Error(
-        "Fixture introuvable."
-      );
+      throw new Error("Fixture introuvable.");
     }
 
     return {
-      fixtureId:
-        Number(fixtureId),
+      fixtureId: Number(fixtureId),
+      fixtureDate: fixture?.fixture?.date || dbRow?.fixture_date || null,
 
-      fixtureDate:
-        fixture?.fixture?.date ||
-        dbRow?.fixture_date ||
-        null,
+      leagueId: Number(fixture?.league?.id || dbRow?.league_id),
+      leagueName: fixture?.league?.name || dbRow?.league_name || null,
+      season: Number(fixture?.league?.season),
 
-      leagueId:
-        Number(
-          fixture?.league?.id ||
-            dbRow?.league_id
-        ),
-
-      leagueName:
-        fixture?.league?.name ||
-        dbRow?.league_name ||
-        null,
-
-      season:
-        Number(
-          fixture?.league?.season
-        ),
-
-      homeTeamId:
-        Number(
-          fixture?.teams?.home?.id ||
-            dbRow?.home_team_id
-        ),
-
+      homeTeamId: Number(
+        fixture?.teams?.home?.id || dbRow?.home_team_id
+      ),
       homeTeamName:
-        fixture?.teams?.home
-          ?.name ||
-        dbRow?.home_team_name ||
-        null,
+        fixture?.teams?.home?.name || dbRow?.home_team_name || null,
 
-      awayTeamId:
-        Number(
-          fixture?.teams?.away?.id ||
-            dbRow?.away_team_id
-        ),
-
+      awayTeamId: Number(
+        fixture?.teams?.away?.id || dbRow?.away_team_id
+      ),
       awayTeamName:
-        fixture?.teams?.away
-          ?.name ||
-        dbRow?.away_team_name ||
-        null,
+        fixture?.teams?.away?.name || dbRow?.away_team_name || null,
 
       status:
-        fixture?.fixture?.status
-          ?.short ||
+        fixture?.fixture?.status?.short ||
         dbRow?.result_status ||
         null,
 
-      homeGoals:
-        numberOrNull(
-          fixture?.goals?.home ??
-            dbRow?.home_goals
-        ),
-
-      awayGoals:
-        numberOrNull(
-          fixture?.goals?.away ??
-            dbRow?.away_goals
-        ),
+      homeGoals: numberOrNull(
+        fixture?.goals?.home ?? dbRow?.home_goals
+      ),
+      awayGoals: numberOrNull(
+        fixture?.goals?.away ?? dbRow?.away_goals
+      ),
 
       dbRow,
       fixture,
     };
   }
 
-  async function getLineupStateMap(
-    fixtureId
-  ) {
+  async function getLineupStateMap(fixtureId) {
     try {
-      const response =
-        await callApiFootball(
-          "/fixtures/lineups",
-          {
-            fixture: fixtureId,
-          }
-        );
-
-      const lineups =
-        response?.data
-          ?.response || [];
+      const response = await callApiFootball("/fixtures/lineups", {
+        fixture: fixtureId,
+      });
 
       const map = new Map();
 
-      for (const team of lineups) {
-        for (
-          const item of
-            team?.startXI || []
-        ) {
-          const id =
-            Number(
-              item?.player?.id
-            );
-
-          if (id) {
-            map.set(
-              id,
-              "STARTER"
-            );
-          }
+      for (const team of response?.data?.response || []) {
+        for (const item of team?.startXI || []) {
+          const id = Number(item?.player?.id);
+          if (id) map.set(id, "STARTER");
         }
 
-        for (
-          const item of
-            team?.substitutes || []
-        ) {
-          const id =
-            Number(
-              item?.player?.id
-            );
-
-          if (id) {
-            map.set(
-              id,
-              "SUBSTITUTE"
-            );
-          }
+        for (const item of team?.substitutes || []) {
+          const id = Number(item?.player?.id);
+          if (id) map.set(id, "SUBSTITUTE");
         }
       }
 
@@ -1192,33 +1102,17 @@ function createGoalscorerEngine({
     }
   }
 
-  async function getInjurySet({
-    leagueId,
-    season,
-    fixtureId,
-  }) {
+  async function getInjurySet({ leagueId, season, fixtureId }) {
     try {
-      const response =
-        await callApiFootball(
-          "/injuries",
-          {
-            league: leagueId,
-            season,
-            fixture: fixtureId,
-          }
-        );
+      const response = await callApiFootball("/injuries", {
+        league: leagueId,
+        season,
+        fixture: fixtureId,
+      });
 
       return new Set(
-        (
-          response?.data
-            ?.response || []
-        )
-          .map(
-            (item) =>
-              Number(
-                item?.player?.id
-              )
-          )
+        (response?.data?.response || [])
+          .map((item) => Number(item?.player?.id))
           .filter(Boolean)
       );
     } catch {
@@ -1226,89 +1120,62 @@ function createGoalscorerEngine({
     }
   }
 
-  async function getTeamStats({
-    leagueId,
-    season,
-    teamId,
-  }) {
-    const response =
-      await callApiFootball(
-        "/teams/statistics",
-        {
-          league: leagueId,
-          season,
-          team: teamId,
-        }
-      );
+  async function getTeamStats({ leagueId, season, teamId }) {
+    try {
+      const response = await callApiFootball("/teams/statistics", {
+        league: leagueId,
+        season,
+        team: teamId,
+      });
 
-    return (
-      response?.data?.response ||
-      {}
-    );
+      return response?.data?.response || {};
+    } catch {
+      return {};
+    }
   }
 
-  async function getPrematchOdds(
-    fixtureId
-  ) {
+  async function getPrematchOdds(fixtureId) {
     try {
-      const response =
-        await callApiFootball(
-          "/odds",
-          {
-            fixture: fixtureId,
-          }
-        );
+      const response = await callApiFootball("/odds", {
+        fixture: fixtureId,
+      });
 
-      return (
-        response?.data?.response ||
-        []
-      );
+      return response?.data?.response || [];
     } catch {
       return [];
     }
   }
 
-  function replacementPoolProbability(
-    features
-  ) {
-    const candidates =
-      features
-        .filter(
-          (item) =>
-            item.positionGroup ===
-              "ATTACKER" ||
-            item.positionGroup ===
-              "MIDFIELDER"
-        )
-        .filter(
-          (item) =>
-            item.appearances >= 2
-        )
-        .sort(
-          (a, b) =>
-            b.anytimeProbability -
-            a.anytimeProbability
-        )
-        .slice(0, 5);
+  async function getPlayersForTeam({
+    teamId,
+    season,
+    leagueId,
+  }) {
+    let fullSeason = [];
+    let competition = [];
 
-    if (
-      candidates.length === 0
-    ) {
-      return 9;
+    try {
+      fullSeason = await fetchPagedPlayers({
+        callApiFootball,
+        teamId,
+        season,
+      });
+    } catch {
+      fullSeason = [];
     }
 
-    return clamp(
-      candidates.reduce(
-        (sum, item) =>
-          sum +
-          item.anytimeProbability,
-        0
-      ) /
-        candidates.length *
-        0.45,
-      4,
-      22
-    );
+    try {
+      competition = await fetchPagedPlayers({
+        callApiFootball,
+        teamId,
+        season,
+        leagueId,
+      });
+    } catch {
+      competition = [];
+    }
+
+    return mergePlayerResponses(fullSeason, competition);
   }
 
   async function analyzeFixture({
@@ -1321,10 +1188,7 @@ function createGoalscorerEngine({
   }) {
     await ensureTables();
 
-    const context =
-      await getFixtureContext(
-        fixtureId
-      );
+    const context = await getFixtureContext(fixtureId);
 
     if (
       !context.leagueId ||
@@ -1332,9 +1196,7 @@ function createGoalscorerEngine({
       !context.homeTeamId ||
       !context.awayTeamId
     ) {
-      throw new Error(
-        "Contexte fixture incomplet pour Goalscorer."
-      );
+      throw new Error("Contexte fixture incomplet pour Goalscorer.");
     }
 
     const [
@@ -1346,78 +1208,47 @@ function createGoalscorerEngine({
       lineupMap,
       odds,
     ] = await Promise.all([
-      fetchPagedPlayers({
-        callApiFootball,
-        teamId:
-          context.homeTeamId,
-        leagueId:
-          context.leagueId,
-        season:
-          context.season,
+      getPlayersForTeam({
+        teamId: context.homeTeamId,
+        season: context.season,
+        leagueId: context.leagueId,
       }),
-
-      fetchPagedPlayers({
-        callApiFootball,
-        teamId:
-          context.awayTeamId,
-        leagueId:
-          context.leagueId,
-        season:
-          context.season,
+      getPlayersForTeam({
+        teamId: context.awayTeamId,
+        season: context.season,
+        leagueId: context.leagueId,
       }),
-
       getTeamStats({
-        leagueId:
-          context.leagueId,
-        season:
-          context.season,
-        teamId:
-          context.homeTeamId,
+        leagueId: context.leagueId,
+        season: context.season,
+        teamId: context.homeTeamId,
       }),
-
       getTeamStats({
-        leagueId:
-          context.leagueId,
-        season:
-          context.season,
-        teamId:
-          context.awayTeamId,
+        leagueId: context.leagueId,
+        season: context.season,
+        teamId: context.awayTeamId,
       }),
-
       getInjurySet({
-        leagueId:
-          context.leagueId,
-        season:
-          context.season,
-        fixtureId:
-          context.fixtureId,
+        leagueId: context.leagueId,
+        season: context.season,
+        fixtureId: context.fixtureId,
       }),
-
-      getLineupStateMap(
-        context.fixtureId
-      ),
-
-      getPrematchOdds(
-        context.fixtureId
-      ),
+      getLineupStateMap(context.fixtureId),
+      getPrematchOdds(context.fixtureId),
     ]);
 
     const teamContexts = [
       {
-        teamId:
-          context.homeTeamId,
-        opponentId:
-          context.awayTeamId,
+        teamId: context.homeTeamId,
+        opponentId: context.awayTeamId,
         homeAway: "HOME",
         players: homePlayers,
         teamStats: homeStats,
         opponentStats: awayStats,
       },
       {
-        teamId:
-          context.awayTeamId,
-        opponentId:
-          context.homeTeamId,
+        teamId: context.awayTeamId,
+        opponentId: context.homeTeamId,
         homeAway: "AWAY",
         players: awayPlayers,
         teamStats: awayStats,
@@ -1427,294 +1258,148 @@ function createGoalscorerEngine({
 
     const rows = [];
 
-    for (
-      const teamContext of
-        teamContexts
-    ) {
-      const ownSide =
-        teamContext.homeAway ===
-        "HOME"
-          ? "home"
-          : "away";
-
+    for (const teamContext of teamContexts) {
+      const ownSide = teamContext.homeAway === "HOME" ? "home" : "away";
       const opponentSide =
-        teamContext.homeAway ===
-        "HOME"
-          ? "away"
-          : "home";
+        teamContext.homeAway === "HOME" ? "away" : "home";
 
-      const teamAverage =
-        teamGoalAverage(
-          teamContext.teamStats,
-          ownSide
-        );
+      const teamAverage = teamGoalAverage(
+        teamContext.teamStats,
+        ownSide
+      );
 
-      const opponentConceded =
-        opponentConcededAverage(
-          teamContext.opponentStats,
-          opponentSide
-        );
+      const opponentConceded = opponentConcededAverage(
+        teamContext.opponentStats,
+        opponentSide
+      );
 
-      const teamExpected =
-        expectedTeamGoals({
-          teamStats:
-            teamContext.teamStats,
-          opponentStats:
-            teamContext
-              .opponentStats,
-          homeAway:
-            teamContext.homeAway,
-        });
+      const fallbackXg = fallbackExpectedTeamGoals({
+        teamStats: teamContext.teamStats,
+        opponentStats: teamContext.opponentStats,
+        homeAway: teamContext.homeAway,
+      });
 
-      /*
-       * Premier passage : profil buteur classique.
-       * Il sert aussi à estimer la profondeur offensive
-       * de l'équipe pour la garantie remplaçant.
-       */
-      const baseFeatures =
-        teamContext.players
-          .map(
-            (playerResponse) => {
-              const stat =
-                extractStatBlock(
-                  playerResponse,
-                  context.leagueId,
-                  teamContext.teamId
-                );
+      const brainXg = resolveBrainTeamXg({
+        dbRow: context.dbRow,
+        homeAway: teamContext.homeAway,
+        fallback: fallbackXg,
+      });
 
-              if (!stat) {
-                return null;
-              }
+      const profiles = teamContext.players
+        .map((playerResponse) => {
+          const playerId = Number(playerResponse?.player?.id);
+          if (!playerId) return null;
 
-              const position =
-                stat?.games
-                  ?.position ||
-                playerResponse?.player
-                  ?.position;
-
-              if (
-                positionGroup(
-                  position
-                ) ===
-                "GOALKEEPER"
-              ) {
-                return null;
-              }
-
-              const playerId =
-                Number(
-                  playerResponse
-                    ?.player?.id
-                );
-
-              return buildPlayerFeatures({
-                playerResponse,
-                stat,
-                teamExpectedGoals:
-                  teamExpected,
-                teamAverageGoals:
-                  teamAverage,
-                injured:
-                  injuries.has(
-                    playerId
-                  ),
-                lineupState:
-                  lineupMap.get(
-                    playerId
-                  ) ||
-                  "UNKNOWN",
-                marketType:
-                  MARKET_TYPES.ANYTIME,
-                replacementPoolProbability:
-                  9,
-              });
-            }
-          )
-          .filter(Boolean);
-
-      const poolProbability =
-        replacementPoolProbability(
-          baseFeatures
-        );
-
-      for (
-        const playerResponse of
-          teamContext.players
-      ) {
-        const stat =
-          extractStatBlock(
+          const profile = buildPlayerProfile({
             playerResponse,
-            context.leagueId,
-            teamContext.teamId
-          );
+            teamId: teamContext.teamId,
+            injured: injuries.has(playerId),
+            lineupState: lineupMap.get(playerId) || "UNKNOWN",
+          });
 
-        if (!stat) continue;
+          if (profile.positionGroup === "GOALKEEPER") return null;
 
-        const playerId =
-          Number(
-            playerResponse
-              ?.player?.id
-          );
+          /*
+           * Filtre souple : on garde les joueurs à faible sample
+           * mais ils seront shrinkés et leur dataQuality sera réduite.
+           */
+          if (profile.appearances < 1 && profile.minutes < 45) {
+            return null;
+          }
 
-        const position =
-          stat?.games?.position ||
-          playerResponse?.player
-            ?.position;
+          return {
+            ...profile,
+            rawPlayer: playerResponse,
+          };
+        })
+        .filter(Boolean);
 
-        if (
-          positionGroup(
-            position
-          ) ===
-          "GOALKEEPER"
-        ) {
-          continue;
-        }
+      const allocated = allocateTeamXg({
+        profiles,
+        teamExpectedGoals: brainXg.value,
+      });
 
-        /*
-         * Evite d'afficher tout l'effectif sans signal.
-         * Un joueur doit avoir au moins un minimum
-         * d'exposition saison.
-         */
-        const appearances =
-          numberOr(
-            stat?.games
-              ?.appearences ??
-            stat?.games
-              ?.appearances
-          );
+      for (const player of allocated) {
+        for (const marketType of marketTypes) {
+          let predictedProbability = player.anytimeProbability;
+          let guaranteeBoost = 0;
+          let conditionalReplacementProbability = 0;
 
-        const minutes =
-          numberOr(
-            stat?.games
-              ?.minutes
-          );
-
-        if (
-          appearances < 2 ||
-          minutes < 90
-        ) {
-          continue;
-        }
-
-        for (
-          const marketType of
-            marketTypes
-        ) {
-          const features =
-            buildPlayerFeatures({
-              playerResponse,
-              stat,
-              teamExpectedGoals:
-                teamExpected,
-              teamAverageGoals:
-                teamAverage,
-              injured:
-                injuries.has(
-                  playerId
-                ),
-              lineupState:
-                lineupMap.get(
-                  playerId
-                ) ||
-                "UNKNOWN",
-              marketType,
-              replacementPoolProbability:
-                poolProbability,
+          if (marketType === MARKET_TYPES.REPLACEMENT) {
+            const replacement = replacementCoverageProbability({
+              player,
+              teamProfiles: allocated,
             });
 
-          const bestOdd =
-            scanOddsForPlayer({
-              oddsResponse: odds,
-              playerName:
-                features.playerName,
-              marketType,
-            });
+            guaranteeBoost = replacement.boost;
+            conditionalReplacementProbability =
+              replacement.conditionalReplacementProbability;
 
-          const marketOdd =
-            bestOdd?.odd || null;
-
-          const implied =
-            impliedProbability(
-              marketOdd
+            predictedProbability = clamp(
+              100 -
+                ((100 - player.anytimeProbability) *
+                  (100 - guaranteeBoost)) /
+                  100,
+              player.anytimeProbability,
+              88
             );
+          }
+
+          const bestOdd = scanOddsForPlayer({
+            oddsResponse: odds,
+            playerName: player.playerName,
+            marketType,
+          });
+
+          const marketOdd = bestOdd?.odd || null;
+          const implied = impliedProbability(marketOdd);
 
           const valueEdge =
             implied == null
               ? null
-              : round(
-                  features
-                    .probability -
-                    implied,
-                  2
-                );
+              : round(predictedProbability - implied, 2);
 
-          const status =
-            scorerStatus({
-              probability:
-                features.probability,
-              dataQuality:
-                features.dataQuality,
-            });
+          const status = scorerStatus({
+            probability: predictedProbability,
+            dataQuality: player.dataQuality,
+            sampleReliability: player.sampleReliability,
+            anomalies: player.anomalies,
+          });
 
           const row = {
-            ...features,
-            fixtureId:
-              context.fixtureId,
-            fixtureDate:
-              context.fixtureDate,
-            leagueId:
-              context.leagueId,
-            leagueName:
-              context.leagueName,
-            season:
-              context.season,
-            teamId:
-              teamContext.teamId,
-            opponentId:
-              teamContext
-                .opponentId,
-            homeAway:
-              teamContext.homeAway,
+            fixtureId: context.fixtureId,
+            fixtureDate: context.fixtureDate,
+            leagueId: context.leagueId,
+            leagueName: context.leagueName,
+            season: context.season,
+
+            teamId: teamContext.teamId,
+            opponentId: teamContext.opponentId,
+            homeAway: teamContext.homeAway,
+
+            ...player,
+
+            teamExpectedGoals: round(brainXg.value, 4),
+            teamExpectedGoalsSource: brainXg.source,
+            teamAverageGoals: round(teamAverage, 4),
+            opponentConcededAverage: round(opponentConceded, 4),
 
             marketType,
             replacementGuarantee:
-              marketType ===
-              MARKET_TYPES.REPLACEMENT,
+              marketType === MARKET_TYPES.REPLACEMENT,
 
-            teamExpectedGoals:
-              round(
-                teamExpected,
-                4
-              ),
-            teamAverageGoals:
-              round(
-                teamAverage,
-                4
-              ),
-            opponentConcededAverage:
-              round(
-                opponentConceded,
-                4
-              ),
+            guaranteeBoost: round(guaranteeBoost, 2),
+            conditionalReplacementProbability,
+
+            probability: round(predictedProbability, 2),
+            fairOdd: fairOdd(predictedProbability),
 
             marketOdd,
-            oddSource:
-              bestOdd
-                ? "API_FOOTBALL"
-                : null,
-            bookmakerId:
-              bestOdd?.bookmakerId ||
-              null,
-            bookmakerName:
-              bestOdd
-                ?.bookmakerName ||
-              null,
-            apiBetId:
-              bestOdd?.betId ||
-              null,
-            apiBetName:
-              bestOdd?.betName ||
-              null,
+            oddSource: bestOdd ? "API_FOOTBALL_STRICT_MATCH" : null,
+            bookmakerId: bestOdd?.bookmakerId || null,
+            bookmakerName: bestOdd?.bookmakerName || null,
+            apiBetId: bestOdd?.betId || null,
+            apiBetName: bestOdd?.betName || null,
             valueEdge,
 
             scorerStatus: status,
@@ -1750,6 +1435,7 @@ function createGoalscorerEngine({
                   minutes,
                   goals,
                   goals_per90,
+                  posterior_goals_per90,
                   shots,
                   shots_per90,
                   shots_on_target,
@@ -1759,6 +1445,8 @@ function createGoalscorerEngine({
                   team_expected_goals,
                   team_average_goals,
                   opponent_conceded_average,
+                  xg_source,
+                  allocation_share,
 
                   anytime_probability,
                   guarantee_boost,
@@ -1774,6 +1462,8 @@ function createGoalscorerEngine({
                   value_edge,
 
                   data_quality,
+                  sample_reliability,
+                  anomaly_flags,
                   scorer_status,
 
                   injured,
@@ -1783,28 +1473,23 @@ function createGoalscorerEngine({
                   model_inputs,
                   raw_player,
 
+                  result_status,
                   analyzed_at,
                   updated_at
                 )
                 VALUES (
-                  $1, $2, $3, $4,
-                  $5, $6, $7,
-                  $8, $9, $10, $11,
-                  $12, $13,
-                  $14, $15,
-                  $16, $17, $18,
-                  $19, $20, $21,
-                  $22, $23, $24,
-                  $25,
-                  $26, $27, $28,
-                  $29, $30, $31, $32,
-                  $33, $34, $35,
-                  $36, $37, $38, $39,
-                  $40, $41,
-                  $42, $43,
-                  $44, $45::jsonb,
-                  $46::jsonb,
-                  NOW(), NOW()
+                  $1,$2,$3,$4,$5,$6,$7,
+                  $8,$9,$10,$11,$12,$13,
+                  $14,$15,$16,$17,$18,$19,$20,$21,
+                  $22,$23,$24,$25,$26,
+                  $27,$28,$29,$30,$31,
+                  $32,$33,$34,$35,
+                  $36,$37,$38,$39,$40,$41,$42,
+                  $43,$44,$45::jsonb,$46,
+                  $47,$48,
+                  $49,$50::jsonb,$51::jsonb,
+                  'PENDING',
+                  NOW(),NOW()
                 )
                 ON CONFLICT (
                   fixture_id,
@@ -1812,142 +1497,72 @@ function createGoalscorerEngine({
                   market_type
                 )
                 DO UPDATE SET
-                  fixture_date =
-                    EXCLUDED.fixture_date,
-                  league_id =
-                    EXCLUDED.league_id,
-                  season =
-                    EXCLUDED.season,
-                  team_id =
-                    EXCLUDED.team_id,
-                  opponent_id =
-                    EXCLUDED.opponent_id,
-                  home_away =
-                    EXCLUDED.home_away,
+                  fixture_date = EXCLUDED.fixture_date,
+                  league_id = EXCLUDED.league_id,
+                  season = EXCLUDED.season,
+                  team_id = EXCLUDED.team_id,
+                  opponent_id = EXCLUDED.opponent_id,
+                  home_away = EXCLUDED.home_away,
 
-                  player_name =
-                    EXCLUDED.player_name,
-                  position =
-                    EXCLUDED.position,
-                  position_group =
-                    EXCLUDED.position_group,
+                  player_name = EXCLUDED.player_name,
+                  position = EXCLUDED.position,
+                  position_group = EXCLUDED.position_group,
 
-                  replacement_guarantee =
-                    EXCLUDED.replacement_guarantee,
+                  replacement_guarantee = EXCLUDED.replacement_guarantee,
 
-                  starter_probability =
-                    EXCLUDED.starter_probability,
-                  expected_minutes =
-                    EXCLUDED.expected_minutes,
+                  starter_probability = EXCLUDED.starter_probability,
+                  expected_minutes = EXCLUDED.expected_minutes,
 
-                  appearances =
-                    EXCLUDED.appearances,
-                  starts =
-                    EXCLUDED.starts,
-                  minutes =
-                    EXCLUDED.minutes,
-                  goals =
-                    EXCLUDED.goals,
-                  goals_per90 =
-                    EXCLUDED.goals_per90,
-                  shots =
-                    EXCLUDED.shots,
-                  shots_per90 =
-                    EXCLUDED.shots_per90,
-                  shots_on_target =
-                    EXCLUDED.shots_on_target,
-                  shots_on_target_per90 =
-                    EXCLUDED.shots_on_target_per90,
-                  penalty_goals =
-                    EXCLUDED.penalty_goals,
+                  appearances = EXCLUDED.appearances,
+                  starts = EXCLUDED.starts,
+                  minutes = EXCLUDED.minutes,
+                  goals = EXCLUDED.goals,
+                  goals_per90 = EXCLUDED.goals_per90,
+                  posterior_goals_per90 = EXCLUDED.posterior_goals_per90,
+                  shots = EXCLUDED.shots,
+                  shots_per90 = EXCLUDED.shots_per90,
+                  shots_on_target = EXCLUDED.shots_on_target,
+                  shots_on_target_per90 = EXCLUDED.shots_on_target_per90,
+                  penalty_goals = EXCLUDED.penalty_goals,
 
-                  team_expected_goals =
-                    EXCLUDED.team_expected_goals,
-                  team_average_goals =
-                    EXCLUDED.team_average_goals,
-                  opponent_conceded_average =
-                    EXCLUDED.opponent_conceded_average,
+                  team_expected_goals = EXCLUDED.team_expected_goals,
+                  team_average_goals = EXCLUDED.team_average_goals,
+                  opponent_conceded_average = EXCLUDED.opponent_conceded_average,
+                  xg_source = EXCLUDED.xg_source,
+                  allocation_share = EXCLUDED.allocation_share,
 
-                  anytime_probability =
-                    EXCLUDED.anytime_probability,
-                  guarantee_boost =
-                    EXCLUDED.guarantee_boost,
-                  predicted_probability =
-                    EXCLUDED.predicted_probability,
-                  fair_odd =
-                    EXCLUDED.fair_odd,
+                  anytime_probability = EXCLUDED.anytime_probability,
+                  guarantee_boost = EXCLUDED.guarantee_boost,
+                  predicted_probability = EXCLUDED.predicted_probability,
+                  fair_odd = EXCLUDED.fair_odd,
 
-                  market_odd =
-                    COALESCE(
-                      EXCLUDED.market_odd,
-                      goalscorer_predictions.market_odd
-                    ),
-                  odd_source =
-                    COALESCE(
-                      EXCLUDED.odd_source,
-                      goalscorer_predictions.odd_source
-                    ),
-                  bookmaker_id =
-                    COALESCE(
-                      EXCLUDED.bookmaker_id,
-                      goalscorer_predictions.bookmaker_id
-                    ),
-                  bookmaker_name =
-                    COALESCE(
-                      EXCLUDED.bookmaker_name,
-                      goalscorer_predictions.bookmaker_name
-                    ),
-                  api_bet_id =
-                    COALESCE(
-                      EXCLUDED.api_bet_id,
-                      goalscorer_predictions.api_bet_id
-                    ),
-                  api_bet_name =
-                    COALESCE(
-                      EXCLUDED.api_bet_name,
-                      goalscorer_predictions.api_bet_name
-                    ),
-                  value_edge =
+                  market_odd = EXCLUDED.market_odd,
+                  odd_source = EXCLUDED.odd_source,
+                  bookmaker_id = EXCLUDED.bookmaker_id,
+                  bookmaker_name = EXCLUDED.bookmaker_name,
+                  api_bet_id = EXCLUDED.api_bet_id,
+                  api_bet_name = EXCLUDED.api_bet_name,
+                  value_edge = EXCLUDED.value_edge,
+
+                  data_quality = EXCLUDED.data_quality,
+                  sample_reliability = EXCLUDED.sample_reliability,
+                  anomaly_flags = EXCLUDED.anomaly_flags,
+                  scorer_status = EXCLUDED.scorer_status,
+
+                  injured = EXCLUDED.injured,
+                  lineup_state = EXCLUDED.lineup_state,
+
+                  model_version = EXCLUDED.model_version,
+                  model_inputs = EXCLUDED.model_inputs,
+                  raw_player = EXCLUDED.raw_player,
+
+                  result_status =
                     CASE
-                      WHEN COALESCE(
-                        EXCLUDED.market_odd,
-                        goalscorer_predictions.market_odd
-                      ) > 1
-                      THEN
-                        EXCLUDED.predicted_probability -
-                        (
-                          100 /
-                          COALESCE(
-                            EXCLUDED.market_odd,
-                            goalscorer_predictions.market_odd
-                          )
-                        )
-                      ELSE NULL
+                      WHEN goalscorer_predictions.model_version <> EXCLUDED.model_version
+                      THEN 'PENDING'
+                      ELSE goalscorer_predictions.result_status
                     END,
-
-                  data_quality =
-                    EXCLUDED.data_quality,
-                  scorer_status =
-                    EXCLUDED.scorer_status,
-
-                  injured =
-                    EXCLUDED.injured,
-                  lineup_state =
-                    EXCLUDED.lineup_state,
-
-                  model_version =
-                    EXCLUDED.model_version,
-                  model_inputs =
-                    EXCLUDED.model_inputs,
-                  raw_player =
-                    EXCLUDED.raw_player,
-
-                  analyzed_at = NOW(),
                   updated_at = NOW()
-
-                WHERE
-                  goalscorer_predictions.result_status =
-                    'PENDING'
               `,
               [
                 row.fixtureId,
@@ -1974,6 +1589,7 @@ function createGoalscorerEngine({
                 row.minutes,
                 row.goals,
                 row.goalsPer90,
+                row.posteriorGoalsPer90,
                 row.shots,
                 row.shotsPer90,
                 row.shotsOnTarget,
@@ -1983,6 +1599,8 @@ function createGoalscorerEngine({
                 row.teamExpectedGoals,
                 row.teamAverageGoals,
                 row.opponentConcededAverage,
+                row.teamExpectedGoalsSource,
+                row.allocationShare,
 
                 row.anytimeProbability,
                 row.guaranteeBoost,
@@ -1998,6 +1616,8 @@ function createGoalscorerEngine({
                 row.valueEdge,
 
                 row.dataQuality,
+                row.sampleReliability,
+                safeJson(row.anomalies),
                 row.scorerStatus,
 
                 row.injured,
@@ -2005,14 +1625,14 @@ function createGoalscorerEngine({
 
                 GOALSCORER_VERSION,
                 safeJson({
-                  replacementPoolProbability:
-                    poolProbability,
-                  formula:
-                    "Poisson goal-rate x minutes x team/opponent adjustment x shots x penalties",
+                  shrinkagePriorMinutes: SHRINKAGE_PRIOR_MINUTES,
+                  xgSource: row.teamExpectedGoalsSource,
+                  conditionalReplacementProbability:
+                    row.conditionalReplacementProbability,
+                  strictMarketMatching: true,
+                  teamLambdaConstraint: true,
                 }),
-                safeJson(
-                  playerResponse
-                ),
+                safeJson(row.rawPlayer),
               ]
             );
           }
@@ -2020,278 +1640,184 @@ function createGoalscorerEngine({
       }
     }
 
+    const teamChecks = {};
+
+    for (const side of ["HOME", "AWAY"]) {
+      const anytimeRows = rows.filter(
+        (row) =>
+          row.homeAway === side &&
+          row.marketType === MARKET_TYPES.ANYTIME
+      );
+
+      teamChecks[side] = {
+        expectedGoals:
+          anytimeRows[0]?.teamExpectedGoals ?? null,
+        allocatedLambda: round(
+          anytimeRows.reduce(
+            (sum, row) => sum + numberOr(row.rawLambda),
+            0
+          ),
+          4
+        ),
+        players: anytimeRows.length,
+      };
+    }
+
     return {
       ok: true,
-      version:
-        GOALSCORER_VERSION,
+      version: GOALSCORER_VERSION,
       fixture: context,
       count: rows.length,
-      rows: rows.sort(
-        (a, b) =>
-          b.probability -
-          a.probability
-      ),
-      generatedAt:
-        new Date().toISOString(),
+      teamChecks,
+      rows: rows.sort((a, b) => b.probability - a.probability),
+      generatedAt: new Date().toISOString(),
     };
   }
 
-  async function getFixturePredictions(
-    fixtureId
-  ) {
+  async function getFixturePredictions(fixtureId) {
     await ensureTables();
 
-    const result =
-      await pool.query(
-        `
-          SELECT *
-          FROM goalscorer_predictions
-          WHERE fixture_id = $1
-          ORDER BY
-            market_type ASC,
-            predicted_probability DESC,
-            player_name ASC
-        `,
-        [fixtureId]
-      );
+    const result = await pool.query(
+      `
+        SELECT *
+        FROM goalscorer_predictions
+        WHERE fixture_id = $1
+          AND model_version = $2
+        ORDER BY
+          market_type ASC,
+          predicted_probability DESC,
+          player_name ASC
+      `,
+      [fixtureId, GOALSCORER_VERSION]
+    );
 
     return {
       ok: true,
-      version:
-        GOALSCORER_VERSION,
-      count:
-        result.rows.length,
-      rows:
-        result.rows,
-      generatedAt:
-        new Date().toISOString(),
+      version: GOALSCORER_VERSION,
+      count: result.rows.length,
+      rows: result.rows,
+      generatedAt: new Date().toISOString(),
     };
   }
 
-  async function settleFixture(
-    fixtureId
-  ) {
+  async function settleFixture(fixtureId) {
     await ensureTables();
 
-    const context =
-      await getFixtureContext(
-        fixtureId
-      );
+    const context = await getFixtureContext(fixtureId);
+    const status = normalizeToken(context.status);
 
     if (
-      !FINISHED_STATUSES.has(
-        normalizeToken(
-          context.status
-        )
-      ) &&
-      !(
-        context.homeGoals !== null &&
-        context.awayGoals !== null
-      )
+      !FINISHED_90.has(status) &&
+      !FINISHED_EXTRA.has(status) &&
+      !(context.homeGoals !== null && context.awayGoals !== null)
     ) {
       return {
         ok: true,
         fixtureId,
         skipped: true,
-        reason:
-          "MATCH_NOT_FINISHED",
+        reason: "MATCH_NOT_FINISHED",
       };
     }
 
-    const [
-      playersResponse,
-      eventsResponse,
-    ] = await Promise.all([
-      callApiFootball(
-        "/fixtures/players",
-        {
-          fixture: fixtureId,
-        }
-      ),
-      callApiFootball(
-        "/fixtures/events",
-        {
-          fixture: fixtureId,
-        }
-      ),
+    const [playersResponse, eventsResponse] = await Promise.all([
+      callApiFootball("/fixtures/players", { fixture: fixtureId }),
+      callApiFootball("/fixtures/events", { fixture: fixtureId }),
     ]);
 
-    const playerGoals =
-      new Map();
+    const playerGoals = new Map();
 
-    for (
-      const team of
-        playersResponse?.data
-          ?.response || []
-    ) {
-      for (
-        const item of
-          team?.players || []
-      ) {
-        const id =
-          Number(
-            item?.player?.id
-          );
-
+    for (const team of playersResponse?.data?.response || []) {
+      for (const item of team?.players || []) {
+        const id = Number(item?.player?.id);
         let goals = 0;
 
-        for (
-          const stat of
-            item?.statistics || []
-        ) {
-          goals +=
-            numberOr(
-              stat?.goals?.total
-            );
+        for (const stat of item?.statistics || []) {
+          goals += numberOr(stat?.goals?.total);
         }
 
         if (id) {
-          playerGoals.set(
-            id,
-            {
-              goals,
-              name:
-                item?.player
-                  ?.name || null,
-            }
-          );
+          playerGoals.set(id, {
+            goals,
+            name: item?.player?.name || null,
+          });
         }
       }
     }
 
-    const substitutionByOut =
-      new Map();
+    const substitutionByOut = new Map();
 
-    for (
-      const event of
-        eventsResponse?.data
-          ?.response || []
-    ) {
-      if (
-        normalizeToken(
-          event?.type
-        ) !== "SUBST"
-      ) {
-        continue;
-      }
+    for (const event of eventsResponse?.data?.response || []) {
+      if (normalizeToken(event?.type) !== "SUBST") continue;
 
-      const outId =
-        Number(
-          event?.player?.id
-        );
-
-      const inId =
-        Number(
-          event?.assist?.id
-        );
+      const outId = Number(event?.player?.id);
+      const inId = Number(event?.assist?.id);
 
       if (outId && inId) {
-        substitutionByOut.set(
-          outId,
-          {
-            playerId: inId,
-            playerName:
-              event?.assist
-                ?.name || null,
-          }
-        );
+        substitutionByOut.set(outId, {
+          playerId: inId,
+          playerName: event?.assist?.name || null,
+        });
       }
     }
 
-    const pending =
-      await pool.query(
-        `
-          SELECT *
-          FROM goalscorer_predictions
-          WHERE fixture_id = $1
-            AND result_status =
-              'PENDING'
-        `,
-        [fixtureId]
-      );
+    const pending = await pool.query(
+      `
+        SELECT *
+        FROM goalscorer_predictions
+        WHERE fixture_id = $1
+          AND model_version = $2
+          AND result_status = 'PENDING'
+      `,
+      [fixtureId, GOALSCORER_VERSION]
+    );
 
     let settled = 0;
     let review = 0;
 
-    for (
-      const row of
-        pending.rows
-    ) {
-      const playerResult =
-        playerGoals.get(
-          Number(row.player_id)
-        );
+    for (const row of pending.rows) {
+      const playerResult = playerGoals.get(Number(row.player_id));
+      const ownGoals = numberOr(playerResult?.goals);
+      const scored = ownGoals > 0;
 
-      const ownGoals =
-        numberOr(
-          playerResult?.goals
-        );
+      let replacement = null;
+      let replacementScored = false;
+      let resultStatus = "SETTLED";
+      let settlementNote = null;
 
-      const scored =
-        ownGoals > 0;
-
-      let replacement =
-        null;
-      let replacementScored =
-        false;
+      /*
+       * AET/PEN : on refuse de supposer les règles bookmaker.
+       * Le marché buteur peut être limité aux 90 minutes.
+       */
+      if (FINISHED_EXTRA.has(status)) {
+        resultStatus = "REVIEW";
+        settlementNote =
+          "Match prolongé / tirs au but : règle bookmaker requise pour le périmètre temporel du marché buteur.";
+      }
 
       if (
+        resultStatus === "SETTLED" &&
         row.replacement_guarantee
       ) {
         replacement =
-          substitutionByOut.get(
-            Number(row.player_id)
-          ) || null;
+          substitutionByOut.get(Number(row.player_id)) || null;
 
         if (replacement) {
           replacementScored =
             numberOr(
-              playerGoals.get(
-                Number(
-                  replacement.playerId
-                )
-              )?.goals
+              playerGoals.get(Number(replacement.playerId))?.goals
             ) > 0;
+        } else if (!scored) {
+          resultStatus = "REVIEW";
+          settlementNote =
+            "Garantie remplaçant : aucune chaîne de substitution sortante vérifiable. Validation bookmaker requise.";
         }
       }
 
-      let resultStatus =
-        "SETTLED";
-
-      let settlementNote =
-        null;
-
-      if (
-        row.replacement_guarantee &&
-        !scored &&
-        !replacement
-      ) {
-        /*
-         * Le bookmaker peut avoir sa propre règle
-         * si le joueur ne commence pas ou n'est jamais
-         * remplacé. On refuse d'inventer.
-         */
-        resultStatus =
-          "REVIEW";
-
-        settlementNote =
-          "Garantie remplaçant non résolue automatiquement : aucune substitution sortante identifiable pour le joueur.";
-      }
-
-      const won =
-        scored ||
-        replacementScored;
-
-      const odd =
-        numberOrNull(
-          row.market_odd
-        );
+      const won = scored || replacementScored;
+      const odd = numberOrNull(row.market_odd);
 
       const profit =
-        resultStatus ===
-          "SETTLED" &&
-        odd &&
-        odd > 1
+        resultStatus === "SETTLED" && odd && odd > 1
           ? won
             ? odd - 1
             : -1
@@ -2309,15 +1835,7 @@ function createGoalscorerEngine({
             replacement_scored = $7,
             settlement_note = $8,
             profit_units = $9,
-            settled_at =
-              CASE
-                WHEN $2 IN (
-                  'SETTLED',
-                  'REVIEW'
-                )
-                THEN NOW()
-                ELSE settled_at
-              END,
+            settled_at = NOW(),
             updated_at = NOW()
           WHERE id = $1
         `,
@@ -2326,268 +1844,177 @@ function createGoalscorerEngine({
           resultStatus,
           won,
           ownGoals,
-          replacement
-            ?.playerId || null,
-          replacement
-            ?.playerName || null,
+          replacement?.playerId || null,
+          replacement?.playerName || null,
           replacementScored,
           settlementNote,
           profit,
         ]
       );
 
-      if (
-        resultStatus ===
-        "SETTLED"
-      ) {
-        settled += 1;
-      } else {
-        review += 1;
-      }
+      if (resultStatus === "SETTLED") settled += 1;
+      else review += 1;
     }
 
     return {
       ok: true,
       fixtureId,
-      found:
-        pending.rows.length,
+      found: pending.rows.length,
       settled,
       review,
-      generatedAt:
-        new Date().toISOString(),
+      generatedAt: new Date().toISOString(),
     };
   }
 
   async function settleFinished() {
     await ensureTables();
 
-    const result =
-      await pool.query(
-        `
-          SELECT DISTINCT
-            g.fixture_id
-          FROM goalscorer_predictions g
-          JOIN predictions p
-            ON p.fixture_id =
-              g.fixture_id
-          WHERE
-            g.result_status =
-              'PENDING'
-            AND (
-              p.result_status =
-                'COMPLETED'
-              OR (
-                p.home_goals IS NOT NULL
-                AND
-                p.away_goals IS NOT NULL
-              )
+    const result = await pool.query(
+      `
+        SELECT DISTINCT g.fixture_id
+        FROM goalscorer_predictions g
+        JOIN predictions p
+          ON p.fixture_id = g.fixture_id
+        WHERE
+          g.model_version = $1
+          AND g.result_status = 'PENDING'
+          AND (
+            p.result_status = 'COMPLETED'
+            OR (
+              p.home_goals IS NOT NULL
+              AND p.away_goals IS NOT NULL
             )
-          ORDER BY
-            g.fixture_id ASC
-          LIMIT 100
-        `
-      );
+          )
+        ORDER BY g.fixture_id ASC
+        LIMIT 100
+      `,
+      [GOALSCORER_VERSION]
+    );
 
     let settled = 0;
     let review = 0;
     const errors = [];
 
-    for (
-      const row of
-        result.rows
-    ) {
+    for (const row of result.rows) {
       try {
-        const response =
-          await settleFixture(
-            row.fixture_id
-          );
-
-        settled +=
-          numberOr(
-            response.settled
-          );
-
-        review +=
-          numberOr(
-            response.review
-          );
+        const response = await settleFixture(row.fixture_id);
+        settled += numberOr(response.settled);
+        review += numberOr(response.review);
       } catch (error) {
         errors.push({
-          fixtureId:
-            row.fixture_id,
-          error:
-            error?.message ||
-            String(error),
+          fixtureId: row.fixture_id,
+          error: error?.message || String(error),
         });
       }
     }
 
     return {
-      ok:
-        errors.length === 0,
-      fixtures:
-        result.rows.length,
+      ok: errors.length === 0,
+      fixtures: result.rows.length,
       settled,
       review,
       errors,
-      generatedAt:
-        new Date().toISOString(),
+      generatedAt: new Date().toISOString(),
     };
   }
 
   async function rebuildLearning() {
     await ensureTables();
 
-    const result =
-      await pool.query(
-        `
-          SELECT
-            market_type,
-            CASE
-              WHEN predicted_probability < 10
-                THEN '00_10'
-              WHEN predicted_probability < 20
-                THEN '10_20'
-              WHEN predicted_probability < 30
-                THEN '20_30'
-              WHEN predicted_probability < 40
-                THEN '30_40'
-              WHEN predicted_probability < 50
-                THEN '40_50'
-              ELSE '50_PLUS'
-            END AS probability_bucket,
+    const result = await pool.query(
+      `
+        SELECT
+          market_type,
+          CASE
+            WHEN predicted_probability < 10 THEN '00_10'
+            WHEN predicted_probability < 20 THEN '10_20'
+            WHEN predicted_probability < 30 THEN '20_30'
+            WHEN predicted_probability < 40 THEN '30_40'
+            WHEN predicted_probability < 50 THEN '40_50'
+            ELSE '50_PLUS'
+          END AS probability_bucket,
 
-            COALESCE(
-              NULLIF(
-                position_group,
-                ''
-              ),
-              'UNKNOWN'
-            ) AS position_group,
+          COALESCE(NULLIF(position_group, ''), 'UNKNOWN')
+            AS position_group,
 
-            COUNT(*)::INTEGER
-              AS sample_size,
+          COUNT(*)::INTEGER AS sample_size,
 
+          COUNT(*) FILTER (
+            WHERE scored = TRUE
+          )::INTEGER AS wins,
+
+          COUNT(*) FILTER (
+            WHERE scored = FALSE
+          )::INTEGER AS losses,
+
+          AVG(predicted_probability)::NUMERIC
+            AS average_predicted_probability,
+
+          (
             COUNT(*) FILTER (
               WHERE scored = TRUE
-            )::INTEGER
-              AS wins,
+            )::NUMERIC /
+            NULLIF(COUNT(*), 0)
+          ) * 100
+            AS actual_score_rate,
 
-            COUNT(*) FILTER (
-              WHERE scored = FALSE
-            )::INTEGER
-              AS losses,
-
-            AVG(
-              predicted_probability
-            )::NUMERIC
-              AS average_predicted_probability,
-
-            (
-              COUNT(*) FILTER (
-                WHERE scored = TRUE
-              )::NUMERIC /
-              NULLIF(
-                COUNT(*),
-                0
-              )
-            ) * 100
-              AS actual_score_rate,
-
-            AVG(
-              POWER(
-                (
-                  predicted_probability /
-                  100.0
-                ) -
-                CASE
-                  WHEN scored = TRUE
-                    THEN 1.0
-                  ELSE 0.0
-                END,
-                2
-              )
-            )::NUMERIC
-              AS brier_score,
-
-            COUNT(*) FILTER (
-              WHERE market_odd > 1
-                AND profit_units
-                  IS NOT NULL
-            )::INTEGER
-              AS bets_with_odds,
-
-            COALESCE(
-              SUM(
-                profit_units
-              ) FILTER (
-                WHERE market_odd > 1
-              ),
-              0
-            )::NUMERIC
-              AS profit_units
-
-          FROM goalscorer_predictions
-          WHERE result_status =
-            'SETTLED'
-            AND scored IS NOT NULL
-
-          GROUP BY
-            market_type,
-            probability_bucket,
-            position_group
-
-          ORDER BY
-            market_type,
-            probability_bucket,
-            position_group
-        `
-      );
-
-    for (
-      const row of
-        result.rows
-    ) {
-      const sample =
-        numberOr(
-          row.sample_size
-        );
-
-      const predicted =
-        numberOr(
-          row
-            .average_predicted_probability
-        );
-
-      const actual =
-        numberOr(
-          row.actual_score_rate
-        );
-
-      const gap =
-        round(
-          predicted - actual,
-          4
-        );
-
-      const bets =
-        numberOr(
-          row.bets_with_odds
-        );
-
-      const profit =
-        numberOr(
-          row.profit_units
-        );
-
-      const roi =
-        bets > 0
-          ? round(
-              (profit / bets) *
-                100,
-              4
+          AVG(
+            POWER(
+              (predicted_probability / 100.0) -
+              CASE
+                WHEN scored = TRUE THEN 1.0
+                ELSE 0.0
+              END,
+              2
             )
-          : null;
+          )::NUMERIC AS brier_score,
+
+          COUNT(*) FILTER (
+            WHERE market_odd > 1
+              AND profit_units IS NOT NULL
+          )::INTEGER AS bets_with_odds,
+
+          COALESCE(
+            SUM(profit_units) FILTER (
+              WHERE market_odd > 1
+            ),
+            0
+          )::NUMERIC AS profit_units
+
+        FROM goalscorer_predictions
+        WHERE
+          model_version = $1
+          AND result_status = 'SETTLED'
+          AND scored IS NOT NULL
+
+        GROUP BY
+          market_type,
+          probability_bucket,
+          position_group
+
+        ORDER BY
+          market_type,
+          probability_bucket,
+          position_group
+      `,
+      [GOALSCORER_VERSION]
+    );
+
+    await pool.query(`
+      DELETE FROM goalscorer_learning_stats
+      WHERE learning_version = 'goalscorer-engine-v2.0.0';
+    `);
+
+    for (const row of result.rows) {
+      const sample = numberOr(row.sample_size);
+      const predicted = numberOr(row.average_predicted_probability);
+      const actual = numberOr(row.actual_score_rate);
+      const gap = round(predicted - actual, 4);
+
+      const bets = numberOr(row.bets_with_odds);
+      const profit = numberOr(row.profit_units);
+      const roi =
+        bets > 0 ? round((profit / bets) * 100, 4) : null;
 
       const reliability =
         sample >= 300
@@ -2604,87 +2031,40 @@ function createGoalscorerEngine({
             market_type,
             probability_bucket,
             position_group,
-
             sample_size,
             wins,
             losses,
-
             average_predicted_probability,
             actual_score_rate,
             calibration_gap,
             brier_score,
-
             bets_with_odds,
             profit_units,
             roi_percentage,
-
             reliability_level,
             learning_version,
-
             calculated_at,
             updated_at
           )
           VALUES (
-            $1, $2, $3,
-            $4, $5, $6,
-            $7, $8, $9, $10,
-            $11, $12, $13,
-            $14, $15,
-            NOW(), NOW()
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,NOW(),NOW()
           )
-          ON CONFLICT (
-            market_type,
-            probability_bucket,
-            position_group
-          )
-          DO UPDATE SET
-            sample_size =
-              EXCLUDED.sample_size,
-            wins =
-              EXCLUDED.wins,
-            losses =
-              EXCLUDED.losses,
-            average_predicted_probability =
-              EXCLUDED.average_predicted_probability,
-            actual_score_rate =
-              EXCLUDED.actual_score_rate,
-            calibration_gap =
-              EXCLUDED.calibration_gap,
-            brier_score =
-              EXCLUDED.brier_score,
-            bets_with_odds =
-              EXCLUDED.bets_with_odds,
-            profit_units =
-              EXCLUDED.profit_units,
-            roi_percentage =
-              EXCLUDED.roi_percentage,
-            reliability_level =
-              EXCLUDED.reliability_level,
-            learning_version =
-              EXCLUDED.learning_version,
-            calculated_at = NOW(),
-            updated_at = NOW()
         `,
         [
           row.market_type,
           row.probability_bucket,
           row.position_group,
-
           sample,
           numberOr(row.wins),
           numberOr(row.losses),
-
           predicted,
           actual,
           gap,
-          numberOrNull(
-            row.brier_score
-          ),
-
+          numberOrNull(row.brier_score),
           bets,
           profit,
           roi,
-
           reliability,
           GOALSCORER_VERSION,
         ]
@@ -2693,202 +2073,132 @@ function createGoalscorerEngine({
 
     return {
       ok: true,
-      groups:
-        result.rows.length,
-      version:
-        GOALSCORER_VERSION,
-      generatedAt:
-        new Date().toISOString(),
+      groups: result.rows.length,
+      version: GOALSCORER_VERSION,
+      generatedAt: new Date().toISOString(),
     };
   }
 
   async function analyzeUpcoming({
     hours = 36,
-    limit = 20,
+    limit = 12,
   } = {}) {
     await ensureTables();
 
-    const safeHours =
-      clamp(hours, 6, 168);
+    const safeHours = clamp(hours, 6, 168);
+    const safeLimit = Math.floor(clamp(limit, 1, 30));
 
-    const safeLimit =
-      Math.floor(
-        clamp(limit, 1, 50)
-      );
-
-    const result =
-      await pool.query(
-        `
-          SELECT
-            p.fixture_id
-          FROM predictions p
-          WHERE
-            p.fixture_date >
-              NOW()
-            AND
-            p.fixture_date <
-              NOW() +
-              ($1 || ' hours')::interval
-            AND p.home_team_id
-              IS NOT NULL
-            AND p.away_team_id
-              IS NOT NULL
-            AND (
-              NOT EXISTS (
-                SELECT 1
-                FROM
-                  goalscorer_predictions g
-                WHERE
-                  g.fixture_id =
-                    p.fixture_id
-              )
-              OR EXISTS (
-                SELECT 1
-                FROM
-                  goalscorer_predictions g
-                WHERE
-                  g.fixture_id =
-                    p.fixture_id
-                  AND
-                  g.result_status =
-                    'PENDING'
-                  AND
-                  g.analyzed_at <
-                    NOW() -
-                    INTERVAL '6 hours'
-              )
-            )
-          ORDER BY
-            p.fixture_date ASC
-          LIMIT $2
-        `,
-        [
-          String(safeHours),
-          safeLimit,
-        ]
-      );
+    const result = await pool.query(
+      `
+        SELECT p.fixture_id
+        FROM predictions p
+        WHERE
+          p.fixture_date > NOW()
+          AND p.fixture_date <
+            NOW() + ($1 || ' hours')::interval
+          AND p.home_team_id IS NOT NULL
+          AND p.away_team_id IS NOT NULL
+        ORDER BY p.fixture_date ASC
+        LIMIT $2
+      `,
+      [String(safeHours), safeLimit]
+    );
 
     let analyzed = 0;
     const errors = [];
 
-    for (
-      const row of
-        result.rows
-    ) {
+    for (const row of result.rows) {
       try {
         await analyzeFixture({
-          fixtureId:
-            Number(
-              row.fixture_id
-            ),
+          fixtureId: Number(row.fixture_id),
           persist: true,
         });
-
         analyzed += 1;
       } catch (error) {
         errors.push({
-          fixtureId:
-            row.fixture_id,
-          error:
-            error?.message ||
-            String(error),
+          fixtureId: row.fixture_id,
+          error: error?.message || String(error),
         });
       }
     }
 
     return {
-      ok:
-        errors.length === 0,
-      found:
-        result.rows.length,
+      ok: errors.length === 0,
+      found: result.rows.length,
       analyzed,
-      errors:
-        errors.slice(0, 20),
-      generatedAt:
-        new Date().toISOString(),
+      errors: errors.slice(0, 20),
+      generatedAt: new Date().toISOString(),
     };
   }
 
   async function getStatus() {
     await ensureTables();
 
-    const [
-      predictions,
-      pending,
-      settled,
-      review,
-      learning,
-    ] = await Promise.all([
-      pool.query(`
-        SELECT COUNT(*)::INTEGER
-          AS count
-        FROM goalscorer_predictions
-      `),
-      pool.query(`
-        SELECT COUNT(*)::INTEGER
-          AS count
-        FROM goalscorer_predictions
-        WHERE result_status =
-          'PENDING'
-      `),
-      pool.query(`
-        SELECT COUNT(*)::INTEGER
-          AS count
-        FROM goalscorer_predictions
-        WHERE result_status =
-          'SETTLED'
-      `),
-      pool.query(`
-        SELECT COUNT(*)::INTEGER
-          AS count
-        FROM goalscorer_predictions
-        WHERE result_status =
-          'REVIEW'
-      `),
-      pool.query(`
-        SELECT COUNT(*)::INTEGER
-          AS count
-        FROM goalscorer_learning_stats
-      `),
-    ]);
+    const [predictions, pending, settled, review, learning] =
+      await Promise.all([
+        pool.query(
+          `
+            SELECT COUNT(*)::INTEGER AS count
+            FROM goalscorer_predictions
+            WHERE model_version = $1
+          `,
+          [GOALSCORER_VERSION]
+        ),
+        pool.query(
+          `
+            SELECT COUNT(*)::INTEGER AS count
+            FROM goalscorer_predictions
+            WHERE model_version = $1
+              AND result_status = 'PENDING'
+          `,
+          [GOALSCORER_VERSION]
+        ),
+        pool.query(
+          `
+            SELECT COUNT(*)::INTEGER AS count
+            FROM goalscorer_predictions
+            WHERE model_version = $1
+              AND result_status = 'SETTLED'
+          `,
+          [GOALSCORER_VERSION]
+        ),
+        pool.query(
+          `
+            SELECT COUNT(*)::INTEGER AS count
+            FROM goalscorer_predictions
+            WHERE model_version = $1
+              AND result_status = 'REVIEW'
+          `,
+          [GOALSCORER_VERSION]
+        ),
+        pool.query(
+          `
+            SELECT COUNT(*)::INTEGER AS count
+            FROM goalscorer_learning_stats
+            WHERE learning_version = $1
+          `,
+          [GOALSCORER_VERSION]
+        ),
+      ]);
 
     return {
       ok: true,
-      version:
-        GOALSCORER_VERSION,
-      markets:
-        MARKET_TYPES,
-      predictions:
-        numberOr(
-          predictions.rows[0]
-            ?.count
-        ),
-      pending:
-        numberOr(
-          pending.rows[0]
-            ?.count
-        ),
-      settled:
-        numberOr(
-          settled.rows[0]
-            ?.count
-        ),
-      review:
-        numberOr(
-          review.rows[0]
-            ?.count
-        ),
-      learningGroups:
-        numberOr(
-          learning.rows[0]
-            ?.count
-        ),
-      scheduler:
-        Boolean(
-          schedulersEnabled
-        ),
-      generatedAt:
-        new Date().toISOString(),
+      version: GOALSCORER_VERSION,
+      markets: MARKET_TYPES,
+      predictions: numberOr(predictions.rows[0]?.count),
+      pending: numberOr(pending.rows[0]?.count),
+      settled: numberOr(settled.rows[0]?.count),
+      review: numberOr(review.rows[0]?.count),
+      learningGroups: numberOr(learning.rows[0]?.count),
+      scheduler: Boolean(schedulersEnabled),
+      architecture: {
+        xgAnchor: "BRAIN_STUDIO_FIRST",
+        shrinkagePriorMinutes: SHRINKAGE_PRIOR_MINUTES,
+        strictMarketMatching: true,
+        dataValidation: true,
+        teamLambdaConstraint: true,
+      },
+      generatedAt: new Date().toISOString(),
     };
   }
 
@@ -2898,18 +2208,12 @@ function createGoalscorerEngine({
       ...guards,
       async (req, res) => {
         try {
-          return res.json(
-            await getStatus()
-          );
+          return res.json(await getStatus());
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
@@ -2919,42 +2223,22 @@ function createGoalscorerEngine({
       ...guards,
       async (req, res) => {
         try {
-          const fixtureId =
-            Number(
-              req.params.fixtureId
-            );
+          const fixtureId = Number(req.params.fixtureId);
 
-          if (
-            !Number.isInteger(
-              fixtureId
-            ) ||
-            fixtureId <= 0
-          ) {
-            return res
-              .status(400)
-              .json({
-                ok: false,
-                error:
-                  "fixtureId invalide",
-              });
+          if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+            return res.status(400).json({
+              ok: false,
+              error: "fixtureId invalide",
+            });
           }
 
-          const market =
-            normalizeToken(
-              req.body?.market
-            );
+          const market = normalizeToken(req.body?.market);
 
           const marketTypes =
-            market ===
-            MARKET_TYPES.ANYTIME
-              ? [
-                  MARKET_TYPES.ANYTIME,
-                ]
-              : market ===
-                  MARKET_TYPES.REPLACEMENT
-                ? [
-                    MARKET_TYPES.REPLACEMENT,
-                  ]
+            market === MARKET_TYPES.ANYTIME
+              ? [MARKET_TYPES.ANYTIME]
+              : market === MARKET_TYPES.REPLACEMENT
+                ? [MARKET_TYPES.REPLACEMENT]
                 : [
                     MARKET_TYPES.ANYTIME,
                     MARKET_TYPES.REPLACEMENT,
@@ -2968,14 +2252,10 @@ function createGoalscorerEngine({
             })
           );
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
@@ -2987,23 +2267,15 @@ function createGoalscorerEngine({
         try {
           return res.json(
             await analyzeUpcoming({
-              hours:
-                req.body?.hours ??
-                36,
-              limit:
-                req.body?.limit ??
-                20,
+              hours: req.body?.hours ?? 36,
+              limit: req.body?.limit ?? 12,
             })
           );
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
@@ -3015,21 +2287,14 @@ function createGoalscorerEngine({
         try {
           return res.json(
             await getFixturePredictions(
-              Number(
-                req.params
-                  .fixtureId
-              )
+              Number(req.params.fixtureId)
             )
           );
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
@@ -3041,85 +2306,55 @@ function createGoalscorerEngine({
         try {
           await ensureTables();
 
-          const id =
-            Number(
-              req.params.id
-            );
+          const id = Number(req.params.id);
+          const odd = numberOrNull(req.body?.odd);
 
-          const odd =
-            numberOrNull(
-              req.body?.odd
-            );
-
-          if (
-            !Number.isInteger(id) ||
-            id <= 0 ||
-            !odd ||
-            odd <= 1
-          ) {
-            return res
-              .status(400)
-              .json({
-                ok: false,
-                error:
-                  "id ou cote invalide",
-              });
+          if (!Number.isInteger(id) || id <= 0 || !odd || odd <= 1) {
+            return res.status(400).json({
+              ok: false,
+              error: "id ou cote invalide",
+            });
           }
 
-          const result =
-            await pool.query(
-              `
-                UPDATE goalscorer_predictions
-                SET
-                  market_odd = $2,
-                  odd_source = $3,
-                  bookmaker_name = $4,
-                  value_edge =
-                    predicted_probability -
-                    (100 / $2),
-                  updated_at = NOW()
-                WHERE id = $1
-                RETURNING *
-              `,
-              [
-                id,
-                odd,
-                String(
-                  req.body?.source ||
-                  "MANUAL"
-                ),
-                req.body
-                  ?.bookmakerName ||
-                null,
-              ]
-            );
+          const result = await pool.query(
+            `
+              UPDATE goalscorer_predictions
+              SET
+                market_odd = $2,
+                odd_source = $3,
+                bookmaker_name = $4,
+                value_edge =
+                  predicted_probability - (100 / $2),
+                updated_at = NOW()
+              WHERE id = $1
+                AND model_version = $5
+              RETURNING *
+            `,
+            [
+              id,
+              odd,
+              String(req.body?.source || "MANUAL"),
+              req.body?.bookmakerName || null,
+              GOALSCORER_VERSION,
+            ]
+          );
 
-          if (
-            result.rows.length === 0
-          ) {
-            return res
-              .status(404)
-              .json({
-                ok: false,
-                error:
-                  "Prédiction buteur introuvable",
-              });
+          if (result.rows.length === 0) {
+            return res.status(404).json({
+              ok: false,
+              error: "Prédiction buteur V2 introuvable",
+            });
           }
 
           return res.json({
             ok: true,
-            prediction:
-              result.rows[0],
+            prediction: result.rows[0],
           });
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
@@ -3129,18 +2364,12 @@ function createGoalscorerEngine({
       ...guards,
       async (req, res) => {
         try {
-          return res.json(
-            await settleFinished()
-          );
+          return res.json(await settleFinished());
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
@@ -3150,18 +2379,12 @@ function createGoalscorerEngine({
       ...guards,
       async (req, res) => {
         try {
-          return res.json(
-            await rebuildLearning()
-          );
+          return res.json(await rebuildLearning());
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
@@ -3173,100 +2396,84 @@ function createGoalscorerEngine({
         try {
           await ensureTables();
 
-          const result =
-            await pool.query(`
+          const result = await pool.query(
+            `
               SELECT *
               FROM goalscorer_learning_stats
+              WHERE learning_version = $1
               ORDER BY
                 market_type,
                 probability_bucket,
                 position_group
-            `);
+            `,
+            [GOALSCORER_VERSION]
+          );
 
           return res.json({
             ok: true,
-            version:
-              GOALSCORER_VERSION,
-            count:
-              result.rows.length,
-            stats:
-              result.rows,
-            generatedAt:
-              new Date()
-                .toISOString(),
+            version: GOALSCORER_VERSION,
+            count: result.rows.length,
+            stats: result.rows,
+            generatedAt: new Date().toISOString(),
           });
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
 
-    /*
-     * Diagnostic officiel des types de paris réellement
-     * proposés par API-Football. Aucun bet-id "buteur"
-     * n'est hardcodé.
-     */
     app.get(
       "/internal/goalscorer/api-bets",
       ...guards,
       async (req, res) => {
         try {
-          const search =
-            String(
-              req.query.search ||
-              "scor"
-            )
-              .trim()
-              .slice(0, 40);
+          const search = String(req.query.search || "scor")
+            .trim()
+            .slice(0, 40);
 
-          const response =
-            await callApiFootball(
-              "/odds/bets",
-              {
-                search:
-                  search.length >= 3
-                    ? search
-                    : "scor",
-              }
-            );
+          const response = await callApiFootball(
+            "/odds/bets",
+            {
+              search: search.length >= 3 ? search : "scor",
+            }
+          );
+
+          const rows = response?.data?.response || [];
 
           return res.json({
             ok: true,
             search,
-            response:
-              response?.data
-                ?.response || [],
+            response: rows,
+            classified: rows.map((bet) => ({
+              id: bet?.id ?? null,
+              name: bet?.name ?? null,
+              anytime: exactMarketNameMatch(
+                bet?.name,
+                MARKET_TYPES.ANYTIME
+              ),
+              replacement: exactMarketNameMatch(
+                bet?.name,
+                MARKET_TYPES.REPLACEMENT
+              ),
+            })),
             note:
-              "Cette route sert à vérifier la couverture réelle des props buteur de votre compte API-Football avant d'automatiser les cotes.",
+              "V2 n'utilise une cote que si son intitulé correspond strictement au marché.",
           });
         } catch (error) {
-          return res
-            .status(500)
-            .json({
-              ok: false,
-              error:
-                error?.message ||
-                String(error),
-            });
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
         }
       }
     );
   }
 
   async function schedulerTick() {
-    if (
-      !schedulersEnabled ||
-      schedulerRunning
-    ) {
-      return;
-    }
+    if (!schedulersEnabled || schedulerRunning) return;
 
     schedulerRunning = true;
 
@@ -3277,13 +2484,11 @@ function createGoalscorerEngine({
       });
 
       await settleFinished();
-
       await rebuildLearning();
     } catch (error) {
       console.error(
-        "GOALSCORER SCHEDULER :",
-        error?.message ||
-          error
+        "GOALSCORER V2 SCHEDULER :",
+        error?.message || error
       );
     } finally {
       schedulerRunning = false;
@@ -3291,37 +2496,18 @@ function createGoalscorerEngine({
   }
 
   function startScheduler() {
-    if (
-      !schedulersEnabled ||
-      schedulerTimer
-    ) {
-      return;
-    }
+    if (!schedulersEnabled || schedulerTimer) return;
 
-    /*
-     * Premier passage 3 min après démarrage,
-     * puis toutes les 6 heures.
-     */
-    setTimeout(
-      () =>
-        schedulerTick(),
-      3 * 60 * 1000
+    setTimeout(() => schedulerTick(), 3 * 60 * 1000);
+
+    schedulerTimer = setInterval(
+      schedulerTick,
+      6 * 60 * 60 * 1000
     );
-
-    schedulerTimer =
-      setInterval(
-        schedulerTick,
-        6 * 60 * 60 * 1000
-      );
   }
 
   function stopScheduler() {
-    if (schedulerTimer) {
-      clearInterval(
-        schedulerTimer
-      );
-    }
-
+    if (schedulerTimer) clearInterval(schedulerTimer);
     schedulerTimer = null;
   }
 
@@ -3335,8 +2521,7 @@ function createGoalscorerEngine({
     settleFinished,
     rebuildLearning,
     getStatus,
-    version:
-      GOALSCORER_VERSION,
+    version: GOALSCORER_VERSION,
   };
 }
 

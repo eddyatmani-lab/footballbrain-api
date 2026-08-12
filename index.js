@@ -340,16 +340,15 @@ async function callApiFootball(
 
 /*
  * ============================================================
- * GOALSCORER ENGINE V1
+ * GOALSCORER ENGINE V2
  * ============================================================
  *
  * Marchés :
  * - ANYTIME_GOALSCORER
  * - SCORER_OR_REPLACEMENT
  *
- * La garantie remplaçant est modélisée avant composition,
- * mais le settlement reste conservateur si la règle bookmaker
- * ne peut pas être résolue avec les événements du match.
+ * V2 ancre les probabilités joueurs sur les xG Brain Studio,
+ * applique du shrinkage et valide strictement les marchés de cotes.
  */
 const goalscorerEngine =
   createGoalscorerEngine({
