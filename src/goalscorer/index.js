@@ -16,7 +16,7 @@
  */
 
 const GOALSCORER_VERSION =
-  "goalscorer-engine-v2.2.0-raw-odds-diagnostics";
+  "goalscorer-engine-v2.3.0-recommendation";
 
 const MARKET_TYPES = Object.freeze({
   ANYTIME: "ANYTIME_GOALSCORER",
@@ -462,37 +462,75 @@ function buildPlayerProfile({
   };
 }
 
-function scorerStatus({
+function buildRecommendation({
   probability,
   dataQuality,
   sampleReliability,
   anomalies,
+  expectedMinutes,
+  starterProbability,
+  injured,
+  lineupState,
 }) {
-  const p = numberOr(probability);
-  const quality = numberOr(dataQuality);
+  const p = clamp(probability, 0, 100);
+  const quality = clamp(dataQuality, 0, 100);
+  const minutes = clamp(expectedMinutes, 0, 90);
+  const starter = clamp(starterProbability, 0, 100);
   const anomalyCount = Array.isArray(anomalies) ? anomalies.length : 0;
 
-  if (quality < 45 || anomalyCount >= 2) {
-    return "REJECTED";
-  }
+  const reliabilityScore =
+    sampleReliability === "HIGH" ? 100 :
+    sampleReliability === "MEDIUM" ? 70 : 35;
 
+  let score =
+    clamp((p / 50) * 100, 0, 100) * 0.40 +
+    clamp((minutes / 90) * 100, 0, 100) * 0.20 +
+    starter * 0.15 +
+    quality * 0.15 +
+    reliabilityScore * 0.10;
+
+  if (lineupState === "STARTER") score += 3;
+  if (lineupState === "SUBSTITUTE") score -= 8;
+  if (injured) score -= 25;
+  score -= anomalyCount * 8;
+  score = round(clamp(score, 0, 100), 1);
+
+  const reasons = [];
+  if (p >= 38) reasons.push("HIGH_GOAL_PROBABILITY");
+  else if (p >= 28) reasons.push("GOOD_GOAL_PROBABILITY");
+  else if (p >= 17) reasons.push("WATCH_GOAL_PROBABILITY");
+  else reasons.push("LOW_GOAL_PROBABILITY");
+  if (minutes >= 75) reasons.push("HIGH_EXPECTED_MINUTES");
+  else if (minutes < 50) reasons.push("LOW_EXPECTED_MINUTES");
+  if (starter >= 75) reasons.push("LIKELY_STARTER");
+  else if (starter < 55) reasons.push("STARTER_UNCERTAINTY");
+  if (quality >= 75) reasons.push("HIGH_DATA_QUALITY");
+  else if (quality < 60) reasons.push("LIMITED_DATA_QUALITY");
+  if (sampleReliability === "HIGH") reasons.push("RELIABLE_SAMPLE");
+  else if (sampleReliability === "LOW") reasons.push("LOW_SAMPLE_RELIABILITY");
+  if (anomalyCount > 0) reasons.push("DATA_ANOMALY");
+  if (injured) reasons.push("INJURY_FLAG");
+
+  let tier = "REJECTED";
   if (
-    p >= 38 &&
-    quality >= 72 &&
+    !injured && anomalyCount < 2 && score >= 80 && p >= 38 &&
+    quality >= 75 && minutes >= 65 && starter >= 75 &&
     sampleReliability !== "LOW"
-  ) {
-    return "GOALSCORER_PLUS";
-  }
+  ) tier = "TOP_SCORER";
+  else if (
+    !injured && anomalyCount < 2 && score >= 65 && p >= 28 &&
+    quality >= 60 && minutes >= 50 && starter >= 55
+  ) tier = "RECOMMENDED";
+  else if (
+    !injured && anomalyCount < 2 && score >= 45 && p >= 17 &&
+    quality >= 45
+  ) tier = "WATCH";
 
-  if (p >= 27 && quality >= 60) {
-    return "GOALSCORER";
-  }
+  return { score, tier, reasons };
+}
 
-  if (p >= 17) {
-    return "WATCH";
-  }
-
-  return "REJECTED";
+function scorerStatus(input) {
+  return buildRecommendation(input).tier;
 }
 
 function teamGoalAverage(stats, side) {
@@ -1025,6 +1063,21 @@ function createGoalscorerEngine({
       `);
 
       await pool.query(`
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS recommendation_score NUMERIC(8,3);
+      `);
+
+      await pool.query(`
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS recommendation_tier TEXT;
+      `);
+
+      await pool.query(`
+        ALTER TABLE goalscorer_predictions
+        ADD COLUMN IF NOT EXISTS recommendation_reasons JSONB;
+      `);
+
+      await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_goalscorer_predictions_fixture
         ON goalscorer_predictions (fixture_id);
       `);
@@ -1084,7 +1137,7 @@ function createGoalscorerEngine({
 
       await pool.query(`
         DELETE FROM goalscorer_learning_stats
-        WHERE learning_version <> 'goalscorer-engine-v2.2.0-raw-odds-diagnostics';
+        WHERE learning_version <> 'goalscorer-engine-v2.3.0-recommendation';
       `);
 
       tablesReady = true;
@@ -1453,12 +1506,18 @@ function createGoalscorerEngine({
               ? null
               : round(predictedProbability - implied, 2);
 
-          const status = scorerStatus({
+          const recommendation = buildRecommendation({
             probability: predictedProbability,
             dataQuality: player.dataQuality,
             sampleReliability: player.sampleReliability,
             anomalies: player.anomalies,
+            expectedMinutes: player.expectedMinutes,
+            starterProbability: player.starterProbability,
+            injured: player.injured,
+            lineupState: player.lineupState,
           });
+
+          const status = recommendation.tier;
 
           const row = {
             fixtureId: context.fixtureId,
@@ -1497,6 +1556,9 @@ function createGoalscorerEngine({
             valueEdge,
 
             scorerStatus: status,
+            recommendationScore: recommendation.score,
+            recommendationTier: recommendation.tier,
+            recommendationReasons: recommendation.reasons,
           };
 
           rows.push(row);
@@ -1725,8 +1787,31 @@ function createGoalscorerEngine({
                     row.conditionalReplacementProbability,
                   strictMarketMatching: true,
                   teamLambdaConstraint: true,
+                  recommendationVersion: "V2.3",
                 }),
                 safeJson(row.rawPlayer),
+              ]
+            );
+
+            await pool.query(
+              `
+                UPDATE goalscorer_predictions
+                SET
+                  recommendation_score = $4,
+                  recommendation_tier = $5,
+                  recommendation_reasons = $6::jsonb,
+                  updated_at = NOW()
+                WHERE fixture_id = $1
+                  AND player_id = $2
+                  AND market_type = $3
+              `,
+              [
+                row.fixtureId,
+                row.playerId,
+                row.marketType,
+                row.recommendationScore,
+                row.recommendationTier,
+                safeJson(row.recommendationReasons),
               ]
             );
           }
@@ -2096,7 +2181,7 @@ function createGoalscorerEngine({
 
     await pool.query(`
       DELETE FROM goalscorer_learning_stats
-      WHERE learning_version = 'goalscorer-engine-v2.2.0-raw-odds-diagnostics';
+      WHERE learning_version = 'goalscorer-engine-v2.3.0-recommendation';
     `);
 
     for (const row of result.rows) {
@@ -2291,6 +2376,8 @@ function createGoalscorerEngine({
         strictMarketMatching: true,
         dataValidation: true,
         teamLambdaConstraint: true,
+        recommendationEngine: true,
+        recommendationTiers: ["TOP_SCORER", "RECOMMENDED", "WATCH", "REJECTED"],
       },
       generatedAt: new Date().toISOString(),
     };
