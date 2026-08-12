@@ -10,7 +10,7 @@ const {
 } = require("./LearningConfig");
 
 const RECOMMENDATION_VERSION =
-  "engine-weight-recommendations-v1.6-probability-integrity";
+  "engine-weight-recommendations-v1.6.1-null-quality-fix";
 
 /*
  * Poids de référence uniquement destinés aux recommandations.
@@ -473,6 +473,16 @@ function createEngineWeightRecommendationService({
       ADD COLUMN IF NOT EXISTS
         eligible_for_global_weight BOOLEAN
         NOT NULL DEFAULT FALSE;
+    `);
+
+    /*
+     * V1.6.1
+     * NULL = qualité probabiliste non calculable faute de vraie probabilité.
+     * Ce n'est pas un score de 0 et ne doit surtout pas être traité comme tel.
+     */
+    await pool.query(`
+      ALTER TABLE engine_weight_recommendations
+      ALTER COLUMN quality_score DROP NOT NULL;
     `);
   }
 
