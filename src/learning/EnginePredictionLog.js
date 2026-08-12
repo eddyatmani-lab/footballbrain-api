@@ -4,6 +4,8 @@ const {
   ENGINE_LEARNING_VERSION,
   LEARNING_MODE,
   SUPPORTED_ENGINES,
+  ENGINE_ROLES,
+  ENGINE_ROLE_BY_NAME,
 } = require("./LearningConfig");
 
 function numberOrNull(value) {
@@ -143,6 +145,101 @@ function scoreOf(raw = {}) {
   );
 }
 
+
+function fatigueContextSignal(raw = {}) {
+  const source =
+    raw?.raw && typeof raw.raw === "object"
+      ? raw.raw
+      : raw;
+
+  const inputs =
+    source?.inputs && typeof source.inputs === "object"
+      ? source.inputs
+      : raw?.inputs && typeof raw.inputs === "object"
+        ? raw.inputs
+        : {};
+
+  const homePenalty = numberOrNull(
+    firstDefined(
+      inputs.homePenalty,
+      source.homePenalty,
+      raw.homePenalty
+    )
+  );
+
+  const awayPenalty = numberOrNull(
+    firstDefined(
+      inputs.awayPenalty,
+      source.awayPenalty,
+      raw.awayPenalty
+    )
+  );
+
+  const homeRestDays = numberOrNull(
+    firstDefined(
+      inputs.homeRestDays,
+      source.homeRestDays,
+      raw.homeRestDays
+    )
+  );
+
+  const awayRestDays = numberOrNull(
+    firstDefined(
+      inputs.awayRestDays,
+      source.awayRestDays,
+      raw.awayRestDays
+    )
+  );
+
+  if (
+    homePenalty === null &&
+    awayPenalty === null &&
+    homeRestDays === null &&
+    awayRestDays === null
+  ) {
+    return null;
+  }
+
+  const penaltyDifference =
+    homePenalty !== null && awayPenalty !== null
+      ? homePenalty - awayPenalty
+      : null;
+
+  const restDifference =
+    homeRestDays !== null && awayRestDays !== null
+      ? homeRestDays - awayRestDays
+      : null;
+
+  let bucket = "UNKNOWN";
+
+  if (penaltyDifference !== null) {
+    if (penaltyDifference <= -2) bucket = "HOME_FRESHER";
+    else if (penaltyDifference === -1) bucket = "SLIGHT_HOME_FRESHER";
+    else if (penaltyDifference === 0) bucket = "BALANCED";
+    else if (penaltyDifference === 1) bucket = "SLIGHT_AWAY_FRESHER";
+    else if (penaltyDifference >= 2) bucket = "AWAY_FRESHER";
+  }
+
+  return {
+    type: "FATIGUE_DIFFERENTIAL",
+    homePenalty,
+    awayPenalty,
+    penaltyDifference,
+    homeRestDays,
+    awayRestDays,
+    restDifference,
+    bucket,
+  };
+}
+
+function roleForEngine(engineName) {
+  return (
+    ENGINE_ROLE_BY_NAME?.[engineName] ||
+    ENGINE_ROLES.DIRECTIONAL
+  );
+}
+
+
 function collectEngineCandidates(snapshot = {}) {
   const learningRoot =
     snapshot?.engineLearning &&
@@ -264,11 +361,22 @@ function collectEngineCandidates(snapshot = {}) {
 
   const candidates = [];
 
-  const push = (engineName, side, predictedProbability, rawOutput, engineScore = null) => {
+  const push = (
+    engineName,
+    side,
+    predictedProbability,
+    rawOutput,
+    engineScore = null,
+    options = {}
+  ) => {
     const normalizedSide = normalizeSide(side) || "NEUTRAL";
+    const role =
+      options.role ||
+      roleForEngine(engineName);
 
     candidates.push({
       engineName,
+      role,
       side: normalizedSide,
       marketKey: normalizedSide === "NEUTRAL" ? null : normalizedSide,
       predictedProbability: clamp(predictedProbability),
@@ -278,6 +386,8 @@ function collectEngineCandidates(snapshot = {}) {
           rawOutput?.confidenceScore ??
           rawOutput?.reliability
       ),
+      contextSignal:
+        options.contextSignal || null,
       rawOutput: rawOutput || {},
     });
   };
@@ -377,16 +487,15 @@ function collectEngineCandidates(snapshot = {}) {
 
   push(
     "FatigueEngine",
-    voteFor("FatigueEngine") ||
-      explicitSideFromOutput(fatigue) ||
-      sideFromPair(
-        fatigue.awayFatigueImpact,
-        fatigue.homeFatigueImpact,
-        1
-      ),
+    "NEUTRAL",
     null,
     fatigue,
-    scoreOf(fatigue)
+    scoreOf(fatigue),
+    {
+      role: ENGINE_ROLES.CONTEXTUAL,
+      contextSignal:
+        fatigueContextSignal(fatigue),
+    }
   );
 
   push(
@@ -548,6 +657,8 @@ function createEnginePredictionLog({ pool }) {
         engine_name TEXT NOT NULL,
         engine_version TEXT NOT NULL,
         learning_mode TEXT NOT NULL DEFAULT 'SHADOW',
+        engine_role TEXT NOT NULL DEFAULT 'DIRECTIONAL',
+        context_signal JSONB,
 
         analysis_version TEXT,
         market_key TEXT,
@@ -572,6 +683,60 @@ function createEnginePredictionLog({ pool }) {
           analysis_version
         )
       );
+    `);
+
+    await pool.query(`
+      ALTER TABLE engine_prediction_logs
+      ADD COLUMN IF NOT EXISTS engine_role TEXT
+        NOT NULL DEFAULT 'DIRECTIONAL';
+    `);
+
+    await pool.query(`
+      ALTER TABLE engine_prediction_logs
+      ADD COLUMN IF NOT EXISTS context_signal JSONB;
+    `);
+
+    await pool.query(`
+      UPDATE engine_prediction_logs
+      SET
+        engine_role = 'CONTEXTUAL',
+        context_signal = jsonb_build_object(
+          'type', 'FATIGUE_DIFFERENTIAL',
+          'homePenalty',
+            CASE
+              WHEN raw_output->'inputs'->>'homePenalty' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN (raw_output->'inputs'->>'homePenalty')::numeric
+              ELSE NULL
+            END,
+          'awayPenalty',
+            CASE
+              WHEN raw_output->'inputs'->>'awayPenalty' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN (raw_output->'inputs'->>'awayPenalty')::numeric
+              ELSE NULL
+            END,
+          'penaltyDifference',
+            CASE
+              WHEN raw_output->'inputs'->>'homePenalty' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               AND raw_output->'inputs'->>'awayPenalty' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN
+                (raw_output->'inputs'->>'homePenalty')::numeric -
+                (raw_output->'inputs'->>'awayPenalty')::numeric
+              ELSE NULL
+            END,
+          'homeRestDays',
+            CASE
+              WHEN raw_output->'inputs'->>'homeRestDays' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN (raw_output->'inputs'->>'homeRestDays')::numeric
+              ELSE NULL
+            END,
+          'awayRestDays',
+            CASE
+              WHEN raw_output->'inputs'->>'awayRestDays' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN (raw_output->'inputs'->>'awayRestDays')::numeric
+              ELSE NULL
+            END
+        )
+      WHERE engine_name = 'FatigueEngine';
     `);
 
     await pool.query(`
@@ -646,6 +811,8 @@ function createEnginePredictionLog({ pool }) {
             engine_name,
             engine_version,
             learning_mode,
+            engine_role,
+            context_signal,
             analysis_version,
             market_key,
             predicted_side,
@@ -662,9 +829,10 @@ function createEnginePredictionLog({ pool }) {
           )
           VALUES (
             $1, $2, $3, $4, $5,
-            $6, $7, $8, $9, $10,
-            $11, $12, $13, $14,
-            $15::jsonb,
+            $6::jsonb, $7, $8, $9,
+            $10, $11, $12, $13,
+            $14, $15, $16,
+            $17::jsonb,
             NOW(), NOW()
           )
           ON CONFLICT (
@@ -675,6 +843,8 @@ function createEnginePredictionLog({ pool }) {
           )
           DO UPDATE SET
             learning_mode = EXCLUDED.learning_mode,
+            engine_role = EXCLUDED.engine_role,
+            context_signal = EXCLUDED.context_signal,
             market_key = EXCLUDED.market_key,
             predicted_side = EXCLUDED.predicted_side,
             predicted_probability = EXCLUDED.predicted_probability,
@@ -692,6 +862,10 @@ function createEnginePredictionLog({ pool }) {
           candidate.engineName,
           engineVersion,
           LEARNING_MODE,
+          candidate.role || roleForEngine(candidate.engineName),
+          candidate.contextSignal
+            ? JSON.stringify(candidate.contextSignal)
+            : null,
           normalizedAnalysisVersion,
           candidate.marketKey,
           candidate.side,

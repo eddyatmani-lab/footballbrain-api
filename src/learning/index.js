@@ -150,6 +150,7 @@ function createEngineLearningCore({
             stats,
             pending,
             ignored,
+            contextualSettled,
             latestRuns,
           ] = await Promise.all([
             pool.query(
@@ -188,6 +189,11 @@ function createEngineLearningCore({
               WHERE settlement_status = 'IGNORED'
             `),
             pool.query(`
+              SELECT COUNT(*)::INTEGER AS count
+              FROM engine_prediction_settlements
+              WHERE settlement_status = 'CONTEXT_SETTLED'
+            `),
+            pool.query(`
               SELECT DISTINCT ON (run_type)
                 run_type,
                 status,
@@ -222,6 +228,9 @@ function createEngineLearningCore({
             ignoredSettlements: Number(
               ignored.rows[0]?.count || 0
             ),
+            contextualSettlements: Number(
+              contextualSettled.rows[0]?.count || 0
+            ),
             performanceGroups: Number(
               stats.rows[0]?.count || 0
             ),
@@ -249,6 +258,7 @@ function createEngineLearningCore({
             pool.query(`
               SELECT
                 log.engine_name,
+                MAX(log.engine_role) AS engine_role,
                 COUNT(*)::INTEGER AS logs,
                 COUNT(*) FILTER (
                   WHERE UPPER(COALESCE(log.predicted_side, '')) = 'NEUTRAL'
@@ -263,7 +273,10 @@ function createEngineLearningCore({
                 )::INTEGER AS settled,
                 COUNT(settlement.id) FILTER (
                   WHERE settlement.settlement_status = 'IGNORED'
-                )::INTEGER AS ignored
+                )::INTEGER AS ignored,
+                COUNT(settlement.id) FILTER (
+                  WHERE settlement.settlement_status = 'CONTEXT_SETTLED'
+                )::INTEGER AS context_settled
               FROM engine_prediction_logs log
               LEFT JOIN engine_prediction_settlements settlement
                 ON settlement.prediction_log_id = log.id
@@ -305,6 +318,33 @@ function createEngineLearningCore({
           return res.status(500).json({
             ok: false,
             error: error?.message || String(error),
+          });
+        }
+      })
+    );
+
+    app.get(
+      "/internal/learning/engines/contextual-performance",
+      ...withAdminGuard(async (req, res) => {
+        try {
+          await ensureTables();
+
+          const performance =
+            await performanceService
+              .getContextualPerformance();
+
+          return res.json({
+            ...performance,
+            readOnly: true,
+            note:
+              "FatigueEngine est évalué comme signal contextuel. Aucun HOME/AWAY artificiel n'est créé et aucun ajustement de probabilité n'est appliqué tant que l'échantillon n'est pas suffisant.",
+          });
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error:
+              error?.message ||
+              String(error),
           });
         }
       })

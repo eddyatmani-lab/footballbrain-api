@@ -79,6 +79,45 @@ function createEnginePerformanceService({ pool }) {
     `);
 
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS engine_contextual_performance_stats (
+        id BIGSERIAL PRIMARY KEY,
+        engine_name TEXT NOT NULL,
+        signal_type TEXT NOT NULL,
+        signal_bucket TEXT NOT NULL,
+
+        sample_size INTEGER NOT NULL DEFAULT 0,
+        home_wins INTEGER NOT NULL DEFAULT 0,
+        draws INTEGER NOT NULL DEFAULT 0,
+        away_wins INTEGER NOT NULL DEFAULT 0,
+
+        home_win_rate NUMERIC(10, 4),
+        draw_rate NUMERIC(10, 4),
+        away_win_rate NUMERIC(10, 4),
+        average_goal_difference NUMERIC(10, 4),
+
+        baseline_home_win_rate NUMERIC(10, 4),
+        baseline_draw_rate NUMERIC(10, 4),
+        baseline_away_win_rate NUMERIC(10, 4),
+
+        home_win_lift NUMERIC(10, 4),
+        draw_lift NUMERIC(10, 4),
+        away_win_lift NUMERIC(10, 4),
+
+        reliability_level TEXT NOT NULL,
+        learning_version TEXT NOT NULL,
+
+        calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        UNIQUE (
+          engine_name,
+          signal_type,
+          signal_bucket
+        )
+      );
+    `);
+
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS engine_learning_runs (
         id BIGSERIAL PRIMARY KEY,
         run_type TEXT NOT NULL,
@@ -90,6 +129,237 @@ function createEnginePerformanceService({ pool }) {
         finished_at TIMESTAMPTZ
       );
     `);
+  }
+
+  async function rebuildContextualPerformance() {
+    const baselineResult = await pool.query(`
+      SELECT
+        COUNT(*)::INTEGER AS sample_size,
+        COUNT(*) FILTER (
+          WHERE p.home_goals > p.away_goals
+        )::INTEGER AS home_wins,
+        COUNT(*) FILTER (
+          WHERE p.home_goals = p.away_goals
+        )::INTEGER AS draws,
+        COUNT(*) FILTER (
+          WHERE p.away_goals > p.home_goals
+        )::INTEGER AS away_wins
+      FROM engine_prediction_logs log
+      JOIN predictions p
+        ON p.fixture_id = log.fixture_id
+      WHERE log.engine_name = 'FatigueEngine'
+        AND log.engine_role = 'CONTEXTUAL'
+        AND p.result_status = 'COMPLETED'
+        AND p.home_goals IS NOT NULL
+        AND p.away_goals IS NOT NULL
+        AND log.context_signal IS NOT NULL
+    `);
+
+    const baseline = baselineResult.rows[0] || {};
+    const baselineSample =
+      Number(baseline.sample_size) || 0;
+
+    const baselineHome =
+      baselineSample > 0
+        ? (Number(baseline.home_wins || 0) / baselineSample) * 100
+        : 0;
+    const baselineDraw =
+      baselineSample > 0
+        ? (Number(baseline.draws || 0) / baselineSample) * 100
+        : 0;
+    const baselineAway =
+      baselineSample > 0
+        ? (Number(baseline.away_wins || 0) / baselineSample) * 100
+        : 0;
+
+    const result = await pool.query(`
+      SELECT
+        COALESCE(
+          NULLIF(log.context_signal->>'bucket', ''),
+          CASE
+            WHEN (log.context_signal->>'penaltyDifference')::numeric <= -2
+              THEN 'HOME_FRESHER'
+            WHEN (log.context_signal->>'penaltyDifference')::numeric = -1
+              THEN 'SLIGHT_HOME_FRESHER'
+            WHEN (log.context_signal->>'penaltyDifference')::numeric = 0
+              THEN 'BALANCED'
+            WHEN (log.context_signal->>'penaltyDifference')::numeric = 1
+              THEN 'SLIGHT_AWAY_FRESHER'
+            WHEN (log.context_signal->>'penaltyDifference')::numeric >= 2
+              THEN 'AWAY_FRESHER'
+            ELSE 'UNKNOWN'
+          END
+        ) AS signal_bucket,
+
+        COUNT(*)::INTEGER AS sample_size,
+        COUNT(*) FILTER (
+          WHERE p.home_goals > p.away_goals
+        )::INTEGER AS home_wins,
+        COUNT(*) FILTER (
+          WHERE p.home_goals = p.away_goals
+        )::INTEGER AS draws,
+        COUNT(*) FILTER (
+          WHERE p.away_goals > p.home_goals
+        )::INTEGER AS away_wins,
+        AVG(
+          p.home_goals - p.away_goals
+        )::NUMERIC AS average_goal_difference
+
+      FROM engine_prediction_logs log
+      JOIN predictions p
+        ON p.fixture_id = log.fixture_id
+      WHERE log.engine_name = 'FatigueEngine'
+        AND log.engine_role = 'CONTEXTUAL'
+        AND p.result_status = 'COMPLETED'
+        AND p.home_goals IS NOT NULL
+        AND p.away_goals IS NOT NULL
+        AND log.context_signal IS NOT NULL
+        AND log.context_signal ? 'penaltyDifference'
+        AND NULLIF(
+          log.context_signal->>'penaltyDifference',
+          ''
+        ) IS NOT NULL
+      GROUP BY signal_bucket
+      ORDER BY sample_size DESC, signal_bucket ASC
+    `);
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      for (const row of result.rows) {
+        const sampleSize =
+          Number(row.sample_size) || 0;
+        const homeWins =
+          Number(row.home_wins) || 0;
+        const draws =
+          Number(row.draws) || 0;
+        const awayWins =
+          Number(row.away_wins) || 0;
+
+        const homeRate =
+          sampleSize > 0
+            ? (homeWins / sampleSize) * 100
+            : 0;
+        const drawRate =
+          sampleSize > 0
+            ? (draws / sampleSize) * 100
+            : 0;
+        const awayRate =
+          sampleSize > 0
+            ? (awayWins / sampleSize) * 100
+            : 0;
+
+        await client.query(
+          `
+            INSERT INTO engine_contextual_performance_stats (
+              engine_name,
+              signal_type,
+              signal_bucket,
+              sample_size,
+              home_wins,
+              draws,
+              away_wins,
+              home_win_rate,
+              draw_rate,
+              away_win_rate,
+              average_goal_difference,
+              baseline_home_win_rate,
+              baseline_draw_rate,
+              baseline_away_win_rate,
+              home_win_lift,
+              draw_lift,
+              away_win_lift,
+              reliability_level,
+              learning_version,
+              calculated_at,
+              updated_at
+            )
+            VALUES (
+              'FatigueEngine',
+              'FATIGUE_DIFFERENTIAL',
+              $1,
+              $2, $3, $4, $5,
+              $6, $7, $8, $9,
+              $10, $11, $12,
+              $13, $14, $15,
+              $16, $17,
+              NOW(), NOW()
+            )
+            ON CONFLICT (
+              engine_name,
+              signal_type,
+              signal_bucket
+            )
+            DO UPDATE SET
+              sample_size = EXCLUDED.sample_size,
+              home_wins = EXCLUDED.home_wins,
+              draws = EXCLUDED.draws,
+              away_wins = EXCLUDED.away_wins,
+              home_win_rate = EXCLUDED.home_win_rate,
+              draw_rate = EXCLUDED.draw_rate,
+              away_win_rate = EXCLUDED.away_win_rate,
+              average_goal_difference =
+                EXCLUDED.average_goal_difference,
+              baseline_home_win_rate =
+                EXCLUDED.baseline_home_win_rate,
+              baseline_draw_rate =
+                EXCLUDED.baseline_draw_rate,
+              baseline_away_win_rate =
+                EXCLUDED.baseline_away_win_rate,
+              home_win_lift =
+                EXCLUDED.home_win_lift,
+              draw_lift =
+                EXCLUDED.draw_lift,
+              away_win_lift =
+                EXCLUDED.away_win_lift,
+              reliability_level =
+                EXCLUDED.reliability_level,
+              learning_version =
+                EXCLUDED.learning_version,
+              calculated_at = NOW(),
+              updated_at = NOW()
+          `,
+          [
+            row.signal_bucket || "UNKNOWN",
+            sampleSize,
+            homeWins,
+            draws,
+            awayWins,
+            homeRate,
+            drawRate,
+            awayRate,
+            row.average_goal_difference == null
+              ? null
+              : Number(row.average_goal_difference),
+            baselineHome,
+            baselineDraw,
+            baselineAway,
+            homeRate - baselineHome,
+            drawRate - baselineDraw,
+            awayRate - baselineAway,
+            reliabilityLevel(sampleSize, null),
+            ENGINE_LEARNING_VERSION,
+          ]
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return {
+      ok: true,
+      engine: "FatigueEngine",
+      role: "CONTEXTUAL",
+      baselineSample,
+      groups: result.rows.length,
+    };
   }
 
   async function rebuildPerformance() {
@@ -262,9 +532,13 @@ function createEnginePerformanceService({ pool }) {
         client.release();
       }
 
+      const contextual =
+        await rebuildContextualPerformance();
+
       const summary = {
         ok: true,
         groups: result.rows.length,
+        contextual,
         startedAt,
         finishedAt: new Date().toISOString(),
       };
@@ -307,6 +581,24 @@ function createEnginePerformanceService({ pool }) {
     }
   }
 
+  async function getContextualPerformance() {
+    const result = await pool.query(`
+      SELECT *
+      FROM engine_contextual_performance_stats
+      ORDER BY
+        engine_name ASC,
+        sample_size DESC,
+        signal_bucket ASC
+    `);
+
+    return {
+      ok: true,
+      count: result.rows.length,
+      stats: result.rows,
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
   async function getPerformance() {
     const result = await pool.query(`
       SELECT *
@@ -329,6 +621,8 @@ function createEnginePerformanceService({ pool }) {
     ensureTables,
     rebuildPerformance,
     getPerformance,
+    getContextualPerformance,
+    rebuildContextualPerformance,
     reliabilityLevel,
   };
 }

@@ -108,6 +108,25 @@ function createEngineSettlementService({ pool }) {
     `);
 
     await pool.query(`
+      UPDATE engine_prediction_settlements settlement
+      SET
+        settlement_status = 'CONTEXT_SETTLED',
+        ignored_reason = NULL,
+        won = NULL,
+        brier_score = NULL,
+        log_loss = NULL,
+        absolute_error = NULL,
+        settlement_version = $1,
+        updated_at = NOW()
+      FROM engine_prediction_logs log
+      WHERE settlement.prediction_log_id = log.id
+        AND log.engine_name = 'FatigueEngine'
+        AND log.engine_role = 'CONTEXTUAL'
+        AND settlement.settlement_status = 'IGNORED'
+        AND settlement.ignored_reason = 'NEUTRAL_PREDICTION';
+    `, [ENGINE_LEARNING_VERSION]);
+
+    await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_engine_settlements_engine
       ON engine_prediction_settlements(
         engine_name,
@@ -138,6 +157,8 @@ function createEngineSettlementService({ pool }) {
           log.fixture_id,
           log.engine_name,
           log.engine_version,
+          log.engine_role,
+          log.context_signal,
           log.predicted_side,
           log.predicted_probability,
           p.home_goals,
@@ -164,6 +185,82 @@ function createEngineSettlementService({ pool }) {
     for (const row of result.rows) {
       const homeGoals = Number(row.home_goals);
       const awayGoals = Number(row.away_goals);
+      const engineRole =
+        String(row.engine_role || "DIRECTIONAL")
+          .trim()
+          .toUpperCase();
+
+      if (engineRole === "CONTEXTUAL") {
+        const contextualResult = await pool.query(
+          `
+            INSERT INTO engine_prediction_settlements (
+              prediction_log_id,
+              fixture_id,
+              engine_name,
+              engine_version,
+              predicted_side,
+              predicted_probability,
+              home_goals,
+              away_goals,
+              actual_outcome,
+              won,
+              brier_score,
+              log_loss,
+              absolute_error,
+              settlement_status,
+              ignored_reason,
+              settlement_version,
+              settled_at,
+              updated_at
+            )
+            VALUES (
+              $1, $2, $3, $4, $5,
+              $6, $7, $8, $9,
+              NULL, NULL, NULL, NULL,
+              'CONTEXT_SETTLED', NULL, $10,
+              NOW(), NOW()
+            )
+            ON CONFLICT (prediction_log_id)
+            DO UPDATE SET
+              home_goals = EXCLUDED.home_goals,
+              away_goals = EXCLUDED.away_goals,
+              actual_outcome = EXCLUDED.actual_outcome,
+              won = NULL,
+              brier_score = NULL,
+              log_loss = NULL,
+              absolute_error = NULL,
+              settlement_status = 'CONTEXT_SETTLED',
+              ignored_reason = NULL,
+              settlement_version = EXCLUDED.settlement_version,
+              settled_at = NOW(),
+              updated_at = NOW()
+            RETURNING id
+          `,
+          [
+            row.prediction_log_id,
+            row.fixture_id,
+            row.engine_name,
+            row.engine_version,
+            row.predicted_side || "NEUTRAL",
+            Number.isFinite(Number(row.predicted_probability))
+              ? Number(row.predicted_probability)
+              : null,
+            homeGoals,
+            awayGoals,
+            outcomeFromScore(homeGoals, awayGoals),
+            ENGINE_LEARNING_VERSION,
+          ]
+        );
+
+        if (contextualResult.rowCount > 0) {
+          settled += 1;
+        } else {
+          skipped += 1;
+        }
+
+        continue;
+      }
+
       const won = marketWon(
         row.predicted_side,
         homeGoals,
