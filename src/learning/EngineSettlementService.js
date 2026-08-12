@@ -278,7 +278,23 @@ function createEngineSettlementService({ pool }) {
             NOW(), NOW()
           )
           ON CONFLICT (prediction_log_id)
-          DO NOTHING
+          DO UPDATE SET
+            engine_name = EXCLUDED.engine_name,
+            engine_version = EXCLUDED.engine_version,
+            predicted_side = EXCLUDED.predicted_side,
+            predicted_probability = EXCLUDED.predicted_probability,
+            home_goals = EXCLUDED.home_goals,
+            away_goals = EXCLUDED.away_goals,
+            actual_outcome = EXCLUDED.actual_outcome,
+            won = EXCLUDED.won,
+            brier_score = EXCLUDED.brier_score,
+            log_loss = EXCLUDED.log_loss,
+            absolute_error = EXCLUDED.absolute_error,
+            settlement_status = 'SETTLED',
+            ignored_reason = NULL,
+            settlement_version = EXCLUDED.settlement_version,
+            settled_at = NOW(),
+            updated_at = NOW()
         `,
         [
           row.prediction_log_id,

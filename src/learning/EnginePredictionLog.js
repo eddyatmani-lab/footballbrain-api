@@ -59,6 +59,46 @@ function normalizeSide(value) {
   return null;
 }
 
+
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && value !== "") {
+      return value;
+    }
+  }
+  return null;
+}
+
+function engineObject(root = {}, ...names) {
+  for (const name of names) {
+    const value = root?.[name];
+    if (value && typeof value === "object") return value;
+  }
+  return {};
+}
+
+function explicitSideFromOutput(raw = {}) {
+  return normalizeSide(
+    firstDefined(
+      raw.predictedSide,
+      raw.predicted_side,
+      raw.side,
+      raw.selection,
+      raw.pick,
+      raw.outcome,
+      raw.recommendation,
+      raw.marketKey,
+      raw.market_key
+    )
+  );
+}
+
+function pairFromAliases(raw = {}, homeKeys = [], awayKeys = [], threshold = 1) {
+  const home = firstDefined(...homeKeys.map((key) => raw?.[key]));
+  const away = firstDefined(...awayKeys.map((key) => raw?.[key]));
+  return sideFromPair(home, away, threshold);
+}
+
 function engineVersionOf(engineName, rawOutput = {}, analysisVersion = null) {
   return String(
     rawOutput?.version ||
@@ -104,79 +144,122 @@ function scoreOf(raw = {}) {
 }
 
 function collectEngineCandidates(snapshot = {}) {
+  const learningRoot =
+    snapshot?.engineLearning &&
+    typeof snapshot.engineLearning === "object"
+      ? snapshot.engineLearning
+      : snapshot;
+
+  /*
+   * Les anciens snapshots compact-v1 ne contiennent volontairement pas
+   * les sorties moteurs. Ne jamais fabriquer 10 prédictions NEUTRAL à
+   * partir de ces snapshots : elles ne sont pas des observations réelles.
+   */
+  if (
+    snapshot?.compact === true &&
+    snapshot?.snapshotVersion === "compact-v1" &&
+    !snapshot?.engineLearning
+  ) {
+    return [];
+  }
+
   const brain =
-    snapshot?.brain ||
-    snapshot?.analysis?.brain ||
-    snapshot?.studio?.brain ||
+    learningRoot?.brain ||
+    learningRoot?.analysis?.brain ||
+    learningRoot?.studio?.brain ||
     {};
 
   const engines = {
     ...(brain?.engines || {}),
-    ...(snapshot?.engines || {}),
-    ...(snapshot?.studio?.engines || {}),
+    ...(learningRoot?.engines || {}),
+    ...(learningRoot?.studio?.engines || {}),
   };
 
   const decision =
     brain?.decision ||
-    snapshot?.decision ||
-    snapshot?.studio?.decision ||
+    learningRoot?.decision ||
+    learningRoot?.studio?.decision ||
     {};
 
   const votes =
     decision?.engineVotes ||
     decision?.consensus?.votes ||
-    snapshot?.engineVotes ||
+    learningRoot?.engineVotes ||
+    learningRoot?.votes ||
     [];
 
   const voteMap = new Map(
     (Array.isArray(votes) ? votes : [])
       .filter(Boolean)
       .map((vote) => [
-        String(vote.engine || vote.engineName || ""),
-        normalizeSide(vote.side),
+        normalizeToken(vote.engine || vote.engineName || vote.name),
+        normalizeSide(
+          vote.side || vote.predictedSide || vote.selection || vote.pick
+        ),
       ])
+      .filter(([engine, side]) => engine && side)
   );
+
+  const voteFor = (engineName) =>
+    voteMap.get(normalizeToken(engineName)) || null;
 
   const probability =
     brain?.probability ||
     engines?.probability ||
-    snapshot?.probability ||
+    engines?.ProbabilityEngine ||
+    learningRoot?.ProbabilityEngine ||
+    learningRoot?.probability ||
     {};
 
   const attackDefense =
     brain?.attackDefense ||
     engines?.attackDefense ||
+    engines?.AttackDefenseEngine ||
+    learningRoot?.attackDefense ||
+    learningRoot?.AttackDefenseEngine ||
     {};
 
   const transition =
     brain?.transition ||
     engines?.transition ||
+    engines?.TransitionEngine ||
+    learningRoot?.transition ||
+    learningRoot?.TransitionEngine ||
     {};
 
   const mental =
     brain?.mental ||
     engines?.mental ||
+    engines?.MentalEngine ||
+    learningRoot?.mental ||
+    learningRoot?.MentalEngine ||
     {};
 
   const tactical =
     brain?.tacticalProfile ||
     engines?.tacticalProfile ||
+    engines?.TacticalProfileEngine ||
+    learningRoot?.tacticalProfile ||
+    learningRoot?.TacticalProfileEngine ||
     {};
 
   const fatigue =
     brain?.fatigue ||
     engines?.fatigue ||
+    engines?.FatigueEngine ||
+    learningRoot?.fatigue ||
+    learningRoot?.FatigueEngine ||
     {};
 
   const xg =
     brain?.xg ||
-    snapshot?.xg ||
+    learningRoot?.xg ||
     {};
 
   const monteCarlo =
     brain?.monteCarloModel ||
-    snapshot?.monteCarloModel ||
-    snapshot?.monte_carlo_model ||
+    learningRoot?.monteCarloModel ||
+    learningRoot?.monte_carlo_model ||
     {};
 
   const candidates = [];
@@ -200,8 +283,13 @@ function collectEngineCandidates(snapshot = {}) {
   };
 
   const probabilitySide =
-    voteMap.get("ProbabilityEngine") ||
-    sideFromPair(probability.homeProb, probability.awayProb, 1);
+    voteFor("ProbabilityEngine") ||
+    explicitSideFromOutput(probability) ||
+    sideFromPair(
+      firstDefined(probability.homeProb, probability.home, probability.homeWin),
+      firstDefined(probability.awayProb, probability.away, probability.awayWin),
+      1
+    );
 
   push(
     "ProbabilityEngine",
@@ -217,10 +305,12 @@ function collectEngineCandidates(snapshot = {}) {
 
   push(
     "AttackDefenseEngine",
-    voteMap.get("AttackDefenseEngine") ||
-      sideFromPair(
-        attackDefense.homeAttackVsAwayDefense,
-        attackDefense.awayAttackVsHomeDefense,
+    voteFor("AttackDefenseEngine") ||
+      explicitSideFromOutput(attackDefense) ||
+      pairFromAliases(
+        attackDefense,
+        ["homeAttackVsAwayDefense", "homeScore", "homeStrength", "homeImpact", "homeRating"],
+        ["awayAttackVsHomeDefense", "awayScore", "awayStrength", "awayImpact", "awayRating"],
         1
       ),
     null,
@@ -233,10 +323,12 @@ function collectEngineCandidates(snapshot = {}) {
 
   push(
     "TransitionEngine",
-    voteMap.get("TransitionEngine") ||
-      sideFromPair(
-        transition.homeCounterThreat,
-        transition.awayCounterThreat,
+    voteFor("TransitionEngine") ||
+      explicitSideFromOutput(transition) ||
+      pairFromAliases(
+        transition,
+        ["homeCounterThreat", "homeScore", "homeThreat", "homeImpact", "homeRating"],
+        ["awayCounterThreat", "awayScore", "awayThreat", "awayImpact", "awayRating"],
         3
       ),
     null,
@@ -249,10 +341,12 @@ function collectEngineCandidates(snapshot = {}) {
 
   push(
     "MentalEngine",
-    voteMap.get("MentalEngine") ||
-      sideFromPair(
-        mental.homeMentalStrength,
-        mental.awayMentalStrength,
+    voteFor("MentalEngine") ||
+      explicitSideFromOutput(mental) ||
+      pairFromAliases(
+        mental,
+        ["homeMentalStrength", "homeScore", "homeStrength", "homeImpact", "homeRating"],
+        ["awayMentalStrength", "awayScore", "awayStrength", "awayImpact", "awayRating"],
         3
       ),
     null,
@@ -265,7 +359,8 @@ function collectEngineCandidates(snapshot = {}) {
 
   push(
     "TacticalProfileEngine",
-    voteMap.get("TacticalProfileEngine") ||
+    voteFor("TacticalProfileEngine") ||
+      explicitSideFromOutput(tactical) ||
       sideFromPair(
         tactical.homeScore ??
           tactical.homeTacticalScore ??
@@ -282,7 +377,8 @@ function collectEngineCandidates(snapshot = {}) {
 
   push(
     "FatigueEngine",
-    voteMap.get("FatigueEngine") ||
+    voteFor("FatigueEngine") ||
+      explicitSideFromOutput(fatigue) ||
       sideFromPair(
         fatigue.awayFatigueImpact,
         fatigue.homeFatigueImpact,
@@ -295,7 +391,8 @@ function collectEngineCandidates(snapshot = {}) {
 
   push(
     "XGProfile",
-    voteMap.get("XGProfile") ||
+    voteFor("XGProfile") ||
+      explicitSideFromOutput(xg) ||
       sideFromPair(
         xg.home ?? probability.xgHome,
         xg.away ?? probability.xgAway,
@@ -307,7 +404,8 @@ function collectEngineCandidates(snapshot = {}) {
   );
 
   const mcSide =
-    voteMap.get("MonteCarloEngine") ||
+    voteFor("MonteCarloEngine") ||
+    explicitSideFromOutput(monteCarlo) ||
     sideFromPair(monteCarlo.homeWin, monteCarlo.awayWin, 1);
 
   push(
@@ -401,9 +499,7 @@ function collectEngineCandidates(snapshot = {}) {
     }
 
     const explicitSide =
-      voteMap.get(
-        rawEngineName
-      ) ||
+      voteFor(rawEngineName) ||
       rawOutput.predictedSide ||
       rawOutput.side ||
       rawOutput.selection ||
@@ -427,7 +523,16 @@ function collectEngineCandidates(snapshot = {}) {
     );
   }
 
-  return candidates;
+  return candidates.filter((candidate) => {
+    const raw = candidate.rawOutput;
+    const hasRawOutput =
+      raw && typeof raw === "object" && Object.keys(raw).length > 0;
+    const hasUsableSide = candidate.side !== "NEUTRAL";
+    const hasProbability = candidate.predictedProbability !== null;
+    const hasScore = candidate.engineScore !== null && candidate.engineScore !== 0;
+
+    return hasRawOutput || hasUsableSide || hasProbability || hasScore;
+  });
 }
 
 function createEnginePredictionLog({ pool }) {

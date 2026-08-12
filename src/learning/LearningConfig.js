@@ -6,7 +6,7 @@ const LEARNING_MODE = String(
   .trim()
   .toUpperCase();
 
-const ENGINE_LEARNING_VERSION = "engine-learning-complete-v1.1.0";
+const ENGINE_LEARNING_VERSION = "engine-learning-complete-v1.2.0";
 
 const SUPPORTED_ENGINES = Object.freeze([
   "ProbabilityEngine",

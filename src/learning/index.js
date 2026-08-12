@@ -239,6 +239,107 @@ function createEngineLearningCore({
       })
     );
 
+    app.get(
+      "/internal/learning/engines/diagnostics",
+      ...withAdminGuard(async (req, res) => {
+        try {
+          await ensureTables();
+
+          const [byEngine, ignoredReasons, compactHistory] = await Promise.all([
+            pool.query(`
+              SELECT
+                log.engine_name,
+                COUNT(*)::INTEGER AS logs,
+                COUNT(*) FILTER (
+                  WHERE UPPER(COALESCE(log.predicted_side, '')) = 'NEUTRAL'
+                )::INTEGER AS neutral_logs,
+                COUNT(*) FILTER (
+                  WHERE UPPER(COALESCE(log.predicted_side, '')) IN (
+                    'HOME','DRAW','AWAY','BTTS','NO_BTTS','OVER25','UNDER25'
+                  )
+                )::INTEGER AS usable_logs,
+                COUNT(settlement.id) FILTER (
+                  WHERE settlement.settlement_status = 'SETTLED'
+                )::INTEGER AS settled,
+                COUNT(settlement.id) FILTER (
+                  WHERE settlement.settlement_status = 'IGNORED'
+                )::INTEGER AS ignored
+              FROM engine_prediction_logs log
+              LEFT JOIN engine_prediction_settlements settlement
+                ON settlement.prediction_log_id = log.id
+              GROUP BY log.engine_name
+              ORDER BY logs DESC, log.engine_name ASC
+            `),
+            pool.query(`
+              SELECT
+                COALESCE(ignored_reason, 'UNKNOWN') AS reason,
+                COUNT(*)::INTEGER AS count
+              FROM engine_prediction_settlements
+              WHERE settlement_status = 'IGNORED'
+              GROUP BY COALESCE(ignored_reason, 'UNKNOWN')
+              ORDER BY count DESC
+            `),
+            pool.query(`
+              SELECT
+                COUNT(*)::INTEGER AS compact_snapshots,
+                COUNT(*) FILTER (
+                  WHERE studio_snapshot ? 'engineLearning'
+                )::INTEGER AS compact_with_engine_learning
+              FROM predictions
+              WHERE studio_snapshot IS NOT NULL
+                AND jsonb_typeof(studio_snapshot) = 'object'
+                AND COALESCE(studio_snapshot->>'compact', 'false') = 'true'
+            `),
+          ]);
+
+          return res.json({
+            ok: true,
+            engines: byEngine.rows,
+            ignoredReasons: ignoredReasons.rows,
+            history: compactHistory.rows[0] || {},
+            warning:
+              "Les anciens snapshots compact-v1 sans engineLearning ne permettent pas de reconstruire honnêtement les votes moteurs historiques.",
+            generatedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
+        }
+      })
+    );
+
+    app.post(
+      "/internal/learning/engines/repair-synthetic-neutral",
+      ...withAdminGuard(async (req, res) => {
+        try {
+          await ensureTables();
+          const result = await pool.query(`
+            DELETE FROM engine_prediction_logs
+            WHERE predicted_side = 'NEUTRAL'
+              AND predicted_probability IS NULL
+              AND COALESCE(engine_score, 0) = 0
+              AND confidence IS NULL
+              AND raw_output = '{}'::jsonb
+            RETURNING id
+          `);
+
+          return res.json({
+            ok: true,
+            deletedSyntheticNeutralLogs: result.rowCount,
+            note:
+              "Seuls les NEUTRAL sans probabilité, score, confiance ni raw_output ont été supprimés.",
+          });
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
+        }
+      })
+    );
+
     app.post(
       "/internal/learning/engines/settle",
       ...withAdminGuard(async (req, res) => {

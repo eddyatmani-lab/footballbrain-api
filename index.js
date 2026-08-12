@@ -14030,6 +14030,63 @@ function compactStudioMarket(
   return compact;
 }
 
+function compactEngineLearningPayload(snapshot = {}) {
+  const brain =
+    snapshot?.brain && typeof snapshot.brain === "object"
+      ? snapshot.brain
+      : {};
+
+  const engines =
+    snapshot?.engines && typeof snapshot.engines === "object"
+      ? snapshot.engines
+      : brain?.engines && typeof brain.engines === "object"
+        ? brain.engines
+        : {};
+
+  const payload = {
+    engines,
+    engineVotes:
+      snapshot?.engineVotes ||
+      snapshot?.decision?.engineVotes ||
+      snapshot?.decision?.consensus?.votes ||
+      brain?.decision?.engineVotes ||
+      brain?.decision?.consensus?.votes ||
+      [],
+    probability:
+      snapshot?.probability || brain?.probability || engines?.probability || null,
+    attackDefense:
+      snapshot?.attackDefense || brain?.attackDefense || engines?.attackDefense || null,
+    transition:
+      snapshot?.transition || brain?.transition || engines?.transition || null,
+    mental:
+      snapshot?.mental || brain?.mental || engines?.mental || null,
+    tacticalProfile:
+      snapshot?.tacticalProfile || brain?.tacticalProfile || engines?.tacticalProfile || null,
+    fatigue:
+      snapshot?.fatigue || brain?.fatigue || engines?.fatigue || null,
+    xg: snapshot?.xg || brain?.xg || null,
+    monteCarloModel:
+      snapshot?.monteCarloModel || snapshot?.monte_carlo_model || brain?.monteCarloModel || null,
+    decision: snapshot?.decision || brain?.decision || null,
+  };
+
+  const hasEvidence =
+    Object.keys(engines).length > 0 ||
+    (Array.isArray(payload.engineVotes) && payload.engineVotes.length > 0) ||
+    [
+      payload.probability,
+      payload.attackDefense,
+      payload.transition,
+      payload.mental,
+      payload.tacticalProfile,
+      payload.fatigue,
+      payload.xg,
+      payload.monteCarloModel,
+    ].some((value) => value && typeof value === "object" && Object.keys(value).length > 0);
+
+  return hasEvidence ? payload : null;
+}
+
 function compactStudioSnapshot(
   snapshot = {}
 ) {
@@ -14180,6 +14237,9 @@ function compactStudioSnapshot(
         snapshot
           ?.administrativeOverride
       ),
+
+    engineLearning:
+      compactEngineLearningPayload(snapshot),
 
     compact: true,
 
@@ -14607,6 +14667,63 @@ app.post(
                 ? body.markets
                 : [],
 
+            /*
+             * Payload Learning : conservé uniquement s'il est réellement
+             * envoyé par Brain Studio. Aucun vote moteur n'est inventé.
+             */
+            brain:
+              body.brain ||
+              body.analysis?.brain ||
+              body.studio?.brain ||
+              null,
+            engines:
+              body.engines ||
+              body.brain?.engines ||
+              body.analysis?.brain?.engines ||
+              null,
+            engineVotes:
+              body.engineVotes ||
+              body.decision?.engineVotes ||
+              body.decision?.consensus?.votes ||
+              null,
+            decision:
+              body.decision ||
+              body.brain?.decision ||
+              null,
+            probability:
+              body.probability ||
+              body.brain?.probability ||
+              null,
+            attackDefense:
+              body.attackDefense ||
+              body.brain?.attackDefense ||
+              null,
+            transition:
+              body.transition ||
+              body.brain?.transition ||
+              null,
+            mental:
+              body.mental ||
+              body.brain?.mental ||
+              null,
+            tacticalProfile:
+              body.tacticalProfile ||
+              body.brain?.tacticalProfile ||
+              null,
+            fatigue:
+              body.fatigue ||
+              body.brain?.fatigue ||
+              null,
+            xg:
+              body.xg ||
+              body.brain?.xg ||
+              null,
+            monteCarloModel:
+              body.monteCarloModel ||
+              body.monte_carlo_model ||
+              body.brain?.monteCarloModel ||
+              null,
+
             generatedAt:
               body.generatedAt ||
               new Date()
@@ -14622,6 +14739,46 @@ app.post(
               false,
           },
         });
+
+      /*
+       * Journaliser immédiatement les sorties moteurs AVANT le coup d'envoi.
+       * Le logger ignore les moteurs sans preuve exploitable et n'invente
+       * jamais une direction HOME/AWAY à partir d'un snapshot compact vide.
+       */
+      try {
+        await engineLearningCore.logStudioSnapshot({
+          fixtureId,
+          snapshot: {
+            brain: body.brain || body.analysis?.brain || body.studio?.brain || null,
+            engines: body.engines || body.brain?.engines || body.analysis?.brain?.engines || null,
+            engineVotes:
+              body.engineVotes ||
+              body.decision?.engineVotes ||
+              body.decision?.consensus?.votes ||
+              null,
+            decision: body.decision || body.brain?.decision || null,
+            probability: body.probability || body.brain?.probability || null,
+            attackDefense: body.attackDefense || body.brain?.attackDefense || null,
+            transition: body.transition || body.brain?.transition || null,
+            mental: body.mental || body.brain?.mental || null,
+            tacticalProfile: body.tacticalProfile || body.brain?.tacticalProfile || null,
+            fatigue: body.fatigue || body.brain?.fatigue || null,
+            xg: body.xg || body.brain?.xg || null,
+            monteCarloModel:
+              body.monteCarloModel || body.monte_carlo_model || body.brain?.monteCarloModel || null,
+            primaryMarket,
+            bestDecision: body.bestDecision || primaryMarket,
+          },
+          analysisVersion:
+            body.analysisVersion || body.version || "brain-studio-v1",
+          primaryMarket,
+        });
+      } catch (learningError) {
+        console.error(
+          "ENGINE LEARNING SNAPSHOT LOG :",
+          learningError
+        );
+      }
 
       /*
        * Le dernier marché principal avant le coup d'envoi reste dynamique.
@@ -20749,6 +20906,7 @@ async function backfillAllEngineLearningLogs({
   let fixtures = 0;
   let inserted = 0;
   let skipped = 0;
+  let unrecoverableCompactSnapshots = 0;
   const errors = [];
 
   for (const row of result.rows) {
@@ -20786,6 +20944,13 @@ async function backfillAllEngineLearningLogs({
 
       if (logged?.skipped) {
         skipped += 1;
+        if (
+          logged?.reason === "NO_ENGINE_OUTPUTS" &&
+          row.studio_snapshot?.compact === true &&
+          !row.studio_snapshot?.engineLearning
+        ) {
+          unrecoverableCompactSnapshots += 1;
+        }
       }
     } catch (error) {
       errors.push({
@@ -20806,6 +20971,7 @@ async function backfillAllEngineLearningLogs({
     fixtures,
     inserted,
     skipped,
+    unrecoverableCompactSnapshots,
     errors:
       errors.slice(0, 50),
   };
