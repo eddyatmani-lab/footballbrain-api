@@ -310,6 +310,184 @@ function createEngineLearningCore({
       })
     );
 
+    app.get(
+      "/internal/learning/engines/raw-diagnostics",
+      ...withAdminGuard(async (req, res) => {
+        try {
+          await ensureTables();
+
+          const allowedEngines = new Set([
+            "FatigueEngine",
+            "TransitionEngine",
+            "MentalEngine",
+            "AttackDefenseEngine",
+            "TacticalProfileEngine",
+            "ProbabilityEngine",
+            "XGProfile",
+            "MonteCarloEngine",
+            "BTTSProfile",
+            "GoalMarketEngine",
+          ]);
+
+          const requested = String(req.query.engines || "")
+            .split(",")
+            .map((value) => value.trim())
+            .filter(Boolean);
+
+          const engines = (requested.length > 0
+            ? requested
+            : ["FatigueEngine", "TransitionEngine", "MentalEngine"]
+          ).filter((engine) => allowedEngines.has(engine));
+
+          if (engines.length === 0) {
+            return res.status(400).json({
+              ok: false,
+              error: "Aucun moteur valide demandé.",
+            });
+          }
+
+          const limit = Math.max(
+            1,
+            Math.min(50, Number(req.query.limit) || 15)
+          );
+
+          const result = await pool.query(
+            `
+              SELECT
+                log.id,
+                log.fixture_id,
+                log.engine_name,
+                log.engine_version,
+                log.analysis_version,
+                log.market_key,
+                log.predicted_side,
+                log.predicted_probability,
+                log.engine_score,
+                log.confidence,
+                log.primary_market_key,
+                log.primary_market_probability,
+                log.decision_type,
+                log.decision_grade,
+                log.raw_output,
+                log.logged_at,
+                log.updated_at,
+                settlement.settlement_status,
+                settlement.ignored_reason,
+                settlement.won,
+                settlement.actual_home_goals,
+                settlement.actual_away_goals
+              FROM engine_prediction_logs log
+              LEFT JOIN engine_prediction_settlements settlement
+                ON settlement.prediction_log_id = log.id
+              WHERE log.engine_name = ANY($1::text[])
+              ORDER BY log.logged_at DESC, log.id DESC
+              LIMIT $2
+            `,
+            [engines, limit * engines.length]
+          );
+
+          const grouped = {};
+          for (const engine of engines) {
+            grouped[engine] = [];
+          }
+
+          for (const row of result.rows) {
+            if (!grouped[row.engine_name]) continue;
+            if (grouped[row.engine_name].length >= limit) continue;
+
+            const raw =
+              row.raw_output && typeof row.raw_output === "object"
+                ? row.raw_output
+                : {};
+
+            grouped[row.engine_name].push({
+              id: Number(row.id),
+              fixtureId: Number(row.fixture_id),
+              predictedSide: row.predicted_side,
+              predictedProbability:
+                row.predicted_probability === null
+                  ? null
+                  : Number(row.predicted_probability),
+              engineScore:
+                row.engine_score === null
+                  ? null
+                  : Number(row.engine_score),
+              confidence:
+                row.confidence === null
+                  ? null
+                  : Number(row.confidence),
+              marketKey: row.market_key,
+              primaryMarketKey: row.primary_market_key,
+              primaryMarketProbability:
+                row.primary_market_probability === null
+                  ? null
+                  : Number(row.primary_market_probability),
+              decisionType: row.decision_type,
+              decisionGrade: row.decision_grade,
+              settlement: {
+                status: row.settlement_status || null,
+                ignoredReason: row.ignored_reason || null,
+                won: row.won,
+                score:
+                  row.actual_home_goals === null ||
+                  row.actual_away_goals === null
+                    ? null
+                    : `${row.actual_home_goals}-${row.actual_away_goals}`,
+              },
+              rawKeys: Object.keys(raw),
+              rawOutput: raw,
+              loggedAt: row.logged_at,
+              updatedAt: row.updated_at,
+              engineVersion: row.engine_version,
+              analysisVersion: row.analysis_version,
+            });
+          }
+
+          const summaries = {};
+          for (const engine of engines) {
+            const rows = grouped[engine] || [];
+            const keyCounts = {};
+            for (const row of rows) {
+              for (const key of row.rawKeys || []) {
+                keyCounts[key] = (keyCounts[key] || 0) + 1;
+              }
+            }
+
+            summaries[engine] = {
+              returned: rows.length,
+              neutral: rows.filter(
+                (row) => String(row.predictedSide).toUpperCase() === "NEUTRAL"
+              ).length,
+              usable: rows.filter(
+                (row) => String(row.predictedSide).toUpperCase() !== "NEUTRAL"
+              ).length,
+              rawKeyFrequency: Object.entries(keyCounts)
+                .sort((a, b) => b[1] - a[1])
+                .map(([key, count]) => ({ key, count })),
+            };
+          }
+
+          return res.json({
+            ok: true,
+            readOnly: true,
+            version: "engine-learning-v1.3-raw-diagnostics",
+            engines,
+            limitPerEngine: limit,
+            summaries,
+            rows: grouped,
+            note:
+              "Diagnostic en lecture seule. Aucun vote moteur ni settlement n'est modifié.",
+            generatedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          return res.status(500).json({
+            ok: false,
+            error: error?.message || String(error),
+          });
+        }
+      })
+    );
+
     app.post(
       "/internal/learning/engines/repair-synthetic-neutral",
       ...withAdminGuard(async (req, res) => {
