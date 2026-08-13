@@ -2440,6 +2440,56 @@ await savePredictionToDatabase(
   result.analysis
 );
 
+/*
+ * ============================================================
+ * GOALSCORER — PREMIÈRE ANALYSE AUTOMATIQUE
+ * ============================================================
+ *
+ * Dès qu'une analyse FootballBrain est enregistrée, on lance
+ * automatiquement le moteur buteur pour ce fixture.
+ *
+ * Le traitement est volontairement non bloquant :
+ * - l'analyse principale est renvoyée rapidement au visiteur ;
+ * - le Goalscorer se calcule en parallèle ;
+ * - Brain Studio relit ensuite la route publique Goalscorer.
+ *
+ * Une erreur Goalscorer ne doit JAMAIS casser l'analyse principale.
+ */
+Promise.resolve()
+  .then(() =>
+    goalscorerEngine.analyzeFixture({
+      fixtureId,
+      persist: true,
+    })
+  )
+  .then((goalscorerResult) => {
+    console.log(
+      "GOALSCORER FIRST ANALYSIS : OK",
+      {
+        fixtureId,
+        version:
+          goalscorerEngine.version,
+        predictions:
+          Array.isArray(
+            goalscorerResult?.predictions
+          )
+            ? goalscorerResult.predictions.length
+            : null,
+      }
+    );
+  })
+  .catch((goalscorerError) => {
+    console.warn(
+      "GOALSCORER FIRST ANALYSIS : SKIPPED/ERROR",
+      {
+        fixtureId,
+        error:
+          goalscorerError?.message ||
+          String(goalscorerError),
+      }
+    );
+  });
+
 analysisCache.set(fixtureId, {
   createdAt: Date.now(),
   data: result,

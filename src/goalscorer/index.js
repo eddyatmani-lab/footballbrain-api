@@ -16,7 +16,7 @@
  */
 
 const GOALSCORER_VERSION =
-  "goalscorer-engine-v2.5.0-auto-learning";
+  "goalscorer-engine-v2.6.0-first-analysis-preview";
 
 const GOALSCORER_LEARNING_GENERATION =
   "goalscorer-probability-v2";
@@ -3164,15 +3164,22 @@ function createGoalscorerEngine({
             grouped.get(playerId).push(row);
           }
 
+          /*
+           * V2.6 — APERÇU PUBLIC COMPLET
+           *
+           * On ne masque plus les joueurs REJECTED dans la réponse publique.
+           * Cela permet à Brain Studio d'afficher les meilleurs candidats
+           * évalués même lorsqu'aucun joueur n'atteint WATCH/RECOMMENDED.
+           *
+           * IMPORTANT :
+           * REJECTED reste bien "NON CONSEILLÉ".
+           * On expose une estimation, on ne transforme pas artificiellement
+           * un profil faible en recommandation.
+           */
           const players =
             [...grouped.values()]
               .map(buildPublicGoalscorerPlayer)
               .filter(Boolean)
-              .filter(
-                (player) =>
-                  publicRecommendationRank(player.tier) >=
-                  publicRecommendationRank("WATCH")
-              )
               .sort((a, b) => {
                 const tierDiff =
                   publicRecommendationRank(b.tier) -
@@ -3180,7 +3187,22 @@ function createGoalscorerEngine({
 
                 if (tierDiff !== 0) return tierDiff;
 
-                return numberOr(b.score) - numberOr(a.score);
+                const scoreDiff =
+                  numberOr(b.score) -
+                  numberOr(a.score);
+
+                if (scoreDiff !== 0) {
+                  return scoreDiff;
+                }
+
+                return (
+                  numberOr(
+                    b?.anytime?.probability
+                  ) -
+                  numberOr(
+                    a?.anytime?.probability
+                  )
+                );
               });
 
           const match = matchResult.rows[0] || null;
@@ -3221,6 +3243,10 @@ function createGoalscorerEngine({
               watch: players.filter(
                 (player) => player.tier === "WATCH"
               ).length,
+              rejected: players.filter(
+                (player) => player.tier === "REJECTED"
+              ).length,
+              evaluatedPlayers: players.length,
             },
             players,
             generatedAt: new Date().toISOString(),
