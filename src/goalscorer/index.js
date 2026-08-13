@@ -16,7 +16,7 @@
  */
 
 const GOALSCORER_VERSION =
-  "goalscorer-engine-v2.6.0-first-analysis-preview";
+  "goalscorer-engine-v2.6.1-first-analysis-fix";
 
 const GOALSCORER_LEARNING_GENERATION =
   "goalscorer-probability-v2";
@@ -3126,12 +3126,15 @@ function createGoalscorerEngine({
                   recommendation_reasons
                 FROM goalscorer_predictions
                 WHERE fixture_id = $1
-                  AND model_version = $2
+                  AND learning_generation = $2
                 ORDER BY
                   recommendation_score DESC NULLS LAST,
                   predicted_probability DESC
               `,
-              [fixtureId, GOALSCORER_VERSION]
+              [
+                fixtureId,
+                GOALSCORER_LEARNING_GENERATION,
+              ]
             ),
             pool.query(
               `

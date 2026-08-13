@@ -376,6 +376,105 @@ const goalscorerEngine =
 goalscorerEngine.registerRoutes();
 
 /*
+ * GOALSCORER FIRST ANALYSIS V2.6.1
+ * Le Studio peut répondre depuis son cache sans repasser par le chemin
+ * d'analyse fraîche. On couvre donc les deux cas.
+ */
+const goalscorerFirstAnalysisInFlight =
+  new Map();
+
+async function hasGoalscorerPredictions(
+  fixtureId
+) {
+  try {
+    const result = await pool.query(
+      `
+        SELECT 1
+        FROM goalscorer_predictions
+        WHERE fixture_id = $1
+          AND learning_generation = 'goalscorer-probability-v2'
+        LIMIT 1
+      `,
+      [fixtureId]
+    );
+
+    return result.rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function triggerGoalscorerFirstAnalysis(
+  fixtureId,
+  source = "studio"
+) {
+  const id = Number(fixtureId);
+
+  if (
+    !Number.isInteger(id) ||
+    id <= 0 ||
+    goalscorerFirstAnalysisInFlight.has(id)
+  ) {
+    return;
+  }
+
+  const task = Promise.resolve()
+    .then(async () => {
+      if (
+        await hasGoalscorerPredictions(id)
+      ) {
+        return null;
+      }
+
+      console.log(
+        "GOALSCORER FIRST ANALYSIS : START",
+        { fixtureId: id, source }
+      );
+
+      return goalscorerEngine.analyzeFixture({
+        fixtureId: id,
+        persist: true,
+      });
+    })
+    .then((result) => {
+      if (!result) return;
+
+      console.log(
+        "GOALSCORER FIRST ANALYSIS : OK",
+        {
+          fixtureId: id,
+          source,
+          version: goalscorerEngine.version,
+          predictions:
+            Array.isArray(result?.predictions)
+              ? result.predictions.length
+              : null,
+        }
+      );
+    })
+    .catch((error) => {
+      console.warn(
+        "GOALSCORER FIRST ANALYSIS : ERROR",
+        {
+          fixtureId: id,
+          source,
+          error:
+            error?.message ||
+            String(error),
+        }
+      );
+    })
+    .finally(() => {
+      goalscorerFirstAnalysisInFlight.delete(id);
+    });
+
+  goalscorerFirstAnalysisInFlight.set(
+    id,
+    task
+  );
+}
+
+/*
  * ============================================================
  * ODDS SYNC SERVICE
  * ============================================================
@@ -1913,6 +2012,14 @@ if (
   Date.now() - cached.createdAt <
     ANALYSIS_CACHE_TTL
 ) {
+  /*
+   * Une analyse Studio en cache peut exister avant les buteurs.
+   */
+  triggerGoalscorerFirstAnalysis(
+    fixtureId,
+    "studio-cache"
+  );
+
   return res.json({
     ...cached.data,
     cached: true,
@@ -2441,54 +2548,12 @@ await savePredictionToDatabase(
 );
 
 /*
- * ============================================================
- * GOALSCORER — PREMIÈRE ANALYSE AUTOMATIQUE
- * ============================================================
- *
- * Dès qu'une analyse FootballBrain est enregistrée, on lance
- * automatiquement le moteur buteur pour ce fixture.
- *
- * Le traitement est volontairement non bloquant :
- * - l'analyse principale est renvoyée rapidement au visiteur ;
- * - le Goalscorer se calcule en parallèle ;
- * - Brain Studio relit ensuite la route publique Goalscorer.
- *
- * Une erreur Goalscorer ne doit JAMAIS casser l'analyse principale.
+ * Calcul buteur non bloquant après analyse fraîche.
  */
-Promise.resolve()
-  .then(() =>
-    goalscorerEngine.analyzeFixture({
-      fixtureId,
-      persist: true,
-    })
-  )
-  .then((goalscorerResult) => {
-    console.log(
-      "GOALSCORER FIRST ANALYSIS : OK",
-      {
-        fixtureId,
-        version:
-          goalscorerEngine.version,
-        predictions:
-          Array.isArray(
-            goalscorerResult?.predictions
-          )
-            ? goalscorerResult.predictions.length
-            : null,
-      }
-    );
-  })
-  .catch((goalscorerError) => {
-    console.warn(
-      "GOALSCORER FIRST ANALYSIS : SKIPPED/ERROR",
-      {
-        fixtureId,
-        error:
-          goalscorerError?.message ||
-          String(goalscorerError),
-      }
-    );
-  });
+triggerGoalscorerFirstAnalysis(
+  fixtureId,
+  "fresh-analysis"
+);
 
 analysisCache.set(fixtureId, {
   createdAt: Date.now(),
