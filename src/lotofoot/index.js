@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.5.1-distinct-strategies";
+  "lotofoot-engine-v1.6.0-grid-intelligence";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -2165,6 +2165,547 @@ function buildProtectionPriority(
       numberOr(
         prediction
           ?.cover_score
+      ),
+  };
+}
+
+
+function clampScore(
+  value
+) {
+  return Math.max(
+    0,
+    Math.min(
+      100,
+      numberOr(value)
+    )
+  );
+}
+
+function classifyGridLine(
+  prediction
+) {
+  const favoriteProbability =
+    numberOr(
+      prediction
+        ?.favorite_probability
+    );
+
+  const margin =
+    numberOr(
+      prediction
+        ?.margin
+    );
+
+  const trapScore =
+    numberOr(
+      prediction
+        ?.trap_score
+    );
+
+  const coverScore =
+    numberOr(
+      prediction
+        ?.cover_score
+    );
+
+  let category =
+    "OPEN_MATCH";
+
+  if (
+    favoriteProbability >= 52 &&
+    margin >= 18 &&
+    trapScore < 60
+  ) {
+    category =
+      "STRONG_BASE";
+  } else if (
+    trapScore >= 80 ||
+    coverScore >= 85 ||
+    margin <= 8
+  ) {
+    category =
+      "MAJOR_TRAP";
+  }
+
+  return {
+    lineNumber:
+      Number(
+        prediction
+          ?.line_number
+      ),
+
+    fixtureId:
+      Number(
+        prediction
+          ?.fixture_id
+      ),
+
+    homeTeam:
+      prediction
+        ?.home_team_name,
+
+    awayTeam:
+      prediction
+        ?.away_team_name,
+
+    aiPick:
+      prediction
+        ?.ai_pick,
+
+    category,
+
+    favoriteProbability:
+      roundScore(
+        favoriteProbability
+      ),
+
+    margin:
+      roundScore(
+        margin
+      ),
+
+    baseScore:
+      numberOr(
+        prediction
+          ?.base_score
+      ),
+
+    trapScore,
+
+    coverScore,
+  };
+}
+
+function buildGridDifficulty(
+  predictions
+) {
+  const rows =
+    Array.isArray(predictions)
+      ? predictions
+      : [];
+
+  if (!rows.length) {
+    return {
+      score: 0,
+      label: "UNKNOWN",
+      strongBases: 0,
+      openMatches: 0,
+      majorTraps: 0,
+      lines: [],
+    };
+  }
+
+  const lines =
+    rows.map(
+      classifyGridLine
+    );
+
+  const averageTrap =
+    lines.reduce(
+      (sum, line) =>
+        sum +
+        numberOr(
+          line.trapScore
+        ),
+      0
+    ) /
+    lines.length;
+
+  const averageCover =
+    lines.reduce(
+      (sum, line) =>
+        sum +
+        numberOr(
+          line.coverScore
+        ),
+      0
+    ) /
+    lines.length;
+
+  const averageUncertainty =
+    lines.reduce(
+      (sum, line) =>
+        sum +
+        (
+          100 -
+          clampScore(
+            line
+              .favoriteProbability
+          )
+        ),
+      0
+    ) /
+    lines.length;
+
+  const majorTraps =
+    lines.filter(
+      (line) =>
+        line.category ===
+        "MAJOR_TRAP"
+    ).length;
+
+  const strongBases =
+    lines.filter(
+      (line) =>
+        line.category ===
+        "STRONG_BASE"
+    ).length;
+
+  const openMatches =
+    lines.length -
+    majorTraps -
+    strongBases;
+
+  const trapDensity =
+    majorTraps /
+    lines.length *
+    100;
+
+  const score =
+    roundScore(
+      averageTrap *
+        0.32 +
+      averageCover *
+        0.28 +
+      averageUncertainty *
+        0.22 +
+      trapDensity *
+        0.18
+    );
+
+  let label =
+    "MEDIUM";
+
+  if (score >= 75) {
+    label = "VERY_HARD";
+  } else if (score >= 60) {
+    label = "HARD";
+  } else if (score < 40) {
+    label = "EASY";
+  }
+
+  return {
+    score,
+    label,
+    strongBases,
+    openMatches,
+    majorTraps,
+    averageTrap:
+      roundScore(
+        averageTrap
+      ),
+    averageCover:
+      roundScore(
+        averageCover
+      ),
+    lines,
+  };
+}
+
+function buildBudgetEfficiencyCurve({
+  predictions,
+  unitStake = 1,
+  budgets = [],
+} = {}) {
+  const stake =
+    Math.max(
+      0.01,
+      numberOr(
+        unitStake,
+        1
+      )
+    );
+
+  const safeBudgets =
+    [...new Set(
+      budgets
+        .map(
+          (value) =>
+            Math.max(
+              stake,
+              numberOr(
+                value,
+                stake
+              )
+            )
+        )
+        .sort(
+          (a, b) =>
+            a - b
+        )
+    )];
+
+  const points = [];
+
+  for (
+    const budget of
+    safeBudgets
+  ) {
+    const maxCombinations =
+      Math.max(
+        1,
+        Math.floor(
+          budget /
+          stake
+        )
+      );
+
+    const result =
+      optimizeGridSelections({
+        predictions,
+        maxCombinations,
+      });
+
+    const usedBudget =
+      Number(
+        (
+          result.combinations *
+          stake
+        ).toFixed(2)
+      );
+
+    points.push({
+      requestedBudget:
+        Number(
+          budget.toFixed(2)
+        ),
+
+      usedBudget,
+
+      combinations:
+        result.combinations,
+
+      theoreticalHitProbability:
+        result
+          .theoreticalHitProbability,
+    });
+  }
+
+  return points.map(
+    (
+      point,
+      index
+    ) => {
+      const previous =
+        index > 0
+          ? points[index - 1]
+          : null;
+
+      const probabilityGain =
+        previous
+          ? Number(
+              (
+                point
+                  .theoreticalHitProbability -
+                previous
+                  .theoreticalHitProbability
+              ).toFixed(6)
+            )
+          : null;
+
+      const extraCost =
+        previous
+          ? Number(
+              (
+                point.usedBudget -
+                previous.usedBudget
+              ).toFixed(2)
+            )
+          : null;
+
+      const gainPerEuro =
+        previous &&
+        extraCost > 0
+          ? Number(
+              (
+                probabilityGain /
+                extraCost
+              ).toFixed(6)
+            )
+          : null;
+
+      return {
+        ...point,
+        probabilityGain,
+        extraCost,
+        gainPerEuro,
+      };
+    }
+  );
+}
+
+function recommendGridStrategy({
+  strategies,
+  difficulty,
+} = {}) {
+  const prudent =
+    strategies
+      ?.PRUDENT;
+
+  const balanced =
+    strategies
+      ?.BALANCED;
+
+  const offensive =
+    strategies
+      ?.OFFENSIVE;
+
+  if (
+    !prudent ||
+    !balanced ||
+    !offensive
+  ) {
+    return null;
+  }
+
+  const difficultyScore =
+    numberOr(
+      difficulty
+        ?.score
+    );
+
+  /*
+   * On ne choisit pas uniquement la meilleure probabilité :
+   * - grille très difficile -> Prudente
+   * - grille moyenne/difficile -> Équilibrée si elle conserve une part
+   *   suffisante de la probabilité Prudente
+   * - grille facile -> Offensive si le sacrifice probabiliste reste contenu.
+   */
+  const balancedRetention =
+    numberOr(
+      prudent
+        .theoreticalHitProbability
+    ) > 0
+      ? (
+          numberOr(
+            balanced
+              .theoreticalHitProbability
+          ) /
+          numberOr(
+            prudent
+              .theoreticalHitProbability
+          )
+        ) *
+        100
+      : 0;
+
+  const offensiveRetention =
+    numberOr(
+      prudent
+        .theoreticalHitProbability
+    ) > 0
+      ? (
+          numberOr(
+            offensive
+              .theoreticalHitProbability
+          ) /
+          numberOr(
+            prudent
+              .theoreticalHitProbability
+          )
+        ) *
+        100
+      : 0;
+
+  let strategy =
+    "BALANCED";
+
+  let reason =
+    "La stratégie équilibrée offre le meilleur compromis entre coût et couverture sur cette grille.";
+
+  if (
+    difficultyScore >= 72
+  ) {
+    strategy =
+      "PRUDENT";
+    reason =
+      "La grille contient suffisamment d'incertitude et de pièges pour privilégier la couverture maximale.";
+  } else if (
+    difficultyScore < 45 &&
+    offensiveRetention >= 70
+  ) {
+    strategy =
+      "OFFENSIVE";
+    reason =
+      "La grille est relativement lisible et la stratégie offensive conserve une part suffisante de la couverture prudente.";
+  } else if (
+    balancedRetention < 72
+  ) {
+    strategy =
+      "PRUDENT";
+    reason =
+      "La réduction de coût de la stratégie équilibrée fait perdre trop de couverture par rapport à la prudente.";
+  }
+
+  const selected =
+    strategies[
+      strategy
+    ];
+
+  return {
+    strategy,
+
+    strategyLabel:
+      selected
+        ?.strategyLabel ||
+      strategy,
+
+    reason,
+
+    difficultyScore:
+      roundScore(
+        difficultyScore
+      ),
+
+    usedBudget:
+      numberOr(
+        selected
+          ?.usedBudget
+    ),
+
+    unusedBudget:
+      numberOr(
+        selected
+          ?.unusedBudget
+    ),
+
+    combinations:
+      numberOr(
+        selected
+          ?.combinations
+    ),
+
+    theoreticalHitProbability:
+      numberOr(
+        selected
+          ?.theoreticalHitProbability
+    ),
+
+    atLeastMinusOne:
+      selected
+        ?.rankProfile
+        ?.atLeast
+        ?.minusOne ??
+      null,
+
+    atLeastMinusTwo:
+      selected
+        ?.rankProfile
+        ?.atLeast
+        ?.minusTwo ??
+      null,
+
+    balancedRetention:
+      Number(
+        balancedRetention
+          .toFixed(2)
+      ),
+
+    offensiveRetention:
+      Number(
+        offensiveRetention
+          .toFixed(2)
       ),
   };
 }
@@ -4516,6 +5057,265 @@ function createLotoFootEngine({
       );
   }
 
+
+  async function getGridIntelligence(
+    gridId,
+    {
+      budget = 16,
+      unitStake = null,
+      persist = false,
+    } = {}
+  ) {
+    await ensureTables();
+
+    const analysis =
+      await getGridAnalysis(
+        gridId
+      );
+
+    if (!analysis) {
+      throw new Error(
+        "Grille Loto Foot introuvable."
+      );
+    }
+
+    const predictions =
+      Array.isArray(
+        analysis.predictions
+      )
+        ? analysis.predictions
+        : [];
+
+    const fullGrid =
+      await getGrid(
+        gridId
+      );
+
+    const actualMatchCount =
+      Array.isArray(
+        fullGrid?.matches
+      )
+        ? fullGrid.matches.length
+        : 0;
+
+    if (
+      predictions.length !==
+      actualMatchCount
+    ) {
+      throw new Error(
+        `Analyse incomplète : ${predictions.length}/${actualMatchCount} lignes disponibles.`
+      );
+    }
+
+    const storedUnitStake =
+      numberOr(
+        fullGrid?.unit_stake,
+        1
+      );
+
+    const effectiveUnitStake =
+      Number.isFinite(
+        Number(unitStake)
+      ) &&
+      Number(unitStake) > 0
+        ? Number(unitStake)
+        : storedUnitStake > 0
+          ? storedUnitStake
+          : 1;
+
+    const requestedBudget =
+      Math.max(
+        effectiveUnitStake,
+        numberOr(
+          budget,
+          16
+        )
+      );
+
+    const strategyResult =
+      await buildGridStrategies(
+        gridId,
+        {
+          budget:
+            requestedBudget,
+          unitStake:
+            effectiveUnitStake,
+          persist,
+        }
+      );
+
+    const difficulty =
+      buildGridDifficulty(
+        predictions
+      );
+
+    const defaultBudgets =
+      [
+        4,
+        8,
+        12,
+        16,
+        24,
+        32,
+      ]
+        .map(
+          (value) =>
+            Math.max(
+              effectiveUnitStake,
+              value
+            )
+        );
+
+    if (
+      !defaultBudgets.some(
+        (value) =>
+          Math.abs(
+            value -
+            requestedBudget
+          ) < 0.000001
+      )
+    ) {
+      defaultBudgets.push(
+        requestedBudget
+      );
+    }
+
+    const budgetEfficiency =
+      buildBudgetEfficiencyCurve({
+        predictions,
+        unitStake:
+          effectiveUnitStake,
+        budgets:
+          defaultBudgets,
+      });
+
+    const recommendation =
+      recommendGridStrategy({
+        strategies:
+          strategyResult
+            .strategies,
+        difficulty,
+      });
+
+    const protectionRanking =
+      strategyResult
+        .protectionRanking;
+
+    const recommendedStrategy =
+      recommendation
+        ?.strategy
+        ? strategyResult
+            .strategies[
+              recommendation
+                .strategy
+            ]
+        : null;
+
+    const summary = {
+      difficultyScore:
+        difficulty.score,
+
+      difficultyLabel:
+        difficulty.label,
+
+      strongBases:
+        difficulty.strongBases,
+
+      openMatches:
+        difficulty.openMatches,
+
+      majorTraps:
+        difficulty.majorTraps,
+
+      recommendedStrategy:
+        recommendation
+          ?.strategy ||
+        null,
+
+      recommendedStrategyLabel:
+        recommendation
+          ?.strategyLabel ||
+        null,
+
+      recommendedCost:
+        recommendation
+          ?.usedBudget ??
+        null,
+
+      recommendedCombinations:
+        recommendation
+          ?.combinations ??
+        null,
+
+      perfectProbability:
+        recommendation
+          ?.theoreticalHitProbability ??
+        null,
+
+      atLeastMinusOne:
+        recommendation
+          ?.atLeastMinusOne ??
+        null,
+
+      atLeastMinusTwo:
+        recommendation
+          ?.atLeastMinusTwo ??
+        null,
+
+      topProtectionPriorities:
+        Array.isArray(
+          protectionRanking
+        )
+          ? protectionRanking
+              .slice(
+                0,
+                4
+              )
+          : [],
+    };
+
+    return {
+      ok: true,
+
+      version:
+        LOTOFOOT_VERSION,
+
+      gridId:
+        Number(
+          fullGrid.id
+        ),
+
+      gridType:
+        fullGrid.grid_type,
+
+      officialGridNumber:
+        fullGrid
+          .official_grid_number,
+
+      requestedBudget,
+
+      unitStake:
+        effectiveUnitStake,
+
+      summary,
+
+      difficulty,
+
+      recommendation,
+
+      strategies:
+        strategyResult
+          .strategies,
+
+      protectionRanking,
+
+      budgetEfficiency,
+
+      generatedAt:
+        new Date().toISOString(),
+    };
+  }
+
   async function getStatus() {
     await ensureTables();
 
@@ -4671,6 +5471,54 @@ function createLotoFootEngine({
                 error:
                   error?.message ||
                   "Impossible de charger le statut Loto Foot.",
+              });
+          }
+        }
+      )
+    );
+
+    app.post(
+      "/internal/lotofoot/grid/:gridId/intelligence",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const result =
+              await getGridIntelligence(
+                req.params.gridId,
+                {
+                  budget:
+                    req.body
+                      ?.budget ?? 16,
+
+                  unitStake:
+                    req.body
+                      ?.unitStake ??
+                    null,
+
+                  persist:
+                    req.body
+                      ?.persist === true,
+                }
+              );
+
+            return res.json(
+              result
+            );
+          } catch (error) {
+            console.error(
+              "LOTOFOOT GRID INTELLIGENCE ERROR :",
+              error
+            );
+
+            return res
+              .status(500)
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  error?.message ||
+                  "Impossible de calculer l'intelligence de grille Loto Foot.",
               });
           }
         }
@@ -5205,6 +6053,7 @@ function createLotoFootEngine({
     getOptimizationHistory,
     buildGridStrategies,
     getProtectionRanking,
+    getGridIntelligence,
     registerRoutes,
     initialize,
 
