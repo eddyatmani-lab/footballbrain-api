@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.6.0-grid-intelligence";
+  "lotofoot-engine-v1.6.1-grid-intelligence-fix";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -2185,16 +2185,76 @@ function clampScore(
 function classifyGridLine(
   prediction
 ) {
+  /*
+   * favoriteProbability et margin ne sont pas des colonnes SQL dédiées
+   * de lotofoot_predictions : ils sont conservés dans
+   * prediction_payload.scoring depuis la V1.3.
+   *
+   * V1.6 lisait par erreur prediction.favorite_probability / prediction.margin,
+   * donc 0/0 pour toutes les lignes et classait toute la grille MAJOR_TRAP.
+   */
+  const scoringPayload =
+    prediction
+      ?.prediction_payload
+      ?.scoring ||
+    {};
+
+  const probabilities = {
+    home:
+      numberOr(
+        prediction
+          ?.footballbrain_home_probability
+      ),
+
+    draw:
+      numberOr(
+        prediction
+          ?.footballbrain_draw_probability
+      ),
+
+    away:
+      numberOr(
+        prediction
+          ?.footballbrain_away_probability
+      ),
+  };
+
+  const ranking =
+    rankedOutcomes(
+      probabilities
+    );
+
+  const fallbackFavorite =
+    numberOr(
+      ranking?.[0]
+        ?.probability
+    );
+
+  const fallbackMargin =
+    Math.max(
+      0,
+      numberOr(
+        ranking?.[0]
+          ?.probability
+      ) -
+      numberOr(
+        ranking?.[1]
+          ?.probability
+      )
+    );
+
   const favoriteProbability =
     numberOr(
-      prediction
-        ?.favorite_probability
+      scoringPayload
+        ?.favoriteProbability,
+      fallbackFavorite
     );
 
   const margin =
     numberOr(
-      prediction
-        ?.margin
+      scoringPayload
+        ?.margin,
+      fallbackMargin
     );
 
   const trapScore =
