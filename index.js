@@ -50,6 +50,9 @@ const {
   createGoalscorerEngine,
 } = require("./src/goalscorer");
 const {
+  createLotoFootEngine,
+} = require("./src/lotofoot");
+const {
   createOddsSyncService,
 } = require("./src/services/OddsSyncService");
 const {
@@ -374,6 +377,52 @@ const goalscorerEngine =
   });
 
 goalscorerEngine.registerRoutes();
+
+/*
+ * ============================================================
+ * LOTO FOOT ENGINE V1
+ * ============================================================
+ *
+ * Le moteur Loto Foot réutilise PostgreSQL et la protection Admin
+ * du backend principal. À cette étape, il enregistre ses routes,
+ * initialise ses tables et expose son endpoint de statut.
+ */
+const lotoFootEngine =
+  createLotoFootEngine({
+    app,
+    pool,
+
+    adminGuard(req, res, next) {
+      if (
+        !requireOptionalAdminKey(
+          req,
+          res
+        )
+      ) {
+        return;
+      }
+
+      next();
+    },
+
+    schedulersEnabled:
+      AUTOMATIC_SCHEDULERS_ENABLED,
+  });
+
+lotoFootEngine.registerRoutes();
+
+lotoFootEngine
+  .initialize()
+  .catch((error) => {
+    console.error(
+      "LOTOFOOT ENGINE INIT ERROR :",
+      error
+    );
+  });
+
+console.log(
+  "✅ LotoFootEngine : routes enregistrées"
+);
 
 /*
  * GOALSCORER FIRST ANALYSIS V2.6.1
