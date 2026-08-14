@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.2.0-fixture-matcher";
+  "lotofoot-engine-v1.3.0-footballbrain-scoring";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -642,6 +642,329 @@ function addCalendarDays(
   return date
     .toISOString()
     .slice(0, 10);
+}
+
+
+function roundScore(
+  value
+) {
+  return Number(
+    clamp(
+      value,
+      0,
+      100
+    ).toFixed(2)
+  );
+}
+
+function probabilityMapFromRow(
+  row = {}
+) {
+  return normalizeProbabilityTriple({
+    home:
+      row.home_probability,
+    draw:
+      row.draw_probability,
+    away:
+      row.away_probability,
+  });
+}
+
+function rankedOutcomes(
+  probabilities
+) {
+  return [
+    {
+      pick: "1",
+      probability:
+        numberOr(
+          probabilities?.home
+        ),
+    },
+    {
+      pick: "N",
+      probability:
+        numberOr(
+          probabilities?.draw
+        ),
+    },
+    {
+      pick: "2",
+      probability:
+        numberOr(
+          probabilities?.away
+        ),
+    },
+  ].sort(
+    (a, b) =>
+      b.probability -
+      a.probability
+  );
+}
+
+function buildDoubleSelection(
+  ranking
+) {
+  if (
+    !Array.isArray(ranking) ||
+    ranking.length < 2
+  ) {
+    return null;
+  }
+
+  const picks =
+    [
+      ranking[0]?.pick,
+      ranking[1]?.pick,
+    ].filter(Boolean);
+
+  const order = {
+    "1": 1,
+    "N": 2,
+    "2": 3,
+  };
+
+  picks.sort(
+    (a, b) =>
+      order[a] -
+      order[b]
+  );
+
+  return picks.join("");
+}
+
+function computeLotoFootScores({
+  probabilities,
+  confidence = null,
+  risk = null,
+} = {}) {
+  const normalized =
+    normalizeProbabilityTriple(
+      probabilities || {}
+    );
+
+  const ranking =
+    rankedOutcomes(
+      normalized
+    );
+
+  const favorite =
+    ranking[0];
+
+  const second =
+    ranking[1];
+
+  const third =
+    ranking[2];
+
+  const favoriteProbability =
+    numberOr(
+      favorite?.probability
+    );
+
+  const secondProbability =
+    numberOr(
+      second?.probability
+    );
+
+  const margin =
+    Math.max(
+      0,
+      favoriteProbability -
+      secondProbability
+    );
+
+  const drawProbability =
+    numberOr(
+      normalized.draw
+    );
+
+  const secondaryMass =
+    Math.max(
+      0,
+      100 -
+      favoriteProbability
+    );
+
+  const normalizedConfidence =
+    Number.isFinite(
+      Number(confidence)
+    )
+      ? clamp(
+          Number(confidence),
+          0,
+          100
+        )
+      : 50;
+
+  const normalizedRiskText =
+    String(risk || "")
+      .trim()
+      .toLowerCase();
+
+  let riskPenalty = 0;
+
+  if (
+    normalizedRiskText.includes(
+      "élev"
+    ) ||
+    normalizedRiskText.includes(
+      "elev"
+    )
+  ) {
+    riskPenalty = 12;
+  } else if (
+    normalizedRiskText.includes(
+      "mod"
+    )
+  ) {
+    riskPenalty = 6;
+  } else if (
+    normalizedRiskText.includes(
+      "faible"
+    )
+  ) {
+    riskPenalty = 0;
+  }
+
+  /*
+   * BASE SCORE
+   *
+   * Favorise :
+   * - une probabilité du choix principal élevée ;
+   * - un écart clair avec la deuxième issue ;
+   * - une confiance FootballBrain élevée.
+   *
+   * Le risque global retire quelques points.
+   */
+  const baseScore =
+    roundScore(
+      favoriteProbability * 0.58 +
+      margin * 0.82 +
+      normalizedConfidence * 0.18 -
+      riskPenalty
+    );
+
+  /*
+   * TRAP SCORE
+   *
+   * Plus le match est équilibré, plus le piège augmente.
+   * Le nul élevé est explicitement valorisé car il casse souvent
+   * les grilles construites uniquement autour des favoris.
+   */
+  const closeness =
+    100 -
+    clamp(
+      margin * 3.2,
+      0,
+      100
+    );
+
+  const trapScore =
+    roundScore(
+      closeness * 0.52 +
+      drawProbability * 0.78 +
+      secondaryMass * 0.34 +
+      riskPenalty * 1.4
+    );
+
+  /*
+   * COVER SCORE
+   *
+   * Mesure l'intérêt d'investir une protection sur cette ligne.
+   * Le score dépend du Trap Score, de la masse des issues secondaires
+   * et de la faiblesse du choix principal.
+   */
+  const coverScore =
+    roundScore(
+      trapScore * 0.58 +
+      secondaryMass * 0.44 +
+      (
+        100 -
+        favoriteProbability
+      ) * 0.24
+    );
+
+  /*
+   * SURPRISE SCORE
+   *
+   * Probabilité qu'une issue autre que le choix principal sorte,
+   * légèrement renforcée quand le troisième scénario reste crédible.
+   */
+  const surpriseScore =
+    roundScore(
+      secondaryMass * 0.82 +
+      numberOr(
+        third?.probability
+      ) * 0.28
+    );
+
+  let recommendedCover =
+    "SIMPLE";
+
+  if (
+    coverScore >= 78 ||
+    favoriteProbability < 40
+  ) {
+    recommendedCover =
+      "TRIPLE";
+  } else if (
+    coverScore >= 55 ||
+    favoriteProbability < 50
+  ) {
+    recommendedCover =
+      "DOUBLE";
+  }
+
+  let recommendedSelection =
+    favorite?.pick ||
+    null;
+
+  if (
+    recommendedCover ===
+    "DOUBLE"
+  ) {
+    recommendedSelection =
+      buildDoubleSelection(
+        ranking
+      );
+  } else if (
+    recommendedCover ===
+    "TRIPLE"
+  ) {
+    recommendedSelection =
+      "1N2";
+  }
+
+  return {
+    probabilities:
+      normalized,
+
+    ranking,
+
+    aiPick:
+      favorite?.pick ||
+      null,
+
+    favoriteProbability:
+      Number(
+        favoriteProbability
+          .toFixed(2)
+      ),
+
+    margin:
+      Number(
+        margin.toFixed(2)
+      ),
+
+    baseScore,
+    trapScore,
+    coverScore,
+    surpriseScore,
+
+    recommendedCover,
+    recommendedSelection,
+  };
 }
 
 function createLotoFootEngine({
@@ -1673,6 +1996,663 @@ function createLotoFootEngine({
     };
   }
 
+
+  async function getFootballBrainPrediction(
+    fixtureId
+  ) {
+    const result =
+      await pool.query(
+        `
+          SELECT
+            fixture_id,
+            fixture_date,
+            league_id,
+            league_name,
+            home_team_name,
+            away_team_name,
+
+            home_probability,
+            draw_probability,
+            away_probability,
+
+            confidence,
+            risk,
+            selected_outcome,
+            bet_status,
+
+            studio_market_key,
+            studio_market_label,
+            studio_probability,
+            studio_decision_score,
+            studio_decision_type,
+            studio_decision_grade,
+            studio_analysis_version,
+            studio_saved_at,
+
+            updated_at
+          FROM predictions
+          WHERE fixture_id = $1
+          LIMIT 1
+        `,
+        [
+          fixtureId,
+        ]
+      );
+
+    return (
+      result.rows[0] ||
+      null
+    );
+  }
+
+  async function analyzeGrid(
+    gridId,
+    {
+      force = false,
+    } = {}
+  ) {
+    await ensureTables();
+
+    const grid =
+      await getGrid(
+        gridId
+      );
+
+    if (!grid) {
+      throw new Error(
+        "Grille Loto Foot introuvable."
+      );
+    }
+
+    const results = [];
+
+    for (
+      const lotoMatch of
+      grid.matches
+    ) {
+      const fixtureId =
+        Number(
+          lotoMatch.fixture_id
+        );
+
+      if (
+        !Number.isInteger(
+          fixtureId
+        ) ||
+        fixtureId <= 0
+      ) {
+        results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          homeTeam:
+            lotoMatch.home_team_name,
+          awayTeam:
+            lotoMatch.away_team_name,
+          status:
+            "UNMATCHED_FIXTURE",
+        });
+
+        continue;
+      }
+
+      const existingResult =
+        await pool.query(
+          `
+            SELECT *
+            FROM lotofoot_predictions
+            WHERE lotofoot_match_id = $1
+              AND analysis_version = $2
+            LIMIT 1
+          `,
+          [
+            lotoMatch.id,
+            LOTOFOOT_VERSION,
+          ]
+        );
+
+      const existing =
+        existingResult.rows[0] ||
+        null;
+
+      if (
+        existing &&
+        !force
+      ) {
+        results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          fixtureId,
+          status:
+            "ALREADY_ANALYZED",
+          aiPick:
+            existing.ai_pick,
+          baseScore:
+            numberOr(
+              existing.base_score
+            ),
+          trapScore:
+            numberOr(
+              existing.trap_score
+            ),
+          coverScore:
+            numberOr(
+              existing.cover_score
+            ),
+          surpriseScore:
+            numberOr(
+              existing.surprise_score
+            ),
+          recommendedCover:
+            existing.recommended_cover,
+          recommendedSelection:
+            existing.recommended_selection,
+        });
+
+        continue;
+      }
+
+      const brain =
+        await getFootballBrainPrediction(
+          fixtureId
+        );
+
+      if (!brain) {
+        results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          fixtureId,
+          homeTeam:
+            lotoMatch.home_team_name,
+          awayTeam:
+            lotoMatch.away_team_name,
+          status:
+            "MISSING_BRAIN_DATA",
+          reason:
+            "Aucune prédiction FootballBrain enregistrée pour ce fixture.",
+        });
+
+        continue;
+      }
+
+      const probabilities =
+        probabilityMapFromRow(
+          brain
+        );
+
+      const totalProbability =
+        probabilities.home +
+        probabilities.draw +
+        probabilities.away;
+
+      if (
+        totalProbability <= 0
+      ) {
+        results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          fixtureId,
+          homeTeam:
+            lotoMatch.home_team_name,
+          awayTeam:
+            lotoMatch.away_team_name,
+          status:
+            "MISSING_PROBABILITIES",
+          reason:
+            "FootballBrain existe mais les probabilités 1/N/2 sont absentes.",
+        });
+
+        continue;
+      }
+
+      const scoring =
+        computeLotoFootScores({
+          probabilities,
+          confidence:
+            brain.confidence,
+          risk:
+            brain.risk,
+        });
+
+      const payload = {
+        fixtureId,
+
+        source:
+          "footballbrain-predictions",
+
+        footballBrain: {
+          confidence:
+            Number.isFinite(
+              Number(
+                brain.confidence
+              )
+            )
+              ? Number(
+                  brain.confidence
+                )
+              : null,
+
+          risk:
+            brain.risk ||
+            null,
+
+          selectedOutcome:
+            brain.selected_outcome ||
+            null,
+
+          betStatus:
+            brain.bet_status ||
+            null,
+
+          studio: {
+            marketKey:
+              brain.studio_market_key ||
+              null,
+
+            marketLabel:
+              brain.studio_market_label ||
+              null,
+
+            probability:
+              Number.isFinite(
+                Number(
+                  brain.studio_probability
+                )
+              )
+                ? Number(
+                    brain.studio_probability
+                  )
+                : null,
+
+            decisionScore:
+              Number.isFinite(
+                Number(
+                  brain.studio_decision_score
+                )
+              )
+                ? Number(
+                    brain.studio_decision_score
+                  )
+                : null,
+
+            decisionType:
+              brain.studio_decision_type ||
+              null,
+
+            decisionGrade:
+              brain.studio_decision_grade ||
+              null,
+
+            analysisVersion:
+              brain.studio_analysis_version ||
+              null,
+
+            savedAt:
+              brain.studio_saved_at ||
+              null,
+          },
+        },
+
+        scoring: {
+          favoriteProbability:
+            scoring.favoriteProbability,
+
+          margin:
+            scoring.margin,
+
+          ranking:
+            scoring.ranking,
+
+          methodology:
+            "lotofoot-scoring-v1",
+        },
+      };
+
+      const upsertResult =
+        await pool.query(
+          `
+            INSERT INTO lotofoot_predictions (
+              grid_id,
+              lotofoot_match_id,
+              fixture_id,
+
+              footballbrain_home_probability,
+              footballbrain_draw_probability,
+              footballbrain_away_probability,
+
+              ai_pick,
+
+              base_score,
+              trap_score,
+              cover_score,
+              surprise_score,
+
+              recommended_cover,
+              recommended_selection,
+
+              analysis_version,
+              status,
+              prediction_payload,
+
+              updated_at
+            )
+            VALUES (
+              $1,
+              $2,
+              $3,
+
+              $4,
+              $5,
+              $6,
+
+              $7,
+
+              $8,
+              $9,
+              $10,
+              $11,
+
+              $12,
+              $13,
+
+              $14,
+              'PENDING',
+              $15::jsonb,
+
+              NOW()
+            )
+            ON CONFLICT (
+              lotofoot_match_id,
+              analysis_version
+            )
+            DO UPDATE SET
+              fixture_id =
+                EXCLUDED.fixture_id,
+
+              footballbrain_home_probability =
+                EXCLUDED.footballbrain_home_probability,
+
+              footballbrain_draw_probability =
+                EXCLUDED.footballbrain_draw_probability,
+
+              footballbrain_away_probability =
+                EXCLUDED.footballbrain_away_probability,
+
+              ai_pick =
+                EXCLUDED.ai_pick,
+
+              base_score =
+                EXCLUDED.base_score,
+
+              trap_score =
+                EXCLUDED.trap_score,
+
+              cover_score =
+                EXCLUDED.cover_score,
+
+              surprise_score =
+                EXCLUDED.surprise_score,
+
+              recommended_cover =
+                EXCLUDED.recommended_cover,
+
+              recommended_selection =
+                EXCLUDED.recommended_selection,
+
+              prediction_payload =
+                EXCLUDED.prediction_payload,
+
+              updated_at =
+                NOW()
+
+            RETURNING *
+          `,
+          [
+            grid.id,
+            lotoMatch.id,
+            fixtureId,
+
+            scoring.probabilities.home,
+            scoring.probabilities.draw,
+            scoring.probabilities.away,
+
+            scoring.aiPick,
+
+            scoring.baseScore,
+            scoring.trapScore,
+            scoring.coverScore,
+            scoring.surpriseScore,
+
+            scoring.recommendedCover,
+            scoring.recommendedSelection,
+
+            LOTOFOOT_VERSION,
+            JSON.stringify(
+              payload
+            ),
+          ]
+        );
+
+      const saved =
+        upsertResult.rows[0];
+
+      results.push({
+        lineNumber:
+          Number(
+            lotoMatch.line_number
+          ),
+
+        fixtureId,
+
+        homeTeam:
+          lotoMatch.home_team_name,
+
+        awayTeam:
+          lotoMatch.away_team_name,
+
+        status:
+          "ANALYZED",
+
+        probabilities: {
+          "1":
+            scoring.probabilities.home,
+          "N":
+            scoring.probabilities.draw,
+          "2":
+            scoring.probabilities.away,
+        },
+
+        aiPick:
+          saved.ai_pick,
+
+        favoriteProbability:
+          scoring.favoriteProbability,
+
+        margin:
+          scoring.margin,
+
+        baseScore:
+          numberOr(
+            saved.base_score
+          ),
+
+        trapScore:
+          numberOr(
+            saved.trap_score
+          ),
+
+        coverScore:
+          numberOr(
+            saved.cover_score
+          ),
+
+        surpriseScore:
+          numberOr(
+            saved.surprise_score
+          ),
+
+        recommendedCover:
+          saved.recommended_cover,
+
+        recommendedSelection:
+          saved.recommended_selection,
+      });
+    }
+
+    const analyzed =
+      results.filter(
+        (item) =>
+          item.status ===
+            "ANALYZED" ||
+          item.status ===
+            "ALREADY_ANALYZED"
+      ).length;
+
+    const missingBrainData =
+      results.filter(
+        (item) =>
+          item.status ===
+            "MISSING_BRAIN_DATA" ||
+          item.status ===
+            "MISSING_PROBABILITIES"
+      ).length;
+
+    const unmatched =
+      results.filter(
+        (item) =>
+          item.status ===
+          "UNMATCHED_FIXTURE"
+      ).length;
+
+    return {
+      ok: true,
+      version:
+        LOTOFOOT_VERSION,
+
+      gridId:
+        Number(
+          grid.id
+        ),
+
+      gridType:
+        grid.grid_type,
+
+      officialGridNumber:
+        grid.official_grid_number,
+
+      total:
+        results.length,
+
+      analyzed,
+      missingBrainData,
+      unmatched,
+
+      results,
+
+      generatedAt:
+        new Date().toISOString(),
+    };
+  }
+
+  async function getGridAnalysis(
+    gridId
+  ) {
+    await ensureTables();
+
+    const grid =
+      await getGrid(
+        gridId
+      );
+
+    if (!grid) {
+      return null;
+    }
+
+    const result =
+      await pool.query(
+        `
+          SELECT
+            lp.*,
+            lm.line_number,
+            lm.home_team_name,
+            lm.away_team_name,
+            lm.fixture_date,
+            lm.league_name
+          FROM lotofoot_predictions lp
+          INNER JOIN lotofoot_matches lm
+            ON lm.id =
+              lp.lotofoot_match_id
+          WHERE lp.grid_id = $1
+          ORDER BY
+            lm.line_number ASC,
+            lp.id DESC
+        `,
+        [
+          gridId,
+        ]
+      );
+
+    const latestByLine =
+      new Map();
+
+    for (
+      const row of
+      result.rows
+    ) {
+      const line =
+        Number(
+          row.line_number
+        );
+
+      if (
+        !latestByLine.has(
+          line
+        )
+      ) {
+        latestByLine.set(
+          line,
+          row
+        );
+      }
+    }
+
+    return {
+      grid: {
+        id:
+          Number(
+            grid.id
+          ),
+
+        gridType:
+          grid.grid_type,
+
+        officialGridNumber:
+          grid.official_grid_number,
+
+        title:
+          grid.title,
+
+        deadlineAt:
+          grid.deadline_at,
+
+        status:
+          grid.status,
+      },
+
+      predictions:
+        [
+          ...latestByLine.values(),
+        ],
+    };
+  }
+
   async function getStatus() {
     await ensureTables();
 
@@ -1828,6 +2808,91 @@ function createLotoFootEngine({
                 error:
                   error?.message ||
                   "Impossible de charger le statut Loto Foot.",
+              });
+          }
+        }
+      )
+    );
+
+    app.post(
+      "/internal/lotofoot/grid/:gridId/analyze",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const result =
+              await analyzeGrid(
+                req.params.gridId,
+                {
+                  force:
+                    req.body
+                      ?.force === true,
+                }
+              );
+
+            return res.json(
+              result
+            );
+          } catch (error) {
+            console.error(
+              "LOTOFOOT ANALYZE GRID ERROR :",
+              error
+            );
+
+            return res
+              .status(500)
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  error?.message ||
+                  "Impossible d'analyser la grille Loto Foot.",
+              });
+          }
+        }
+      )
+    );
+
+    app.get(
+      "/internal/lotofoot/grid/:gridId/analysis",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const analysis =
+              await getGridAnalysis(
+                req.params.gridId
+              );
+
+            if (!analysis) {
+              return res
+                .status(404)
+                .json({
+                  ok: false,
+                  version:
+                    LOTOFOOT_VERSION,
+                  error:
+                    "Grille Loto Foot introuvable.",
+                });
+            }
+
+            return res.json({
+              ok: true,
+              version:
+                LOTOFOOT_VERSION,
+              ...analysis,
+              generatedAt:
+                new Date().toISOString(),
+            });
+          } catch (error) {
+            return res
+              .status(500)
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  error?.message ||
+                  "Impossible de charger l'analyse Loto Foot.",
               });
           }
         }
@@ -2078,6 +3143,8 @@ function createLotoFootEngine({
     listGrids,
     getGrid,
     matchGridFixtures,
+    analyzeGrid,
+    getGridAnalysis,
     registerRoutes,
     initialize,
 
