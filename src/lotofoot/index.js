@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.5.0-strategy-profiles";
+  "lotofoot-engine-v1.5.1-distinct-strategies";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -1452,24 +1452,27 @@ const LOTOFOOT_STRATEGIES = {
     label: "PRUDENTE",
     objective:
       "MAX_HIT_PROBABILITY",
-    complexityPenalty: 0,
-    triplePenalty: 0,
+    budgetShare: 1,
+    description:
+      "Utilise jusqu'à 100 % du budget pour maximiser la probabilité théorique de couvrir toute la grille.",
   },
 
   BALANCED: {
     label: "ÉQUILIBRÉE",
     objective:
       "BALANCED_COVERAGE_COST",
-    complexityPenalty: 0.07,
-    triplePenalty: 0.025,
+    budgetShare: 0.75,
+    description:
+      "Limite volontairement la complexité à environ 75 % du budget maximum afin de conserver un meilleur compromis couverture/coût.",
   },
 
   OFFENSIVE: {
     label: "OFFENSIVE",
     objective:
       "SELECTIVE_PROTECTION",
-    complexityPenalty: 0.16,
-    triplePenalty: 0.08,
+    budgetShare: 0.5,
+    description:
+      "N'utilise qu'environ 50 % du budget maximum : davantage de bases sont assumées et seules les protections les plus rentables sont conservées.",
   },
 };
 
@@ -1514,8 +1517,6 @@ function normalizeStrategy(
 
 function strategyCandidateUtility({
   coverageProbability,
-  factor,
-  strategy,
 }) {
   const p =
     Math.max(
@@ -1528,41 +1529,130 @@ function strategyCandidateUtility({
       )
     );
 
-  const profile =
-    LOTOFOOT_STRATEGIES[
-      normalizeStrategy(
-        strategy
-      )
-    ];
+  return Math.log(p);
+}
 
-  const complexityCost =
-    Math.log(
+function computeCoverageDistribution(
+  lines = []
+) {
+  /*
+   * Distribution Poisson-binomiale des lignes couvertes.
+   * Hypothèse : indépendance entre les matchs.
+   *
+   * distribution[k] = probabilité d'obtenir exactement k lignes correctes.
+   */
+  let distribution = [1];
+
+  for (const line of lines) {
+    const p =
       Math.max(
-        1,
+        0,
+        Math.min(
+          1,
+          numberOr(
+            line?.coveredProbability
+          ) / 100
+        )
+      );
+
+    const next =
+      new Array(
+        distribution.length + 1
+      ).fill(0);
+
+    for (
+      let k = 0;
+      k < distribution.length;
+      k += 1
+    ) {
+      next[k] +=
+        distribution[k] *
+        (1 - p);
+
+      next[k + 1] +=
+        distribution[k] *
+        p;
+    }
+
+    distribution = next;
+  }
+
+  const totalLines =
+    lines.length;
+
+  function exact(k) {
+    return Number(
+      (
         numberOr(
-          factor,
-          1
-        )
-      )
-    ) *
-    numberOr(
-      profile
-        ?.complexityPenalty
+          distribution[k]
+        ) *
+        100
+      ).toFixed(6)
     );
+  }
 
-  const tripleCost =
-    Number(factor) === 3
-      ? numberOr(
-          profile
-            ?.triplePenalty
-        )
-      : 0;
+  function atLeast(k) {
+    let total = 0;
 
-  return (
-    Math.log(p) -
-    complexityCost -
-    tripleCost
-  );
+    for (
+      let index = k;
+      index <= totalLines;
+      index += 1
+    ) {
+      total +=
+        numberOr(
+          distribution[index]
+        );
+    }
+
+    return Number(
+      (
+        total * 100
+      ).toFixed(6)
+    );
+  }
+
+  return {
+    totalLines,
+
+    exact: {
+      perfect:
+        exact(totalLines),
+
+      minusOne:
+        totalLines >= 1
+          ? exact(
+              totalLines - 1
+            )
+          : null,
+
+      minusTwo:
+        totalLines >= 2
+          ? exact(
+              totalLines - 2
+            )
+          : null,
+    },
+
+    atLeast: {
+      perfect:
+        atLeast(totalLines),
+
+      minusOne:
+        totalLines >= 1
+          ? atLeast(
+              totalLines - 1
+            )
+          : null,
+
+      minusTwo:
+        totalLines >= 2
+          ? atLeast(
+              totalLines - 2
+            )
+          : null,
+    },
+  };
 }
 
 function optimizeGridSelectionsByStrategy({
@@ -1670,10 +1760,6 @@ function optimizeGridSelectionsByStrategy({
             coverageProbability:
               candidate
                 .coverageProbability,
-            factor:
-              candidate.factor,
-            strategy:
-              normalizedStrategy,
           });
 
         const newState = {
@@ -4186,10 +4272,29 @@ function createLotoFootEngine({
         "OFFENSIVE",
       ]
     ) {
+      const profile =
+        LOTOFOOT_STRATEGIES[
+          strategy
+        ];
+
+      const strategyMaxCombinations =
+        Math.max(
+          1,
+          Math.floor(
+            maxCombinations *
+            numberOr(
+              profile
+                ?.budgetShare,
+              1
+            )
+          )
+        );
+
       const result =
         optimizeGridSelectionsByStrategy({
           predictions,
-          maxCombinations,
+          maxCombinations:
+            strategyMaxCombinations,
           strategy,
         });
 
@@ -4201,17 +4306,44 @@ function createLotoFootEngine({
           ).toFixed(2)
         );
 
+      const rankProfile =
+        computeCoverageDistribution(
+          result.lines
+        );
+
       strategies[strategy] = {
         ...result,
+
+        description:
+          profile?.description ||
+          null,
 
         requestedBudget,
 
         unitStake:
           effectiveUnitStake,
 
-        maxCombinations,
+        globalMaxCombinations:
+          maxCombinations,
+
+        strategyMaxCombinations,
+
+        budgetShare:
+          profile?.budgetShare ||
+          1,
 
         usedBudget,
+
+        unusedBudget:
+          Number(
+            Math.max(
+              0,
+              requestedBudget -
+              usedBudget
+            ).toFixed(2)
+          ),
+
+        rankProfile,
       };
 
       if (persist) {
@@ -4245,7 +4377,7 @@ function createLotoFootEngine({
             LOTOFOOT_VERSION,
             requestedBudget,
             effectiveUnitStake,
-            maxCombinations,
+            strategyMaxCombinations,
             result.combinations,
             result
               .theoreticalHitProbability,
@@ -4253,10 +4385,25 @@ function createLotoFootEngine({
             JSON.stringify({
               strategy,
               result,
+              description:
+                profile?.description ||
+                null,
               requestedBudget,
               effectiveUnitStake,
-              maxCombinations,
+              globalMaxCombinations:
+                maxCombinations,
+              strategyMaxCombinations,
+              budgetShare:
+                profile?.budgetShare ||
+                1,
               usedBudget,
+              unusedBudget:
+                Math.max(
+                  0,
+                  requestedBudget -
+                  usedBudget
+                ),
+              rankProfile,
             }),
           ]
         );
@@ -4308,6 +4455,17 @@ function createLotoFootEngine({
         effectiveUnitStake,
 
       maxCombinations,
+
+      strategyPolicy: {
+        PRUDENT:
+          "jusqu'à 100 % du budget",
+
+        BALANCED:
+          "jusqu'à 75 % du budget",
+
+        OFFENSIVE:
+          "jusqu'à 50 % du budget",
+      },
 
       strategies,
 
