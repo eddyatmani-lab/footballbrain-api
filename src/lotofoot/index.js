@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.3.0-footballbrain-scoring";
+  "lotofoot-engine-v1.4.0-grid-optimizer";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -967,6 +967,485 @@ function computeLotoFootScores({
   };
 }
 
+
+function selectionProbability(
+  row,
+  selection
+) {
+  const probabilities = {
+    "1": numberOr(
+      row?.footballbrain_home_probability
+    ),
+    "N": numberOr(
+      row?.footballbrain_draw_probability
+    ),
+    "2": numberOr(
+      row?.footballbrain_away_probability
+    ),
+  };
+
+  const normalized =
+    String(selection || "")
+      .toUpperCase();
+
+  let total = 0;
+
+  for (const pick of ["1", "N", "2"]) {
+    if (normalized.includes(pick)) {
+      total += probabilities[pick];
+    }
+  }
+
+  return Math.max(
+    0,
+    Math.min(
+      100,
+      total
+    )
+  );
+}
+
+function normalizeSelection(
+  value
+) {
+  const normalized =
+    String(value || "")
+      .trim()
+      .toUpperCase();
+
+  const allowed = new Set([
+    "1",
+    "N",
+    "2",
+    "1N",
+    "12",
+    "N2",
+    "1N2",
+  ]);
+
+  return allowed.has(normalized)
+    ? normalized
+    : null;
+}
+
+function selectionCombinationFactor(
+  selection
+) {
+  const normalized =
+    normalizeSelection(
+      selection
+    );
+
+  if (!normalized) {
+    return 1;
+  }
+
+  if (normalized === "1N2") {
+    return 3;
+  }
+
+  if (
+    normalized === "1N" ||
+    normalized === "12" ||
+    normalized === "N2"
+  ) {
+    return 2;
+  }
+
+  return 1;
+}
+
+function buildSelectionCandidates(
+  prediction
+) {
+  const probabilities = {
+    "1": numberOr(
+      prediction
+        ?.footballbrain_home_probability
+    ),
+    "N": numberOr(
+      prediction
+        ?.footballbrain_draw_probability
+    ),
+    "2": numberOr(
+      prediction
+        ?.footballbrain_away_probability
+    ),
+  };
+
+  const ranking = [
+    {
+      pick: "1",
+      probability:
+        probabilities["1"],
+    },
+    {
+      pick: "N",
+      probability:
+        probabilities["N"],
+    },
+    {
+      pick: "2",
+      probability:
+        probabilities["2"],
+    },
+  ].sort(
+    (a, b) =>
+      b.probability -
+      a.probability
+  );
+
+  const first =
+    ranking[0]?.pick;
+
+  const second =
+    ranking[1]?.pick;
+
+  const order = {
+    "1": 1,
+    "N": 2,
+    "2": 3,
+  };
+
+  const double =
+    [first, second]
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          order[a] -
+          order[b]
+      )
+      .join("");
+
+  const candidates = [
+    first,
+    double,
+    "1N2",
+  ]
+    .map(
+      normalizeSelection
+    )
+    .filter(Boolean);
+
+  const unique =
+    [...new Set(candidates)];
+
+  return unique.map(
+    (selection) => ({
+      selection,
+
+      factor:
+        selectionCombinationFactor(
+          selection
+        ),
+
+      coverageProbability:
+        Number(
+          selectionProbability(
+            prediction,
+            selection
+          ).toFixed(4)
+        ),
+    })
+  );
+}
+
+function gridProbabilityScore(
+  coverageProbabilities
+) {
+  /*
+   * Probabilité théorique d'une couverture parfaite si l'on suppose
+   * les lignes indépendantes.
+   *
+   * On travaille en log pour éviter les sous-flux numériques.
+   */
+  let logProbability = 0;
+
+  for (
+    const probability of
+    coverageProbabilities
+  ) {
+    const p =
+      Math.max(
+        0.000001,
+        Math.min(
+          0.999999,
+          numberOr(probability) /
+          100
+        )
+      );
+
+    logProbability +=
+      Math.log(p);
+  }
+
+  return Math.exp(
+    logProbability
+  );
+}
+
+function optimizeGridSelections({
+  predictions,
+  maxCombinations,
+} = {}) {
+  const rows =
+    Array.isArray(predictions)
+      ? predictions
+      : [];
+
+  const budget =
+    Math.max(
+      1,
+      Math.floor(
+        numberOr(
+          maxCombinations,
+          1
+        )
+      )
+    );
+
+  if (
+    rows.length === 0
+  ) {
+    return {
+      combinations: 0,
+      theoreticalHitProbability: 0,
+      lines: [],
+    };
+  }
+
+  const candidateSets =
+    rows.map(
+      (row) => ({
+        row,
+        candidates:
+          buildSelectionCandidates(
+            row
+          ),
+      })
+    );
+
+  /*
+   * Dynamic Programming.
+   *
+   * État :
+   * - nombre de combinaisons déjà utilisées
+   * - meilleur log-probability obtenu
+   *
+   * On garde un seul meilleur chemin pour chaque coût exact.
+   */
+  let states =
+    new Map();
+
+  states.set(
+    1,
+    {
+      combinations: 1,
+      logProbability: 0,
+      selections: [],
+    }
+  );
+
+  for (
+    const entry of
+    candidateSets
+  ) {
+    const next =
+      new Map();
+
+    for (
+      const state of
+      states.values()
+    ) {
+      for (
+        const candidate of
+        entry.candidates
+      ) {
+        const newCombinations =
+          state.combinations *
+          candidate.factor;
+
+        if (
+          newCombinations >
+          budget
+        ) {
+          continue;
+        }
+
+        const p =
+          Math.max(
+            0.000001,
+            Math.min(
+              0.999999,
+              candidate
+                .coverageProbability /
+              100
+            )
+          );
+
+        const newState = {
+          combinations:
+            newCombinations,
+
+          logProbability:
+            state.logProbability +
+            Math.log(p),
+
+          selections: [
+            ...state.selections,
+            {
+              prediction:
+                entry.row,
+
+              selection:
+                candidate.selection,
+
+              factor:
+                candidate.factor,
+
+              coverageProbability:
+                candidate
+                  .coverageProbability,
+            },
+          ],
+        };
+
+        const existing =
+          next.get(
+            newCombinations
+          );
+
+        if (
+          !existing ||
+          newState.logProbability >
+            existing.logProbability
+        ) {
+          next.set(
+            newCombinations,
+            newState
+          );
+        }
+      }
+    }
+
+    states = next;
+  }
+
+  if (
+    states.size === 0
+  ) {
+    return {
+      combinations: 0,
+      theoreticalHitProbability: 0,
+      lines: [],
+    };
+  }
+
+  const best =
+    [...states.values()]
+      .sort(
+        (a, b) => {
+          const probabilityDiff =
+            b.logProbability -
+            a.logProbability;
+
+          if (
+            Math.abs(
+              probabilityDiff
+            ) >
+            1e-12
+          ) {
+            return probabilityDiff;
+          }
+
+          /*
+           * À probabilité identique, on préfère la grille la moins chère.
+           */
+          return (
+            a.combinations -
+            b.combinations
+          );
+        }
+      )[0];
+
+  return {
+    combinations:
+      best.combinations,
+
+    theoreticalHitProbability:
+      Number(
+        (
+          Math.exp(
+            best.logProbability
+          ) *
+          100
+        ).toFixed(6)
+      ),
+
+    lines:
+      best.selections.map(
+        (item) => ({
+          lineNumber:
+            Number(
+              item.prediction
+                ?.line_number
+            ),
+
+          fixtureId:
+            Number(
+              item.prediction
+                ?.fixture_id
+            ),
+
+          homeTeam:
+            item.prediction
+              ?.home_team_name,
+
+          awayTeam:
+            item.prediction
+              ?.away_team_name,
+
+          aiPick:
+            item.prediction
+              ?.ai_pick,
+
+          selection:
+            item.selection,
+
+          factor:
+            item.factor,
+
+          coveredProbability:
+            item.coverageProbability,
+
+          baseScore:
+            numberOr(
+              item.prediction
+                ?.base_score
+            ),
+
+          trapScore:
+            numberOr(
+              item.prediction
+                ?.trap_score
+            ),
+
+          coverScore:
+            numberOr(
+              item.prediction
+                ?.cover_score
+            ),
+
+          surpriseScore:
+            numberOr(
+              item.prediction
+                ?.surprise_score
+            ),
+        })
+      ),
+  };
+}
+
 function createLotoFootEngine({
   app,
   pool,
@@ -1311,6 +1790,51 @@ function createLotoFootEngine({
           learning_bucket,
           learning_version
         )
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS lotofoot_grid_optimizations (
+        id BIGSERIAL PRIMARY KEY,
+
+        grid_id BIGINT NOT NULL
+          REFERENCES lotofoot_grids(id)
+          ON DELETE CASCADE,
+
+        analysis_version TEXT NOT NULL,
+
+        requested_budget NUMERIC(10,2)
+          NOT NULL,
+
+        unit_stake NUMERIC(10,2)
+          NOT NULL DEFAULT 1.00,
+
+        max_combinations INTEGER
+          NOT NULL,
+
+        used_combinations INTEGER
+          NOT NULL,
+
+        theoretical_hit_probability
+          NUMERIC(14,8),
+
+        strategy TEXT
+          NOT NULL DEFAULT 'MAX_HIT_PROBABILITY',
+
+        optimization_payload JSONB
+          NOT NULL DEFAULT '{}'::jsonb,
+
+        created_at TIMESTAMPTZ
+          NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS
+        idx_lotofoot_grid_optimizations_grid
+      ON lotofoot_grid_optimizations (
+        grid_id,
+        created_at DESC
       );
     `);
 
@@ -2653,6 +3177,284 @@ function createLotoFootEngine({
     };
   }
 
+
+  async function optimizeGrid(
+    gridId,
+    {
+      budget = 8,
+      unitStake = null,
+      persist = true,
+    } = {}
+  ) {
+    await ensureTables();
+
+    const gridAnalysis =
+      await getGridAnalysis(
+        gridId
+      );
+
+    if (!gridAnalysis) {
+      throw new Error(
+        "Grille Loto Foot introuvable."
+      );
+    }
+
+    const grid =
+      gridAnalysis.grid;
+
+    const predictions =
+      Array.isArray(
+        gridAnalysis.predictions
+      )
+        ? gridAnalysis.predictions
+        : [];
+
+    const expectedLines =
+      Number(
+        String(
+          grid.gridType || ""
+        )
+          .replace(
+            /\D/g,
+            ""
+          )
+      );
+
+    if (
+      predictions.length === 0
+    ) {
+      throw new Error(
+        "Aucune prédiction Loto Foot disponible. Lance d'abord /analyze."
+      );
+    }
+
+    /*
+     * On vérifie qu'une ligne analysée existe pour chaque ligne réellement
+     * stockée dans la grille, pas uniquement le nombre théorique du nom LF.
+     */
+    const fullGrid =
+      await getGrid(
+        gridId
+      );
+
+    const actualMatchCount =
+      Array.isArray(
+        fullGrid?.matches
+      )
+        ? fullGrid.matches.length
+        : 0;
+
+    if (
+      predictions.length !==
+      actualMatchCount
+    ) {
+      throw new Error(
+        `Analyse incomplète : ${predictions.length}/${actualMatchCount} lignes disponibles.`
+      );
+    }
+
+    const storedUnitStake =
+      numberOr(
+        fullGrid?.unit_stake,
+        1
+      );
+
+    const effectiveUnitStake =
+      Number.isFinite(
+        Number(unitStake)
+      ) &&
+      Number(unitStake) > 0
+        ? Number(unitStake)
+        : storedUnitStake > 0
+          ? storedUnitStake
+          : 1;
+
+    const requestedBudget =
+      Math.max(
+        effectiveUnitStake,
+        numberOr(
+          budget,
+          effectiveUnitStake
+        )
+      );
+
+    const maxCombinations =
+      Math.max(
+        1,
+        Math.floor(
+          requestedBudget /
+          effectiveUnitStake
+        )
+      );
+
+    const optimization =
+      optimizeGridSelections({
+        predictions,
+        maxCombinations,
+      });
+
+    const usedBudget =
+      Number(
+        (
+          optimization.combinations *
+          effectiveUnitStake
+        ).toFixed(2)
+      );
+
+    const payload = {
+      methodology:
+        "grid-optimizer-dp-v1",
+
+      strategy:
+        "MAX_HIT_PROBABILITY",
+
+      requestedBudget,
+
+      unitStake:
+        effectiveUnitStake,
+
+      maxCombinations,
+
+      usedCombinations:
+        optimization.combinations,
+
+      usedBudget,
+
+      theoreticalHitProbability:
+        optimization
+          .theoreticalHitProbability,
+
+      assumptions: [
+        "Les probabilités proviennent de FootballBrain.",
+        "La probabilité théorique de grille suppose les matchs indépendants.",
+        "Le budget limite le produit des facteurs SIMPLE=1, DOUBLE=2, TRIPLE=3.",
+      ],
+
+      lines:
+        optimization.lines,
+    };
+
+    if (persist) {
+      await pool.query(
+        `
+          INSERT INTO lotofoot_grid_optimizations (
+            grid_id,
+            analysis_version,
+            requested_budget,
+            unit_stake,
+            max_combinations,
+            used_combinations,
+            theoretical_hit_probability,
+            strategy,
+            optimization_payload
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            'MAX_HIT_PROBABILITY',
+            $8::jsonb
+          )
+        `,
+        [
+          gridId,
+          LOTOFOOT_VERSION,
+          requestedBudget,
+          effectiveUnitStake,
+          maxCombinations,
+          optimization.combinations,
+          optimization
+            .theoreticalHitProbability,
+          JSON.stringify(
+            payload
+          ),
+        ]
+      );
+    }
+
+    return {
+      ok: true,
+
+      version:
+        LOTOFOOT_VERSION,
+
+      gridId:
+        Number(
+          grid.id
+        ),
+
+      gridType:
+        grid.gridType,
+
+      officialGridNumber:
+        grid.officialGridNumber,
+
+      requestedBudget,
+
+      unitStake:
+        effectiveUnitStake,
+
+      maxCombinations,
+
+      usedCombinations:
+        optimization.combinations,
+
+      usedBudget,
+
+      theoreticalHitProbability:
+        optimization
+          .theoreticalHitProbability,
+
+      strategy:
+        "MAX_HIT_PROBABILITY",
+
+      lines:
+        optimization.lines,
+
+      generatedAt:
+        new Date().toISOString(),
+    };
+  }
+
+  async function getOptimizationHistory(
+    gridId,
+    {
+      limit = 20,
+    } = {}
+  ) {
+    await ensureTables();
+
+    const safeLimit =
+      Math.max(
+        1,
+        Math.min(
+          100,
+          Number(limit) || 20
+        )
+      );
+
+    const result =
+      await pool.query(
+        `
+          SELECT *
+          FROM lotofoot_grid_optimizations
+          WHERE grid_id = $1
+          ORDER BY created_at DESC
+          LIMIT $2
+        `,
+        [
+          gridId,
+          safeLimit,
+        ]
+      );
+
+    return result.rows;
+  }
+
   async function getStatus() {
     await ensureTables();
 
@@ -2808,6 +3610,99 @@ function createLotoFootEngine({
                 error:
                   error?.message ||
                   "Impossible de charger le statut Loto Foot.",
+              });
+          }
+        }
+      )
+    );
+
+    app.post(
+      "/internal/lotofoot/grid/:gridId/optimize",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const result =
+              await optimizeGrid(
+                req.params.gridId,
+                {
+                  budget:
+                    req.body
+                      ?.budget ?? 8,
+
+                  unitStake:
+                    req.body
+                      ?.unitStake ??
+                    null,
+
+                  persist:
+                    req.body
+                      ?.persist !== false,
+                }
+              );
+
+            return res.json(
+              result
+            );
+          } catch (error) {
+            console.error(
+              "LOTOFOOT GRID OPTIMIZER ERROR :",
+              error
+            );
+
+            return res
+              .status(500)
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  error?.message ||
+                  "Impossible d'optimiser la grille Loto Foot.",
+              });
+          }
+        }
+      )
+    );
+
+    app.get(
+      "/internal/lotofoot/grid/:gridId/optimizations",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const history =
+              await getOptimizationHistory(
+                req.params.gridId,
+                {
+                  limit:
+                    req.query?.limit,
+                }
+              );
+
+            return res.json({
+              ok: true,
+              version:
+                LOTOFOOT_VERSION,
+              gridId:
+                Number(
+                  req.params.gridId
+                ),
+              count:
+                history.length,
+              optimizations:
+                history,
+              generatedAt:
+                new Date().toISOString(),
+            });
+          } catch (error) {
+            return res
+              .status(500)
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  error?.message ||
+                  "Impossible de charger l'historique des optimisations.",
               });
           }
         }
@@ -3145,6 +4040,8 @@ function createLotoFootEngine({
     matchGridFixtures,
     analyzeGrid,
     getGridAnalysis,
+    optimizeGrid,
+    getOptimizationHistory,
     registerRoutes,
     initialize,
 
