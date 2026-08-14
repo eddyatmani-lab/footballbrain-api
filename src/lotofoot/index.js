@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.0.0";
+  "lotofoot-engine-v1.1.0-manual-import";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -136,6 +136,290 @@ function normalizeProbabilityTriple({
         100
       ).toFixed(2)
     ),
+  };
+}
+
+
+const GRID_LINE_RULES = {
+  LF7: {
+    standard: 7,
+    allowed: [6, 7],
+  },
+  LF8: {
+    standard: 8,
+    allowed: [7, 8],
+  },
+  LF12: {
+    standard: 12,
+    allowed: [9, 10, 11, 12],
+  },
+  LF15: {
+    standard: 15,
+    allowed: [12, 13, 14, 15],
+  },
+};
+
+function normalizeText(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function nullablePercent(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return null;
+  }
+
+  const number = Number(value);
+
+  if (
+    !Number.isFinite(number) ||
+    number < 0 ||
+    number > 100
+  ) {
+    return NaN;
+  }
+
+  return Number(number.toFixed(2));
+}
+
+function validateManualGridPayload(payload) {
+  const gridType =
+    normalizeGridType(
+      payload?.gridType
+    );
+
+  if (!gridType) {
+    throw new Error(
+      "gridType invalide. Valeurs acceptées : LF7, LF8, LF12, LF15."
+    );
+  }
+
+  const matches =
+    Array.isArray(payload?.matches)
+      ? payload.matches
+      : [];
+
+  const rule =
+    GRID_LINE_RULES[gridType];
+
+  if (
+    !rule.allowed.includes(
+      matches.length
+    )
+  ) {
+    throw new Error(
+      `${gridType} : ${matches.length} lignes reçues. Nombre autorisé : ${rule.allowed.join(", ")}.`
+    );
+  }
+
+  const seen =
+    new Set();
+
+  const normalizedMatches =
+    matches.map(
+      (match, index) => {
+        const lineNumber =
+          Number(
+            match?.lineNumber ??
+            index + 1
+          );
+
+        if (
+          !Number.isInteger(
+            lineNumber
+          ) ||
+          lineNumber <= 0
+        ) {
+          throw new Error(
+            `Ligne ${index + 1} : lineNumber invalide.`
+          );
+        }
+
+        if (
+          seen.has(lineNumber)
+        ) {
+          throw new Error(
+            `lineNumber ${lineNumber} présent plusieurs fois.`
+          );
+        }
+
+        seen.add(lineNumber);
+
+        const homeTeam =
+          normalizeText(
+            match?.homeTeam
+          );
+
+        const awayTeam =
+          normalizeText(
+            match?.awayTeam
+          );
+
+        if (
+          !homeTeam ||
+          !awayTeam
+        ) {
+          throw new Error(
+            `Ligne ${lineNumber} : les deux équipes sont obligatoires.`
+          );
+        }
+
+        const publicData =
+          match?.public || {};
+
+        const homePercent =
+          nullablePercent(
+            publicData["1"] ??
+            match?.publicHomePercent
+          );
+
+        const drawPercent =
+          nullablePercent(
+            publicData["N"] ??
+            publicData["n"] ??
+            match?.publicDrawPercent
+          );
+
+        const awayPercent =
+          nullablePercent(
+            publicData["2"] ??
+            match?.publicAwayPercent
+          );
+
+        if (
+          Number.isNaN(homePercent) ||
+          Number.isNaN(drawPercent) ||
+          Number.isNaN(awayPercent)
+        ) {
+          throw new Error(
+            `Ligne ${lineNumber} : pourcentage public invalide (0 à 100 attendu).`
+          );
+        }
+
+        const percentages =
+          [
+            homePercent,
+            drawPercent,
+            awayPercent,
+          ];
+
+        const provided =
+          percentages.filter(
+            (value) =>
+              value !== null
+          );
+
+        if (
+          provided.length !== 0 &&
+          provided.length !== 3
+        ) {
+          throw new Error(
+            `Ligne ${lineNumber} : renseigne les 3 pourcentages publics 1/N/2 ou aucun.`
+          );
+        }
+
+        if (
+          provided.length === 3
+        ) {
+          const sum =
+            provided.reduce(
+              (total, value) =>
+                total + value,
+              0
+            );
+
+          if (
+            Math.abs(
+              sum - 100
+            ) > 2
+          ) {
+            throw new Error(
+              `Ligne ${lineNumber} : les pourcentages publics totalisent ${sum.toFixed(2)} %, attendu environ 100 %.`
+            );
+          }
+        }
+
+        return {
+          lineNumber,
+          homeTeam,
+          awayTeam,
+          fixtureId:
+            match?.fixtureId
+              ? Number(
+                  match.fixtureId
+                )
+              : null,
+          fixtureDate:
+            match?.fixtureDate ||
+            null,
+          leagueId:
+            match?.leagueId
+              ? Number(
+                  match.leagueId
+                )
+              : null,
+          leagueName:
+            normalizeText(
+              match?.leagueName
+            ) || null,
+          publicHomePercent:
+            homePercent,
+          publicDrawPercent:
+            drawPercent,
+          publicAwayPercent:
+            awayPercent,
+          metadata:
+            match?.metadata &&
+            typeof match.metadata ===
+              "object"
+              ? match.metadata
+              : {},
+        };
+      }
+    );
+
+  normalizedMatches.sort(
+    (a, b) =>
+      a.lineNumber -
+      b.lineNumber
+  );
+
+  return {
+    gridType,
+    officialGridNumber:
+      normalizeText(
+        payload?.officialGridNumber
+      ) || null,
+    title:
+      normalizeText(
+        payload?.title
+      ) || null,
+    deadlineAt:
+      payload?.deadlineAt ||
+      null,
+    unitStake:
+      Number.isFinite(
+        Number(
+          payload?.unitStake
+        )
+      )
+        ? Number(
+            payload.unitStake
+          )
+        : 1,
+    metadata:
+      payload?.metadata &&
+      typeof payload.metadata ===
+        "object"
+        ? payload.metadata
+        : {},
+    matches:
+      normalizedMatches,
   };
 }
 
@@ -499,6 +783,307 @@ function createLotoFootEngine({
     `);
   }
 
+
+  async function importManualGrid(
+    payload
+  ) {
+    await ensureTables();
+
+    const data =
+      validateManualGridPayload(
+        payload
+      );
+
+    const client =
+      await pool.connect();
+
+    try {
+      await client.query(
+        "BEGIN"
+      );
+
+      let existingGrid =
+        null;
+
+      if (
+        data.officialGridNumber
+      ) {
+        const existingResult =
+          await client.query(
+            `
+              SELECT id
+              FROM lotofoot_grids
+              WHERE grid_type = $1
+                AND official_grid_number = $2
+              LIMIT 1
+            `,
+            [
+              data.gridType,
+              data.officialGridNumber,
+            ]
+          );
+
+        existingGrid =
+          existingResult.rows[0] ||
+          null;
+      }
+
+      if (existingGrid) {
+        throw new Error(
+          `La grille ${data.gridType} n°${data.officialGridNumber} existe déjà (id ${existingGrid.id}).`
+        );
+      }
+
+      const gridResult =
+        await client.query(
+          `
+            INSERT INTO lotofoot_grids (
+              grid_type,
+              official_grid_number,
+              source,
+              title,
+              deadline_at,
+              status,
+              unit_stake,
+              metadata,
+              updated_at
+            )
+            VALUES (
+              $1,
+              $2,
+              'MANUAL_IMPORT',
+              $3,
+              $4,
+              'IMPORTED',
+              $5,
+              $6::jsonb,
+              NOW()
+            )
+            RETURNING *
+          `,
+          [
+            data.gridType,
+            data.officialGridNumber,
+            data.title,
+            data.deadlineAt,
+            data.unitStake,
+            JSON.stringify(
+              data.metadata
+            ),
+          ]
+        );
+
+      const grid =
+        gridResult.rows[0];
+
+      const insertedMatches =
+        [];
+
+      for (
+        const match of
+        data.matches
+      ) {
+        const matchResult =
+          await client.query(
+            `
+              INSERT INTO lotofoot_matches (
+                grid_id,
+                line_number,
+                fixture_id,
+                home_team_name,
+                away_team_name,
+                fixture_date,
+                league_id,
+                league_name,
+                matching_status,
+                matching_confidence,
+                public_home_percent,
+                public_draw_percent,
+                public_away_percent,
+                metadata,
+                updated_at
+              )
+              VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10,
+                $11,
+                $12,
+                $13,
+                $14::jsonb,
+                NOW()
+              )
+              RETURNING *
+            `,
+            [
+              grid.id,
+              match.lineNumber,
+              match.fixtureId,
+              match.homeTeam,
+              match.awayTeam,
+              match.fixtureDate,
+              match.leagueId,
+              match.leagueName,
+              match.fixtureId
+                ? "MANUAL_FIXTURE"
+                : "UNMATCHED",
+              match.fixtureId
+                ? 100
+                : null,
+              match.publicHomePercent,
+              match.publicDrawPercent,
+              match.publicAwayPercent,
+              JSON.stringify(
+                match.metadata
+              ),
+            ]
+          );
+
+        insertedMatches.push(
+          matchResult.rows[0]
+        );
+      }
+
+      await client.query(
+        "COMMIT"
+      );
+
+      return {
+        ok: true,
+        version:
+          LOTOFOOT_VERSION,
+        imported: true,
+        grid: {
+          id:
+            numberOr(grid.id),
+          gridType:
+            grid.grid_type,
+          officialGridNumber:
+            grid.official_grid_number,
+          source:
+            grid.source,
+          title:
+            grid.title,
+          deadlineAt:
+            grid.deadline_at,
+          status:
+            grid.status,
+          unitStake:
+            numberOr(
+              grid.unit_stake,
+              1
+            ),
+          matches:
+            insertedMatches.length,
+        },
+        generatedAt:
+          new Date().toISOString(),
+      };
+    } catch (error) {
+      await client.query(
+        "ROLLBACK"
+      );
+
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async function listGrids({
+    limit = 50,
+  } = {}) {
+    await ensureTables();
+
+    const safeLimit =
+      Math.max(
+        1,
+        Math.min(
+          200,
+          Number(limit) || 50
+        )
+      );
+
+    const result =
+      await pool.query(
+        `
+          SELECT
+            g.*,
+            COUNT(m.id)::INTEGER
+              AS match_count
+          FROM lotofoot_grids g
+          LEFT JOIN lotofoot_matches m
+            ON m.grid_id = g.id
+          GROUP BY g.id
+          ORDER BY
+            g.deadline_at DESC NULLS LAST,
+            g.id DESC
+          LIMIT $1
+        `,
+        [safeLimit]
+      );
+
+    return result.rows;
+  }
+
+  async function getGrid(
+    gridId
+  ) {
+    await ensureTables();
+
+    const id =
+      Number(gridId);
+
+    if (
+      !Number.isInteger(id) ||
+      id <= 0
+    ) {
+      return null;
+    }
+
+    const gridResult =
+      await pool.query(
+        `
+          SELECT *
+          FROM lotofoot_grids
+          WHERE id = $1
+          LIMIT 1
+        `,
+        [id]
+      );
+
+    const grid =
+      gridResult.rows[0];
+
+    if (!grid) {
+      return null;
+    }
+
+    const matchesResult =
+      await pool.query(
+        `
+          SELECT *
+          FROM lotofoot_matches
+          WHERE grid_id = $1
+          ORDER BY line_number ASC
+        `,
+        [id]
+      );
+
+    return {
+      ...grid,
+      matches:
+        matchesResult.rows,
+    };
+  }
+
   async function getStatus() {
     await ensureTables();
 
@@ -661,6 +1246,135 @@ function createLotoFootEngine({
     );
 
     app.post(
+      "/internal/lotofoot/import-grid",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const result =
+              await importManualGrid(
+                req.body || {}
+              );
+
+            return res
+              .status(201)
+              .json(result);
+          } catch (error) {
+            console.error(
+              "LOTOFOOT IMPORT GRID ERROR :",
+              error
+            );
+
+            const message =
+              error?.message ||
+              "Impossible d'importer la grille Loto Foot.";
+
+            const isDuplicate =
+              /existe déjà/i.test(
+                message
+              );
+
+            return res
+              .status(
+                isDuplicate
+                  ? 409
+                  : 400
+              )
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  message,
+              });
+          }
+        }
+      )
+    );
+
+    app.get(
+      "/internal/lotofoot/grids",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const grids =
+              await listGrids({
+                limit:
+                  req.query?.limit,
+              });
+
+            return res.json({
+              ok: true,
+              version:
+                LOTOFOOT_VERSION,
+              count:
+                grids.length,
+              grids,
+              generatedAt:
+                new Date().toISOString(),
+            });
+          } catch (error) {
+            return res
+              .status(500)
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  error?.message ||
+                  "Impossible de lister les grilles.",
+              });
+          }
+        }
+      )
+    );
+
+    app.get(
+      "/internal/lotofoot/grid/:gridId",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const grid =
+              await getGrid(
+                req.params.gridId
+              );
+
+            if (!grid) {
+              return res
+                .status(404)
+                .json({
+                  ok: false,
+                  version:
+                    LOTOFOOT_VERSION,
+                  error:
+                    "Grille Loto Foot introuvable.",
+                });
+            }
+
+            return res.json({
+              ok: true,
+              version:
+                LOTOFOOT_VERSION,
+              grid,
+              generatedAt:
+                new Date().toISOString(),
+            });
+          } catch (error) {
+            return res
+              .status(500)
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  error?.message ||
+                  "Impossible de charger la grille.",
+              });
+          }
+        }
+      )
+    );
+
+    app.post(
       "/internal/lotofoot/ensure-tables",
       protectAdmin(
         async (req, res) => {
@@ -727,6 +1441,9 @@ function createLotoFootEngine({
 
     ensureTables,
     getStatus,
+    importManualGrid,
+    listGrids,
+    getGrid,
     registerRoutes,
     initialize,
 
