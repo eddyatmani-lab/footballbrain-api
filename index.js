@@ -391,6 +391,7 @@ const lotoFootEngine =
   createLotoFootEngine({
     app,
     pool,
+    callApiFootball,
 
     adminGuard(req, res, next) {
       if (

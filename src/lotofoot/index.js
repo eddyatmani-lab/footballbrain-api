@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.1.0-manual-import";
+  "lotofoot-engine-v1.2.0-fixture-matcher";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -423,9 +423,231 @@ function validateManualGridPayload(payload) {
   };
 }
 
+
+function normalizeTeamNameForMatch(
+  value
+) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .toLowerCase()
+    .replace(
+      /\b(fc|afc|sc|ac|as|rc|cf|club|football|foot)\b/g,
+      " "
+    )
+    .replace(
+      /[^a-z0-9]+/g,
+      " "
+    )
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function teamNameSimilarity(
+  expected,
+  candidate
+) {
+  const a =
+    normalizeTeamNameForMatch(
+      expected
+    );
+
+  const b =
+    normalizeTeamNameForMatch(
+      candidate
+    );
+
+  if (!a || !b) {
+    return 0;
+  }
+
+  if (a === b) {
+    return 100;
+  }
+
+  if (
+    a.includes(b) ||
+    b.includes(a)
+  ) {
+    const shortest =
+      Math.min(
+        a.length,
+        b.length
+      );
+
+    const longest =
+      Math.max(
+        a.length,
+        b.length
+      );
+
+    return Math.max(
+      82,
+      Math.round(
+        shortest /
+        Math.max(1, longest) *
+        100
+      )
+    );
+  }
+
+  const tokensA =
+    new Set(
+      a.split(" ")
+        .filter(Boolean)
+    );
+
+  const tokensB =
+    new Set(
+      b.split(" ")
+        .filter(Boolean)
+    );
+
+  const union =
+    new Set([
+      ...tokensA,
+      ...tokensB,
+    ]);
+
+  let intersection = 0;
+
+  for (
+    const token of tokensA
+  ) {
+    if (
+      tokensB.has(token)
+    ) {
+      intersection += 1;
+    }
+  }
+
+  if (union.size === 0) {
+    return 0;
+  }
+
+  const jaccard =
+    intersection /
+    union.size *
+    100;
+
+  return Math.round(
+    jaccard
+  );
+}
+
+function fixtureMatchScore(
+  lotoMatch,
+  fixture
+) {
+  const homeScore =
+    teamNameSimilarity(
+      lotoMatch?.home_team_name,
+      fixture?.teams?.home?.name
+    );
+
+  const awayScore =
+    teamNameSimilarity(
+      lotoMatch?.away_team_name,
+      fixture?.teams?.away?.name
+    );
+
+  const direct =
+    homeScore * 0.5 +
+    awayScore * 0.5;
+
+  const reverseHome =
+    teamNameSimilarity(
+      lotoMatch?.home_team_name,
+      fixture?.teams?.away?.name
+    );
+
+  const reverseAway =
+    teamNameSimilarity(
+      lotoMatch?.away_team_name,
+      fixture?.teams?.home?.name
+    );
+
+  const reversed =
+    reverseHome * 0.5 +
+    reverseAway * 0.5;
+
+  return {
+    score:
+      Math.round(
+        Math.max(
+          direct,
+          reversed * 0.9
+        )
+      ),
+
+    orientation:
+      direct >= reversed
+        ? "DIRECT"
+        : "REVERSED",
+
+    homeScore:
+      Math.round(homeScore),
+
+    awayScore:
+      Math.round(awayScore),
+  };
+}
+
+function formatParisDate(
+  value
+) {
+  const date =
+    new Date(value);
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return null;
+  }
+
+  const formatter =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone:
+          "Europe/Paris",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }
+    );
+
+  return formatter.format(date);
+}
+
+function addCalendarDays(
+  dateString,
+  days
+) {
+  const date =
+    new Date(
+      `${dateString}T12:00:00Z`
+    );
+
+  date.setUTCDate(
+    date.getUTCDate() +
+    days
+  );
+
+  return date
+    .toISOString()
+    .slice(0, 10);
+}
+
 function createLotoFootEngine({
   app,
   pool,
+  callApiFootball,
   adminGuard,
   schedulersEnabled = true,
 } = {}) {
@@ -438,6 +660,15 @@ function createLotoFootEngine({
   if (!pool) {
     throw new Error(
       "LotoFootEngine : pool PostgreSQL manquant."
+    );
+  }
+
+  if (
+    typeof callApiFootball !==
+    "function"
+  ) {
+    throw new Error(
+      "LotoFootEngine : callApiFootball manquante."
     );
   }
 
@@ -1084,6 +1315,364 @@ function createLotoFootEngine({
     };
   }
 
+
+  async function loadCandidateFixtures(
+    grid
+  ) {
+    const baseDate =
+      formatParisDate(
+        grid?.deadline_at ||
+        new Date()
+      );
+
+    if (!baseDate) {
+      throw new Error(
+        "Impossible de déterminer la date de recherche de la grille."
+      );
+    }
+
+    /*
+     * Fenêtre volontairement large :
+     * J-1 / J / J+1.
+     * Certaines grilles clôturent avant une série de matchs répartis
+     * autour de minuit ou sur deux journées.
+     */
+    const dates = [
+      addCalendarDays(
+        baseDate,
+        -1
+      ),
+      baseDate,
+      addCalendarDays(
+        baseDate,
+        1
+      ),
+    ];
+
+    const fixturesById =
+      new Map();
+
+    for (
+      const date of dates
+    ) {
+      const response =
+        await callApiFootball(
+          "/fixtures",
+          {
+            date,
+            timezone:
+              "Europe/Paris",
+          }
+        );
+
+      const fixtures =
+        Array.isArray(
+          response?.data?.response
+        )
+          ? response.data.response
+          : [];
+
+      for (
+        const fixture of
+        fixtures
+      ) {
+        const fixtureId =
+          Number(
+            fixture?.fixture?.id
+          );
+
+        if (
+          Number.isInteger(
+            fixtureId
+          ) &&
+          fixtureId > 0
+        ) {
+          fixturesById.set(
+            fixtureId,
+            fixture
+          );
+        }
+      }
+    }
+
+    return [
+      ...fixturesById.values(),
+    ];
+  }
+
+  async function matchGridFixtures(
+    gridId,
+    {
+      minimumScore = 72,
+      force = false,
+    } = {}
+  ) {
+    await ensureTables();
+
+    const grid =
+      await getGrid(
+        gridId
+      );
+
+    if (!grid) {
+      throw new Error(
+        "Grille Loto Foot introuvable."
+      );
+    }
+
+    const candidates =
+      await loadCandidateFixtures(
+        grid
+      );
+
+    const results = [];
+
+    for (
+      const lotoMatch of
+      grid.matches
+    ) {
+      if (
+        lotoMatch.fixture_id &&
+        !force
+      ) {
+        results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          status:
+            "ALREADY_MATCHED",
+          fixtureId:
+            Number(
+              lotoMatch.fixture_id
+            ),
+          confidence:
+            numberOr(
+              lotoMatch.matching_confidence,
+              100
+            ),
+        });
+
+        continue;
+      }
+
+      const ranked =
+        candidates
+          .map((fixture) => {
+            const scoring =
+              fixtureMatchScore(
+                lotoMatch,
+                fixture
+              );
+
+            return {
+              fixture,
+              ...scoring,
+            };
+          })
+          .sort(
+            (a, b) =>
+              b.score -
+              a.score
+          );
+
+      const best =
+        ranked[0] ||
+        null;
+
+      const second =
+        ranked[1] ||
+        null;
+
+      const ambiguous =
+        best &&
+        second &&
+        best.score -
+          second.score <
+          6;
+
+      if (
+        !best ||
+        best.score <
+          minimumScore ||
+        ambiguous
+      ) {
+        await pool.query(
+          `
+            UPDATE lotofoot_matches
+            SET
+              fixture_id = NULL,
+              fixture_date = NULL,
+              league_id = NULL,
+              league_name = NULL,
+              matching_status = $2,
+              matching_confidence = $3,
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [
+            lotoMatch.id,
+            ambiguous
+              ? "AMBIGUOUS"
+              : "UNMATCHED",
+            best
+              ? best.score
+              : 0,
+          ]
+        );
+
+        results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          homeTeam:
+            lotoMatch.home_team_name,
+          awayTeam:
+            lotoMatch.away_team_name,
+          status:
+            ambiguous
+              ? "AMBIGUOUS"
+              : "UNMATCHED",
+          confidence:
+            best
+              ? best.score
+              : 0,
+          bestCandidate:
+            best
+              ? {
+                  fixtureId:
+                    Number(
+                      best.fixture
+                        ?.fixture?.id
+                    ),
+                  homeTeam:
+                    best.fixture
+                      ?.teams?.home?.name,
+                  awayTeam:
+                    best.fixture
+                      ?.teams?.away?.name,
+                  score:
+                    best.score,
+                }
+              : null,
+        });
+
+        continue;
+      }
+
+      const fixture =
+        best.fixture;
+
+      await pool.query(
+        `
+          UPDATE lotofoot_matches
+          SET
+            fixture_id = $2,
+            fixture_date = $3,
+            league_id = $4,
+            league_name = $5,
+            matching_status = 'MATCHED',
+            matching_confidence = $6,
+            updated_at = NOW()
+          WHERE id = $1
+        `,
+        [
+          lotoMatch.id,
+          Number(
+            fixture?.fixture?.id
+          ),
+          fixture?.fixture?.date ||
+            null,
+          fixture?.league?.id ||
+            null,
+          fixture?.league?.name ||
+            null,
+          best.score,
+        ]
+      );
+
+      results.push({
+        lineNumber:
+          Number(
+            lotoMatch.line_number
+          ),
+        homeTeam:
+          lotoMatch.home_team_name,
+        awayTeam:
+          lotoMatch.away_team_name,
+        status:
+          "MATCHED",
+        fixtureId:
+          Number(
+            fixture?.fixture?.id
+          ),
+        fixtureDate:
+          fixture?.fixture?.date ||
+          null,
+        leagueId:
+          fixture?.league?.id ||
+          null,
+        leagueName:
+          fixture?.league?.name ||
+          null,
+        confidence:
+          best.score,
+        apiHomeTeam:
+          fixture?.teams?.home?.name ||
+          null,
+        apiAwayTeam:
+          fixture?.teams?.away?.name ||
+          null,
+      });
+    }
+
+    const matched =
+      results.filter(
+        (item) =>
+          item.status ===
+            "MATCHED" ||
+          item.status ===
+            "ALREADY_MATCHED"
+      ).length;
+
+    const ambiguous =
+      results.filter(
+        (item) =>
+          item.status ===
+          "AMBIGUOUS"
+      ).length;
+
+    const unmatched =
+      results.filter(
+        (item) =>
+          item.status ===
+          "UNMATCHED"
+      ).length;
+
+    return {
+      ok: true,
+      version:
+        LOTOFOOT_VERSION,
+      gridId:
+        Number(grid.id),
+      gridType:
+        grid.grid_type,
+      officialGridNumber:
+        grid.official_grid_number,
+      candidates:
+        candidates.length,
+      total:
+        results.length,
+      matched,
+      ambiguous,
+      unmatched,
+      results,
+      generatedAt:
+        new Date().toISOString(),
+    };
+  }
+
   async function getStatus() {
     await ensureTables();
 
@@ -1239,6 +1828,50 @@ function createLotoFootEngine({
                 error:
                   error?.message ||
                   "Impossible de charger le statut Loto Foot.",
+              });
+          }
+        }
+      )
+    );
+
+    app.post(
+      "/internal/lotofoot/grid/:gridId/match-fixtures",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const result =
+              await matchGridFixtures(
+                req.params.gridId,
+                {
+                  minimumScore:
+                    Number(
+                      req.body
+                        ?.minimumScore
+                    ) || 72,
+                  force:
+                    req.body
+                      ?.force === true,
+                }
+              );
+
+            return res.json(
+              result
+            );
+          } catch (error) {
+            console.error(
+              "LOTOFOOT FIXTURE MATCHER ERROR :",
+              error
+            );
+
+            return res
+              .status(500)
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  error?.message ||
+                  "Impossible de matcher les rencontres Loto Foot.",
               });
           }
         }
@@ -1444,6 +2077,7 @@ function createLotoFootEngine({
     importManualGrid,
     listGrids,
     getGrid,
+    matchGridFixtures,
     registerRoutes,
     initialize,
 
