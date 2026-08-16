@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.6.1-grid-intelligence-fix";
+  "lotofoot-engine-v1.7.0-strategy-optimizer";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -1517,18 +1517,35 @@ function normalizeStrategy(
 
 function strategyCandidateUtility({
   coverageProbability,
+  factor = 1,
+  strategy = "PRUDENT",
+  prediction = {},
 }) {
-  const p =
-    Math.max(
-      0.000001,
-      Math.min(
-        0.999999,
-        numberOr(
-          coverageProbability
-        ) / 100
-      )
-    );
+  const p = Math.max(
+    0.000001,
+    Math.min(0.999999, numberOr(coverageProbability) / 100)
+  );
 
+  const normalizedStrategy = normalizeStrategy(strategy);
+  const costPenalty = Math.log(Math.max(1, numberOr(factor, 1)));
+  const trap = clampScore(prediction?.trap_score) / 100;
+  const cover = clampScore(prediction?.cover_score) / 100;
+  const surprise = clampScore(prediction?.surprise_score) / 100;
+
+  if (normalizedStrategy === "BALANCED") {
+    // Couverture forte, mais pénalise explicitement la complexité/coût.
+    return Math.log(p) - costPenalty * 0.12 + (trap + cover) * 0.015;
+  }
+
+  if (normalizedStrategy === "OFFENSIVE") {
+    // Assume davantage les bases : une protection doit apporter une vraie valeur
+    // sur une ligne piégeuse pour justifier son coût combinatoire.
+    return Math.log(p) - costPenalty * 0.28 +
+      (trap * 0.018 + cover * 0.012 + surprise * 0.01) *
+      Math.max(0, numberOr(factor, 1) - 1);
+  }
+
+  // PRUDENT : objectif pur de probabilité de grille parfaite.
   return Math.log(p);
 }
 
@@ -1760,6 +1777,12 @@ function optimizeGridSelectionsByStrategy({
             coverageProbability:
               candidate
                 .coverageProbability,
+            factor:
+              candidate.factor,
+            strategy:
+              normalizedStrategy,
+            prediction:
+              entry.row,
           });
 
         const newState = {
@@ -1971,204 +1994,73 @@ function buildProtectionPriority(
       prediction
     );
 
-  const simple =
-    candidates.find(
-      (item) =>
-        item.factor === 1
-    );
+  const simple = candidates.find((item) => item.factor === 1);
+  const double = candidates.find((item) => item.factor === 2);
+  const triple = candidates.find((item) => item.factor === 3);
 
-  const double =
-    candidates.find(
-      (item) =>
-        item.factor === 2
-    );
+  const simpleProbability = numberOr(simple?.coverageProbability);
+  const doubleProbability = numberOr(double?.coverageProbability, simpleProbability);
+  const tripleProbability = numberOr(triple?.coverageProbability, 100);
 
-  const triple =
-    candidates.find(
-      (item) =>
-        item.factor === 3
-    );
+  const doubleGain = Math.max(0, doubleProbability - simpleProbability);
+  const tripleGainFromDouble = Math.max(0, tripleProbability - doubleProbability);
 
-  const simpleProbability =
-    numberOr(
-      simple
-        ?.coverageProbability
-    );
+  // Le classement suit désormais le gain marginal multiplicatif réellement
+  // utilisé par l'optimiseur : log(Pnouvelle / Pancienne), rapporté au coût.
+  const safeSimple = Math.max(0.000001, simpleProbability / 100);
+  const safeDouble = Math.max(safeSimple, doubleProbability / 100);
+  const safeTriple = Math.max(safeDouble, tripleProbability / 100);
 
-  const doubleProbability =
-    numberOr(
-      double
-        ?.coverageProbability,
-      simpleProbability
-    );
+  const doubleLogGain = Math.max(0, Math.log(safeDouble / safeSimple));
+  const tripleLogGain = Math.max(0, Math.log(safeTriple / safeDouble));
+  const doubleCostLog = Math.log(2);
+  const tripleIncrementalCostLog = Math.log(3 / 2);
 
-  const tripleProbability =
-    numberOr(
-      triple
-        ?.coverageProbability,
-      100
-    );
+  const doubleEfficiency = doubleCostLog > 0
+    ? doubleLogGain / doubleCostLog
+    : 0;
+  const tripleEfficiency = tripleIncrementalCostLog > 0
+    ? tripleLogGain / tripleIncrementalCostLog
+    : 0;
 
-  const doubleGain =
-    Math.max(
-      0,
-      doubleProbability -
-      simpleProbability
-    );
-
-  const tripleGainFromDouble =
-    Math.max(
-      0,
-      tripleProbability -
-      doubleProbability
-    );
-
-  const relativeDoubleGain =
-    simpleProbability > 0
-      ? (
-          doubleGain /
-          simpleProbability *
-          100
-        )
-      : 0;
-
-  /*
-   * Le score de priorité mélange :
-   * - CoverScore V1.3
-   * - TrapScore
-   * - gain absolu apporté par le premier double
-   * - gain relatif par rapport à la base
-   *
-   * Le triple est volontairement moins valorisé :
-   * il coûte 50 % de combinaisons supplémentaires par rapport au double.
-   */
-  const priorityScore =
-    roundScore(
-      numberOr(
-        prediction
-          ?.cover_score
-      ) *
-        0.34 +
-      numberOr(
-        prediction
-          ?.trap_score
-      ) *
-        0.26 +
-      doubleGain *
-        0.62 +
-      Math.min(
-        100,
-        relativeDoubleGain
-      ) *
-        0.24 +
-      tripleGainFromDouble *
-        0.14
-    );
+  // 100 signifie qu'un double augmente la couverture aussi vite que son coût
+  // combinatoire (ratio idéal proche de x2 pour un coût x2). Pas de saturation
+  // heuristique liée aux anciens Trap/Cover scores.
+  const priorityScore = Number((doubleEfficiency * 100).toFixed(4));
 
   let stars = 1;
-
-  if (
-    priorityScore >= 80
-  ) {
-    stars = 5;
-  } else if (
-    priorityScore >= 65
-  ) {
-    stars = 4;
-  } else if (
-    priorityScore >= 50
-  ) {
-    stars = 3;
-  } else if (
-    priorityScore >= 35
-  ) {
-    stars = 2;
-  }
+  if (priorityScore >= 95) stars = 5;
+  else if (priorityScore >= 85) stars = 4;
+  else if (priorityScore >= 70) stars = 3;
+  else if (priorityScore >= 50) stars = 2;
 
   return {
-    lineNumber:
-      Number(
-        prediction
-          ?.line_number
-      ),
-
-    fixtureId:
-      Number(
-        prediction
-          ?.fixture_id
-      ),
-
-    homeTeam:
-      prediction
-        ?.home_team_name,
-
-    awayTeam:
-      prediction
-        ?.away_team_name,
-
-    aiPick:
-      prediction
-        ?.ai_pick,
-
-    baseSelection:
-      simple
-        ?.selection ||
-      prediction
-        ?.ai_pick ||
-      null,
-
-    bestDouble:
-      double
-        ?.selection ||
-      null,
-
-    simpleProbability:
-      Number(
-        simpleProbability
-          .toFixed(2)
-      ),
-
-    doubleProbability:
-      Number(
-        doubleProbability
-          .toFixed(2)
-      ),
-
-    tripleProbability:
-      Number(
-        tripleProbability
-          .toFixed(2)
-      ),
-
-    doubleGain:
-      Number(
-        doubleGain.toFixed(2)
-      ),
-
-    tripleGainFromDouble:
-      Number(
-        tripleGainFromDouble
-          .toFixed(2)
-      ),
-
+    lineNumber: Number(prediction?.line_number),
+    fixtureId: Number(prediction?.fixture_id),
+    homeTeam: prediction?.home_team_name,
+    awayTeam: prediction?.away_team_name,
+    aiPick: prediction?.ai_pick,
+    baseSelection: simple?.selection || prediction?.ai_pick || null,
+    bestDouble: double?.selection || null,
+    simpleProbability: Number(simpleProbability.toFixed(2)),
+    doubleProbability: Number(doubleProbability.toFixed(2)),
+    tripleProbability: Number(tripleProbability.toFixed(2)),
+    doubleGain: Number(doubleGain.toFixed(2)),
+    tripleGainFromDouble: Number(tripleGainFromDouble.toFixed(2)),
+    relativeDoubleGain: Number(
+      (simpleProbability > 0 ? doubleGain / simpleProbability * 100 : 0).toFixed(2)
+    ),
+    marginalMultiplier: Number(
+      (simpleProbability > 0 ? doubleProbability / simpleProbability : 0).toFixed(4)
+    ),
+    doubleEfficiency: Number(doubleEfficiency.toFixed(6)),
+    tripleEfficiency: Number(tripleEfficiency.toFixed(6)),
     priorityScore,
-
     stars,
-
-    trapScore:
-      numberOr(
-        prediction
-          ?.trap_score
-      ),
-
-    coverScore:
-      numberOr(
-        prediction
-          ?.cover_score
-      ),
+    trapScore: numberOr(prediction?.trap_score),
+    coverScore: numberOr(prediction?.cover_score),
   };
 }
-
 
 function clampScore(
   value
