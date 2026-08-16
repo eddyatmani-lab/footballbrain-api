@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.7.1-balanced-diversification";
+  "lotofoot-engine-v1.7.2-settlement-engine";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -5973,6 +5973,60 @@ function createLotoFootEngine({
       )
     );
 
+
+    app.post(
+      "/internal/lotofoot/grid/:gridId/settle",
+      protectAdmin(
+        async (req, res) => {
+          try {
+            const result =
+              await settleLotoFootGrid(
+                req.params.gridId
+              );
+
+            return res.json(
+              result
+            );
+          } catch (error) {
+            console.error(
+              "LOTOFOOT SETTLEMENT ERROR :",
+              error
+            );
+
+            const message =
+              error?.message ||
+              "Impossible de régler la grille Loto Foot.";
+
+            const isNotFound =
+              /introuvable/i.test(
+                message
+              );
+
+            const isBadRequest =
+              /invalide/i.test(
+                message
+              );
+
+            return res
+              .status(
+                isNotFound
+                  ? 404
+                  : isBadRequest
+                    ? 400
+                    : 500
+              )
+              .json({
+                ok: false,
+                version:
+                  LOTOFOOT_VERSION,
+                error:
+                  message,
+              });
+          }
+        }
+      )
+    );
+
     app.post(
       "/internal/lotofoot/ensure-tables",
       protectAdmin(
@@ -6009,6 +6063,420 @@ function createLotoFootEngine({
         }
       )
     );
+  }
+
+
+  async function settleLotoFootGrid(
+    gridId
+  ) {
+    await ensureTables();
+
+    const normalizedGridId =
+      Number(gridId);
+
+    if (
+      !Number.isInteger(
+        normalizedGridId
+      ) ||
+      normalizedGridId <= 0
+    ) {
+      throw new Error(
+        "gridId invalide."
+      );
+    }
+
+    const gridResult =
+      await pool.query(
+        `
+          SELECT *
+          FROM lotofoot_grids
+          WHERE id = $1
+          LIMIT 1
+        `,
+        [normalizedGridId]
+      );
+
+    const grid =
+      gridResult.rows[0];
+
+    if (!grid) {
+      throw new Error(
+        "Grille Loto Foot introuvable."
+      );
+    }
+
+    const matchesResult =
+      await pool.query(
+        `
+          SELECT *
+          FROM lotofoot_matches
+          WHERE grid_id = $1
+          ORDER BY line_number ASC
+        `,
+        [normalizedGridId]
+      );
+
+    const summary = {
+      total:
+        matchesResult.rows.length,
+      settledMatches: 0,
+      pendingResults: 0,
+      settledPredictions: 0,
+      alreadySettledPredictions: 0,
+      results: [],
+    };
+
+    for (
+      const lotoMatch of
+      matchesResult.rows
+    ) {
+      const fixtureId =
+        Number(
+          lotoMatch.fixture_id
+        );
+
+      if (
+        !Number.isInteger(
+          fixtureId
+        ) ||
+        fixtureId <= 0
+      ) {
+        summary.pendingResults += 1;
+
+        summary.results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          fixtureId: null,
+          status:
+            "NO_FIXTURE",
+        });
+
+        continue;
+      }
+
+      /*
+       * Source officielle interne :
+       * table predictions de FootballBrain.
+       * Aucun nouvel appel API-Football n'est nécessaire.
+       */
+      const footballResult =
+        await pool.query(
+          `
+            SELECT
+              fixture_id,
+              result_status,
+              home_goals,
+              away_goals
+            FROM predictions
+            WHERE fixture_id = $1
+              AND UPPER(
+                COALESCE(
+                  result_status,
+                  ''
+                )
+              ) IN (
+                'COMPLETED',
+                'FINISHED',
+                'FT',
+                'AET',
+                'PEN'
+              )
+              AND home_goals IS NOT NULL
+              AND away_goals IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT 1
+          `,
+          [fixtureId]
+        );
+
+      const footballMatch =
+        footballResult.rows[0];
+
+      if (!footballMatch) {
+        summary.pendingResults += 1;
+
+        summary.results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          fixtureId,
+          homeTeam:
+            lotoMatch.home_team_name,
+          awayTeam:
+            lotoMatch.away_team_name,
+          status:
+            "RESULT_NOT_AVAILABLE",
+        });
+
+        continue;
+      }
+
+      const homeGoals =
+        Number(
+          footballMatch.home_goals
+        );
+
+      const awayGoals =
+        Number(
+          footballMatch.away_goals
+        );
+
+      let actualResult;
+
+      if (homeGoals > awayGoals) {
+        actualResult = "1";
+      } else if (homeGoals < awayGoals) {
+        actualResult = "2";
+      } else {
+        actualResult = "N";
+      }
+
+      const client =
+        await pool.connect();
+
+      try {
+        await client.query(
+          "BEGIN"
+        );
+
+        await client.query(
+          `
+            UPDATE lotofoot_matches
+            SET
+              final_result = $2,
+              home_goals = $3,
+              away_goals = $4,
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [
+            lotoMatch.id,
+            actualResult,
+            homeGoals,
+            awayGoals,
+          ]
+        );
+
+        const predictionsResult =
+          await client.query(
+            `
+              SELECT *
+              FROM lotofoot_predictions
+              WHERE lotofoot_match_id = $1
+              ORDER BY created_at ASC
+            `,
+            [lotoMatch.id]
+          );
+
+        let lineSettledPredictions =
+          0;
+
+        for (
+          const prediction of
+          predictionsResult.rows
+        ) {
+          const existingSettlement =
+            await client.query(
+              `
+                SELECT id
+                FROM lotofoot_settlements
+                WHERE prediction_id = $1
+                LIMIT 1
+              `,
+              [prediction.id]
+            );
+
+          if (
+            existingSettlement
+              .rows.length > 0
+          ) {
+            summary
+              .alreadySettledPredictions +=
+              1;
+
+            continue;
+          }
+
+          const aiPick =
+            normalizePick(
+              prediction.ai_pick
+            );
+
+          const recommendedSelection =
+            normalizeSelection(
+              prediction
+                .recommended_selection
+            );
+
+          const aiPickCorrect =
+            aiPick
+              ? aiPick === actualResult
+              : null;
+
+          const selectionCovered =
+            recommendedSelection
+              ? recommendedSelection
+                  .includes(
+                    actualResult
+                  )
+              : null;
+
+          const baseScore =
+            numberOr(
+              prediction.base_score
+            );
+
+          const baseHit =
+            baseScore >= 60 && aiPick
+              ? aiPickCorrect
+              : null;
+
+          const trapScore =
+            numberOr(
+              prediction.trap_score
+            );
+
+          const trapEvent =
+            trapScore >= 80 && aiPick
+              ? !aiPickCorrect
+              : false;
+
+          const settlementInsert =
+            await client.query(
+              `
+                INSERT INTO lotofoot_settlements (
+                  prediction_id,
+                  grid_id,
+                  lotofoot_match_id,
+                  actual_result,
+                  ai_pick_correct,
+                  selection_covered,
+                  base_hit,
+                  trap_event,
+                  metadata,
+                  settled_at
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  $3,
+                  $4,
+                  $5,
+                  $6,
+                  $7,
+                  $8,
+                  $9::jsonb,
+                  NOW()
+                )
+                ON CONFLICT (
+                  prediction_id
+                )
+                DO NOTHING
+                RETURNING id
+              `,
+              [
+                prediction.id,
+                normalizedGridId,
+                lotoMatch.id,
+                actualResult,
+                aiPickCorrect,
+                selectionCovered,
+                baseHit,
+                trapEvent,
+                JSON.stringify({
+                  source:
+                    "FOOTBALLBRAIN_PREDICTIONS",
+                  fixtureId,
+                  homeGoals,
+                  awayGoals,
+                  engineVersion:
+                    prediction
+                      .analysis_version ||
+                    null,
+                }),
+              ]
+            );
+
+          if (
+            settlementInsert.rows.length > 0
+          ) {
+            await client.query(
+              `
+                UPDATE lotofoot_predictions
+                SET
+                  status = 'SETTLED',
+                  settled_at = NOW(),
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [prediction.id]
+            );
+
+            lineSettledPredictions +=
+              1;
+
+            summary
+              .settledPredictions +=
+              1;
+          }
+        }
+
+        await client.query(
+          "COMMIT"
+        );
+
+        summary.settledMatches +=
+          1;
+
+        summary.results.push({
+          lineNumber:
+            Number(
+              lotoMatch.line_number
+            ),
+          fixtureId,
+          homeTeam:
+            lotoMatch.home_team_name,
+          awayTeam:
+            lotoMatch.away_team_name,
+          score:
+            `${homeGoals}-${awayGoals}`,
+          actualResult,
+          status:
+            "SETTLED",
+          settledPredictions:
+            lineSettledPredictions,
+        });
+      } catch (error) {
+        await client.query(
+          "ROLLBACK"
+        );
+
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+
+    return {
+      ok: true,
+      version:
+        LOTOFOOT_VERSION,
+      gridId:
+        normalizedGridId,
+      gridType:
+        grid.grid_type,
+      officialGridNumber:
+        grid.official_grid_number,
+      ...summary,
+      complete:
+        summary.settledMatches ===
+        summary.total,
+      generatedAt:
+        new Date().toISOString(),
+    };
   }
 
   async function initialize() {
@@ -6051,6 +6519,7 @@ function createLotoFootEngine({
     buildGridStrategies,
     getProtectionRanking,
     getGridIntelligence,
+    settleLotoFootGrid,
     registerRoutes,
     initialize,
 
