@@ -25125,245 +25125,38 @@ function startAutomaticSchedulers() {
 app.get("/public/statistics/dashboard", async (req, res) => {
   try {
     await ensureBilanV3Columns();
-    await ensureStudioPredictionColumns();
     await ensureDailyTicketTables();
     await refreshManualOddsProfits();
 
-    // ==========================================================
-    // 1) SOURCE UNIQUE = même population que /public/bilan/detaille
-    // ==========================================================
-    const detailedSourceResult = await pool.query(`
-      SELECT DISTINCT ON (p.fixture_id)
-        p.fixture_id,
-        p.fixture_date,
-        p.home_team_name,
-        p.away_team_name,
-        p.league_name,
-        p.home_goals,
-        p.away_goals,
-        p.result_status,
-        p.studio_market_key,
-        p.studio_market_label,
-        p.studio_probability,
-        p.studio_decision_score,
-        p.studio_snapshot,
-        p.studio_saved_at,
-        p.manual_market_key,
-        p.manual_market_odd,
-        p.manual_odd_source,
-        p.manual_odd_updated_at
-      FROM predictions p
-      WHERE UPPER(COALESCE(p.result_status, '')) IN (
-        'FT', 'AET', 'PEN', 'FINISHED', 'COMPLETED'
-      )
-        AND p.home_goals IS NOT NULL
-        AND p.away_goals IS NOT NULL
-        AND (
-          p.studio_snapshot IS NOT NULL
-          OR NULLIF(BTRIM(COALESCE(p.studio_market_key, '')), '') IS NOT NULL
-        )
-      ORDER BY
-        p.fixture_id,
-        p.updated_at DESC NULLS LAST,
-        p.id DESC
-    `);
-
-    const analyses = [];
-
-    for (const prediction of detailedSourceResult.rows) {
-      const primary = detailedBilanExtractSnapshotMarket(prediction);
-      if (!primary?.marketKey) continue;
-
-      const won = detailedBilanEvaluateMarket(
-        primary.marketKey,
-        prediction.home_goals,
-        prediction.away_goals
-      );
-
-      if (typeof won !== "boolean") continue;
-
-      analyses.push({
-        fixtureId: Number(prediction.fixture_id),
-        kickoff: prediction.fixture_date,
-        competition: prediction.league_name || "Compétition inconnue",
-        marketKey: detailedBilanNormalizeMarketKey(primary.marketKey),
-        marketLabel: detailedBilanMarketLabel(
-          primary.marketKey,
-          primary.marketLabel
-        ),
-        correct: won === true,
-      });
-    }
-
-    // ==========================================================
-    // 2) GLOBAL
-    // ==========================================================
-    const evaluatedMarkets = analyses.length;
-    const wins = analyses.filter((item) => item.correct === true).length;
-    const losses = evaluatedMarkets - wins;
-
-    // ==========================================================
-    // 3) PAR COMPÉTITION + DÉTAIL DES MARCHÉS DE LA COMPÉTITION
-    // ==========================================================
-    const competitionMap = new Map();
-
-    for (const analysis of analyses) {
-      const competitionName =
-        String(analysis.competition || "Compétition inconnue").trim() ||
-        "Compétition inconnue";
-
-      if (!competitionMap.has(competitionName)) {
-        competitionMap.set(competitionName, {
-          name: competitionName,
-          volume: 0,
-          evaluated: 0,
-          wins: 0,
-          losses: 0,
-          lastMatch: null,
-          marketsMap: new Map(),
-        });
-      }
-
-      const competition = competitionMap.get(competitionName);
-      competition.volume += 1;
-      competition.evaluated += 1;
-
-      if (analysis.correct) competition.wins += 1;
-      else competition.losses += 1;
-
-      if (
-        analysis.kickoff &&
-        (!competition.lastMatch ||
-          new Date(analysis.kickoff).getTime() >
-            new Date(competition.lastMatch).getTime())
-      ) {
-        competition.lastMatch = analysis.kickoff;
-      }
-
-      const marketKey = detailedBilanNormalizeMarketKey(analysis.marketKey);
-
-      if (!competition.marketsMap.has(marketKey)) {
-        competition.marketsMap.set(marketKey, {
-          key: marketKey,
-          label:
-            analysis.marketLabel || detailedBilanMarketLabel(marketKey),
-          volume: 0,
-          evaluated: 0,
-          wins: 0,
-          losses: 0,
-        });
-      }
-
-      const market = competition.marketsMap.get(marketKey);
-      market.volume += 1;
-      market.evaluated += 1;
-      if (analysis.correct) market.wins += 1;
-      else market.losses += 1;
-    }
-
-    const competitions = Array.from(competitionMap.values())
-      .map((competition) => {
-        const volume = Number(competition.volume || 0);
-
-        const markets = Array.from(competition.marketsMap.values())
-          .map((market) => ({
-            ...market,
-            accuracy:
-              market.evaluated > 0
-                ? Number(((market.wins / market.evaluated) * 100).toFixed(1))
-                : null,
-          }))
-          .sort(
-            (a, b) =>
-              b.volume - a.volume ||
-              String(a.label).localeCompare(String(b.label), "fr")
-          );
-
-        return {
-          name: competition.name,
-          volume,
-          evaluated: volume,
-          wins: Number(competition.wins || 0),
-          losses: Number(competition.losses || 0),
-          accuracy:
-            volume > 0
-              ? Number(((competition.wins / volume) * 100).toFixed(1))
-              : null,
-          lastMatch: competition.lastMatch,
-          sampleQuality:
-            volume >= 100
-              ? "excellent"
-              : volume >= 50
-                ? "bon"
-                : volume >= 20
-                  ? "moyen"
-                  : "faible",
-          markets,
-        };
-      })
-      .sort(
-        (a, b) =>
-          b.volume - a.volume ||
-          String(a.name).localeCompare(String(b.name), "fr")
-      );
-
-    // ==========================================================
-    // 4) PAR MARCHÉ GLOBAL
-    // ==========================================================
-    const marketMap = new Map();
-
-    for (const analysis of analyses) {
-      const marketKey = detailedBilanNormalizeMarketKey(analysis.marketKey);
-
-      if (!marketMap.has(marketKey)) {
-        marketMap.set(marketKey, {
-          key: marketKey,
-          label:
-            analysis.marketLabel || detailedBilanMarketLabel(marketKey),
-          volume: 0,
-          evaluated: 0,
-          wins: 0,
-          losses: 0,
-        });
-      }
-
-      const market = marketMap.get(marketKey);
-      market.volume += 1;
-      market.evaluated += 1;
-      if (analysis.correct) market.wins += 1;
-      else market.losses += 1;
-    }
-
-    const markets = Array.from(marketMap.values())
-      .map((market) => ({
-        ...market,
-        accuracy:
-          market.evaluated > 0
-            ? Number(((market.wins / market.evaluated) * 100).toFixed(1))
-            : null,
-        settledBets: 0,
-        stake: 0,
-        profit: 0,
-        roi: null,
-        averageOdd: null,
-      }))
-      .sort(
-        (a, b) =>
-          b.volume - a.volume ||
-          String(a.label).localeCompare(String(b.label), "fr")
-      );
-
-    // ==========================================================
-    // 5) MÉTRIQUES FINANCIÈRES — logique existante conservée
-    // ==========================================================
     const [
-      financialGlobalResult,
+      globalResult,
+      competitionsResult,
+      marketsResult,
       oddsBandsResult,
       valueScannerResult,
       ticketStatsResult,
     ] = await Promise.all([
       pool.query(`
         SELECT
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+          )::INTEGER AS completed_markets,
+
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) IS NOT NULL
+          )::INTEGER AS evaluated_markets,
+
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = TRUE
+          )::INTEGER AS wins,
+
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = FALSE
+          )::INTEGER AS losses,
+
           COUNT(*) FILTER (
             WHERE manual_market_odd IS NOT NULL
               AND manual_profit_units IS NOT NULL
@@ -25403,6 +25196,124 @@ app.get("/public/statistics/dashboard", async (req, res) => {
             3
           ) AS average_odd
         FROM predictions
+      `),
+
+      pool.query(`
+        SELECT
+          COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue') AS competition,
+          COUNT(*)::INTEGER AS volume,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) IS NOT NULL
+          )::INTEGER AS evaluated,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = TRUE
+          )::INTEGER AS wins,
+          COUNT(*) FILTER (
+            WHERE manual_profit_units IS NOT NULL
+          )::INTEGER AS settled_bets,
+          COALESCE(
+            SUM(manual_stake_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS stake,
+          COALESCE(
+            SUM(manual_profit_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS profit,
+          ROUND(
+            (
+              SUM(manual_market_odd * manual_stake_units) FILTER (
+                WHERE manual_profit_units IS NOT NULL
+                  AND manual_market_odd > 1
+                  AND manual_stake_units > 0
+              )
+              /
+              NULLIF(
+                SUM(manual_stake_units) FILTER (
+                  WHERE manual_profit_units IS NOT NULL
+                    AND manual_market_odd > 1
+                    AND manual_stake_units > 0
+                ),
+                0
+              )
+            )::NUMERIC,
+            2
+          ) AS average_odd,
+          MAX(fixture_date) AS last_match
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+        GROUP BY COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue')
+        HAVING COUNT(*) FILTER (
+          WHERE COALESCE(official_market_won, won) IS NOT NULL
+        ) > 0
+        ORDER BY volume DESC, competition ASC
+        LIMIT 100
+      `),
+
+      pool.query(`
+        SELECT
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), ''),
+            'UNKNOWN'
+          ) AS market_key,
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché inconnu'
+          ) AS market_label,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) IS NOT NULL
+          )::INTEGER AS evaluated,
+          COUNT(*) FILTER (
+            WHERE result_status = 'COMPLETED'
+              AND COALESCE(official_market_won, won) = TRUE
+          )::INTEGER AS wins,
+          COUNT(*) FILTER (
+            WHERE manual_profit_units IS NOT NULL
+          )::INTEGER AS settled_bets,
+          COALESCE(
+            SUM(manual_stake_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS stake,
+          COALESCE(
+            SUM(manual_profit_units) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+            ),
+            0
+          )::NUMERIC AS profit,
+          ROUND(
+            AVG(manual_market_odd) FILTER (
+              WHERE manual_profit_units IS NOT NULL
+                AND manual_market_odd > 1
+            )::NUMERIC,
+            2
+          ) AS average_odd
+        FROM predictions
+        WHERE result_status = 'COMPLETED'
+        GROUP BY
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_key), ''),
+            NULLIF(BTRIM(studio_market_key), ''),
+            'UNKNOWN'
+          ),
+          COALESCE(
+            NULLIF(BTRIM(official_tracked_market_label), ''),
+            NULLIF(BTRIM(studio_market_label), ''),
+            'Marché inconnu'
+          )
+        HAVING COUNT(*) FILTER (
+          WHERE COALESCE(official_market_won, won) IS NOT NULL
+        ) > 0
+        ORDER BY evaluated DESC, market_label ASC
       `),
 
       pool.query(`
@@ -25524,31 +25435,67 @@ app.get("/public/statistics/dashboard", async (req, res) => {
       `),
     ]);
 
-    const financialRow = financialGlobalResult.rows[0] || {};
-    const totalStake = Number(financialRow.total_stake || 0);
-    const totalProfit = Number(financialRow.total_profit || 0);
+    const globalRow = globalResult.rows[0] || {};
+    const evaluatedMarkets = Number(globalRow.evaluated_markets || 0);
+    const wins = Number(globalRow.wins || 0);
+    const totalStake = Number(globalRow.total_stake || 0);
+    const totalProfit = Number(globalRow.total_profit || 0);
 
-    const oddsBands = oddsBandsResult.rows.map((row) => {
-      const bets = Number(row.bets || 0);
+    const mapPerformanceRow = (row) => {
+      const evaluated = Number(row.evaluated || 0);
       const rowWins = Number(row.wins || 0);
       const stake = Number(row.stake || 0);
       const profit = Number(row.profit || 0);
 
       return {
-        band: row.odd_band,
-        bets,
+        ...row,
+        volume: Number(row.volume || evaluated || 0),
+        evaluated,
         wins: rowWins,
-        losses: Math.max(0, bets - rowWins),
-        accuracy:
-          bets > 0 ? Number(((rowWins / bets) * 100).toFixed(1)) : null,
+        accuracy: evaluated > 0
+          ? Number(((rowWins / evaluated) * 100).toFixed(1))
+          : null,
+        settledBets: Number(row.settled_bets || row.bets || 0),
         stake: Number(stake.toFixed(2)),
         profit: Number(profit.toFixed(2)),
-        roi:
-          stake > 0 ? Number(((profit / stake) * 100).toFixed(1)) : null,
-        averageOdd:
-          row.average_odd == null ? null : Number(row.average_odd),
+        roi: stake > 0
+          ? Number(((profit / stake) * 100).toFixed(1))
+          : null,
+        averageOdd: row.average_odd == null
+          ? null
+          : Number(row.average_odd),
+      };
+    };
+
+    const competitions = competitionsResult.rows.map((row) => {
+      const mapped = mapPerformanceRow(row);
+      const settledBets = Number(mapped.settledBets || 0);
+
+      return {
+        ...mapped,
+        name: row.competition,
+        lastMatch: row.last_match || null,
+        sampleQuality:
+          settledBets >= 100
+            ? "excellent"
+            : settledBets >= 50
+              ? "bon"
+              : settledBets >= 20
+                ? "moyen"
+                : "faible",
       };
     });
+
+    const markets = marketsResult.rows.map((row) => ({
+      ...mapPerformanceRow(row),
+      key: row.market_key,
+      label: row.market_label,
+    }));
+
+    const oddsBands = oddsBandsResult.rows.map((row) => ({
+      ...mapPerformanceRow(row),
+      band: row.odd_band,
+    }));
 
     const valueScanner = valueScannerResult.rows.map((row) => ({
       fixtureId: Number(row.fixture_id),
@@ -25575,68 +25522,43 @@ app.get("/public/statistics/dashboard", async (req, res) => {
         tickets,
         wins: rowWins,
         losses: Number(row.losses || 0),
-        accuracy:
-          tickets > 0 ? Number(((rowWins / tickets) * 100).toFixed(1)) : null,
+        accuracy: tickets > 0
+          ? Number(((rowWins / tickets) * 100).toFixed(1))
+          : null,
         stake: Number(stake.toFixed(2)),
         profit: Number(profit.toFixed(2)),
-        roi:
-          stake > 0 ? Number(((profit / stake) * 100).toFixed(1)) : null,
+        roi: stake > 0
+          ? Number(((profit / stake) * 100).toFixed(1))
+          : null,
       };
     });
 
-    // ==========================================================
-    // 6) CONTRÔLE DE COHÉRENCE
-    // ==========================================================
-    const competitionVolume = competitions.reduce(
-      (sum, competition) => sum + Number(competition.volume || 0),
-      0
-    );
-
-    const marketVolume = markets.reduce(
-      (sum, market) => sum + Number(market.volume || 0),
-      0
-    );
-
     return res.json({
       ok: true,
-      source: "BILAN_DETAILLE_PRIMARY_MARKET",
       generatedAt: new Date().toISOString(),
-
       global: {
-        completedMarkets: evaluatedMarkets,
+        completedMarkets: Number(globalRow.completed_markets || 0),
         evaluatedMarkets,
         wins,
-        losses,
-        accuracy:
-          evaluatedMarkets > 0
-            ? Number(((wins / evaluatedMarkets) * 100).toFixed(1))
-            : null,
-        settledRealBets: Number(financialRow.settled_real_bets || 0),
+        losses: Number(globalRow.losses || 0),
+        accuracy: evaluatedMarkets > 0
+          ? Number(((wins / evaluatedMarkets) * 100).toFixed(1))
+          : null,
+        settledRealBets: Number(globalRow.settled_real_bets || 0),
         totalStake: Number(totalStake.toFixed(2)),
         totalProfit: Number(totalProfit.toFixed(2)),
-        roi:
-          totalStake > 0
-            ? Number(((totalProfit / totalStake) * 100).toFixed(1))
-            : null,
-        averageOdd:
-          financialRow.average_odd == null
-            ? null
-            : Number(financialRow.average_odd),
+        roi: totalStake > 0
+          ? Number(((totalProfit / totalStake) * 100).toFixed(1))
+          : null,
+        averageOdd: globalRow.average_odd == null
+          ? null
+          : Number(globalRow.average_odd),
       },
-
       competitions,
       markets,
       oddsBands,
       valueScanner,
       ticketStats,
-
-      consistency: {
-        detailedBilanTotal: evaluatedMarkets,
-        competitionVolume,
-        marketVolume,
-        competitionsMatch: competitionVolume === evaluatedMarkets,
-        marketsMatch: marketVolume === evaluatedMarkets,
-      },
     });
   } catch (error) {
     console.error("ERREUR /public/statistics/dashboard :", error);
@@ -25649,7 +25571,6 @@ app.get("/public/statistics/dashboard", async (req, res) => {
     });
   }
 });
-
 
 const DEFAULT_BET_QUALIFICATION_CONFIG = Object.freeze({
   safe: {
@@ -27396,6 +27317,254 @@ function detailedBilanExtractSnapshotMarket(prediction = {}) {
     snapshotSource,
   };
 }
+
+
+/*
+ * ============================================================
+ * ADMIN — MARCHÉS PRINCIPAUX DU JOUR
+ * ============================================================
+ * Source : snapshots Brain Studio déjà enregistrés dans predictions.
+ * Aucun recalcul du moteur n'est déclenché par cette route.
+ */
+app.get(
+  "/internal/admin/brainstudio/today-primary-markets",
+  async (req, res) => {
+    if (!requireOptionalAdminKey(req, res)) {
+      return;
+    }
+
+    try {
+      await ensureStudioPredictionColumns();
+
+      const result = await pool.query(`
+        SELECT DISTINCT ON (p.fixture_id)
+          p.fixture_id,
+          p.fixture_date,
+          p.home_team_name,
+          p.away_team_name,
+          p.league_id,
+          p.league_name,
+          p.result_status,
+          p.home_goals,
+          p.away_goals,
+          p.studio_market_key,
+          p.studio_market_label,
+          p.studio_probability,
+          p.studio_decision_score,
+          p.studio_snapshot,
+          p.studio_saved_at,
+          p.manual_market_key,
+          p.manual_market_odd,
+          p.manual_odd_source,
+          p.manual_odd_updated_at
+        FROM predictions p
+        WHERE
+          (p.fixture_date AT TIME ZONE 'Europe/Paris')::date =
+          (NOW() AT TIME ZONE 'Europe/Paris')::date
+          AND (
+            p.studio_snapshot IS NOT NULL
+            OR NULLIF(BTRIM(COALESCE(p.studio_market_key, '')), '') IS NOT NULL
+          )
+        ORDER BY
+          p.fixture_id,
+          p.updated_at DESC NULLS LAST,
+          p.id DESC
+      `);
+
+      const rows = result.rows
+        .map((prediction) => {
+          const primary = detailedBilanExtractSnapshotMarket(prediction);
+
+          if (!primary?.marketKey) {
+            return null;
+          }
+
+          const snapshot =
+            prediction.studio_snapshot &&
+            typeof prediction.studio_snapshot === "object"
+              ? prediction.studio_snapshot
+              : {};
+
+          const snapshotPrimary =
+            snapshot.primaryMarket ||
+            snapshot.bestDecision ||
+            snapshot.studio?.primaryMarket ||
+            {};
+
+          const decision =
+            snapshotPrimary.decision ||
+            snapshotPrimary.marketDecision ||
+            {};
+
+          const risk = detailedBilanNumberOrNull(
+            snapshotPrimary.risk ??
+              snapshotPrimary.riskScore ??
+              decision.risk ??
+              snapshot.risk ??
+              snapshot.riskScore
+          );
+
+          const confidence = detailedBilanNumberOrNull(
+            snapshotPrimary.confidence ??
+              decision.confidence ??
+              snapshot.confidence
+          );
+
+          const valuePercent = detailedBilanNumberOrNull(
+            snapshotPrimary.valuePercent ??
+              snapshotPrimary.valueEdge ??
+              snapshotPrimary.expectedValuePercent ??
+              snapshotPrimary.expectedValue ??
+              snapshotPrimary.fairOdds?.value ??
+              snapshotPrimary.oddsMetrics?.value ??
+              snapshot.valuePercent
+          );
+
+          const fairOdd = detailedBilanNumberOrNull(
+            snapshotPrimary.fairOdd ??
+              snapshotPrimary.fairOdds?.fairOdds ??
+              snapshotPrimary.fairOdds?.fairOdd ??
+              snapshotPrimary.oddsMetrics?.fairOdd
+          );
+
+          const manualKey = detailedBilanNormalizeMarketKey(
+            prediction.manual_market_key
+          );
+
+          const manualOdd =
+            manualKey === primary.marketKey
+              ? detailedBilanNumberOrNull(prediction.manual_market_odd)
+              : null;
+
+          const bookmakerOdd =
+            manualOdd && manualOdd > 1
+              ? manualOdd
+              : primary.snapshotOdd && primary.snapshotOdd > 1
+                ? primary.snapshotOdd
+                : null;
+
+          const bookmaker =
+            manualOdd && manualOdd > 1
+              ? prediction.manual_odd_source || "Admin Football AI Pro"
+              : primary.snapshotBookmaker || null;
+
+          const decisionType = String(
+            decision.type ??
+              decision.status ??
+              snapshotPrimary.decisionType ??
+              snapshotPrimary.betStatus ??
+              snapshotPrimary.status ??
+              ""
+          ).trim() || null;
+
+          const decisionGrade = String(
+            decision.grade ??
+              snapshotPrimary.grade ??
+              snapshotPrimary.decisionGrade ??
+              snapshotPrimary.fairOddsQuality?.grade ??
+              ""
+          ).trim() || null;
+
+          return {
+            fixtureId: Number(prediction.fixture_id),
+            kickoff: prediction.fixture_date,
+            homeTeam: prediction.home_team_name || "Domicile",
+            awayTeam: prediction.away_team_name || "Extérieur",
+            leagueId:
+              prediction.league_id == null
+                ? null
+                : Number(prediction.league_id),
+            competition:
+              prediction.league_name || "Compétition inconnue",
+            resultStatus: prediction.result_status || null,
+            score:
+              prediction.home_goals != null && prediction.away_goals != null
+                ? `${Number(prediction.home_goals)}-${Number(prediction.away_goals)}`
+                : null,
+            marketKey: primary.marketKey,
+            marketLabel: detailedBilanMarketLabel(
+              primary.marketKey,
+              primary.marketLabel
+            ),
+            probability: primary.probability,
+            decisionScore: primary.decisionScore,
+            decisionType,
+            decisionGrade,
+            risk,
+            confidence,
+            valuePercent,
+            fairOdd,
+            bookmakerOdd,
+            bookmaker,
+            bookmakerSource:
+              manualOdd && manualOdd > 1
+                ? "MANUAL_ADMIN"
+                : primary.snapshotSource || null,
+            analyzedAt: prediction.studio_saved_at || null,
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => {
+          const first = new Date(a.kickoff || 0).getTime();
+          const second = new Date(b.kickoff || 0).getTime();
+          return first - second;
+        });
+
+      const withDecisionScore = rows.filter(
+        (row) => Number.isFinite(Number(row.decisionScore))
+      );
+
+      const summary = {
+        total: rows.length,
+        withPrimaryMarket: rows.length,
+        withOdds: rows.filter(
+          (row) => Number(row.bookmakerOdd) > 1
+        ).length,
+        highScore: rows.filter(
+          (row) => Number(row.decisionScore) >= 80
+        ).length,
+        averageDecisionScore:
+          withDecisionScore.length > 0
+            ? Number(
+                (
+                  withDecisionScore.reduce(
+                    (sum, row) => sum + Number(row.decisionScore),
+                    0
+                  ) / withDecisionScore.length
+                ).toFixed(1)
+              )
+            : null,
+      };
+
+      return res.json({
+        ok: true,
+        source: "BRAIN_STUDIO_STORED_PRIMARY_MARKET",
+        timezone: "Europe/Paris",
+        date: new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Europe/Paris",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        }).format(new Date()),
+        summary,
+        rows,
+        generatedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /internal/admin/brainstudio/today-primary-markets :",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error?.message ||
+          "Impossible de charger les marchés principaux du jour.",
+      });
+    }
+  }
+);
 
 app.get("/public/bilan/detaille", async (req, res) => {
   try {
