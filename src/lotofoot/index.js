@@ -1,5 +1,5 @@
 const LOTOFOOT_VERSION =
-  "lotofoot-engine-v1.7.0-strategy-optimizer";
+  "lotofoot-engine-v1.7.1-balanced-diversification";
 
 const LOTOFOOT_MODE =
   "ACTIVE_CONTROLLED";
@@ -1463,7 +1463,7 @@ const LOTOFOOT_STRATEGIES = {
       "BALANCED_COVERAGE_COST",
     budgetShare: 0.75,
     description:
-      "Limite volontairement la complexité à environ 75 % du budget maximum afin de conserver un meilleur compromis couverture/coût.",
+      "Utilise environ 75 % du budget et privilégie la dispersion des protections : les doubles prioritaires passent avant un triple, sauf si celui-ci concerne une ligne de toute première priorité.",
   },
 
   OFFENSIVE: {
@@ -1711,15 +1711,60 @@ function optimizeGridSelectionsByStrategy({
     };
   }
 
+  /*
+   * V1.7.1 — diversification BALANCED
+   *
+   * Un budget comme 12 combinaisons oblige mathématiquement à utiliser
+   * au moins un facteur 3 pour consommer tout le plafond. La V1.7.0 pouvait
+   * donc tripler une ligne classée plus bas tout en laissant une priorité
+   * supérieure en simple.
+   *
+   * En BALANCED, les triples sont désormais réservés aux 3 meilleures
+   * priorités de protection. Cela conserve la possibilité d'un 3×2×2 = 12
+   * tout en garantissant que le triple ne contourne pas les protections
+   * les plus importantes. PRUDENT et OFFENSIVE restent inchangés.
+   */
+  let balancedTripleEligibleLines = null;
+
+  if (normalizedStrategy === "BALANCED") {
+    balancedTripleEligibleLines = new Set(
+      rows
+        .map((row) => buildProtectionPriority(row))
+        .sort((a, b) =>
+          numberOr(b?.priorityScore) -
+          numberOr(a?.priorityScore)
+        )
+        .slice(0, Math.min(3, rows.length))
+        .map((item) => Number(item?.lineNumber))
+    );
+  }
+
   const candidateSets =
     rows.map(
-      (row) => ({
-        row,
-        candidates:
+      (row) => {
+        let candidates =
           buildSelectionCandidates(
             row
-          ),
-      })
+          );
+
+        if (
+          normalizedStrategy === "BALANCED" &&
+          balancedTripleEligibleLines &&
+          !balancedTripleEligibleLines.has(
+            Number(row?.line_number)
+          )
+        ) {
+          candidates = candidates.filter(
+            (candidate) =>
+              candidate.factor !== 3
+          );
+        }
+
+        return {
+          row,
+          candidates,
+        };
+      }
     );
 
   let states =
