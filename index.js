@@ -27768,8 +27768,19 @@ app.get("/public/bilan/detaille", async (req, res) => {
 
 /*
  * ============================================================
- * TRACKED BETS V2 — PARIS RÉELLEMENT JOUÉS
+ * TRACKED BETS V3 — PARIS DU JOUR OFFICIELS
  * ============================================================
+ *
+ * Source officielle de :
+ * - Paris du jour
+ * - Opportunités
+ * - SAFE
+ * - FUN
+ * - futur Bilan
+ * - futures Statistiques
+ *
+ * IMPORTANT :
+ * aucune publication automatique.
  *
  * PUBLIC :
  * GET /public/tracked-bets
@@ -27780,9 +27791,6 @@ app.get("/public/bilan/detaille", async (req, res) => {
  * PATCH  /internal/tracked-bets/:id
  * DELETE /internal/tracked-bets/:id
  * GET    /internal/tracked-bets/stats
- *
- * Catégories publiques :
- * SAFE / FUN / OPPORTUNITY
  */
 
 const TRACKED_BET_STATUSES = new Set([
@@ -27790,6 +27798,7 @@ const TRACKED_BET_STATUSES = new Set([
   "WIN",
   "LOSS",
   "VOID",
+  "CANCELLED",
 ]);
 
 const TRACKED_BET_CATEGORIES = new Set([
@@ -27798,112 +27807,12 @@ const TRACKED_BET_CATEGORIES = new Set([
   "OPPORTUNITY",
 ]);
 
-async function ensureTrackedBetsTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS tracked_bets (
-      id BIGSERIAL PRIMARY KEY,
-
-      fixture_id BIGINT,
-      kickoff TIMESTAMPTZ,
-
-      league_id BIGINT,
-      league_name TEXT,
-
-      home_team_name TEXT NOT NULL,
-      away_team_name TEXT NOT NULL,
-
-      market_key TEXT NOT NULL,
-      market_label TEXT NOT NULL,
-
-      category TEXT NOT NULL DEFAULT 'FUN',
-
-      odd NUMERIC(10, 4) NOT NULL,
-      stake NUMERIC(12, 4) NOT NULL DEFAULT 1,
-
-      bookmaker TEXT,
-
-      status TEXT NOT NULL DEFAULT 'PENDING',
-      profit NUMERIC(12, 4),
-
-      note TEXT,
-
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      settled_at TIMESTAMPTZ,
-
-      CONSTRAINT tracked_bets_status_check
-        CHECK (
-          status IN (
-            'PENDING',
-            'WIN',
-            'LOSS',
-            'VOID'
-          )
-        ),
-
-      CONSTRAINT tracked_bets_odd_check
-        CHECK (odd > 1),
-
-      CONSTRAINT tracked_bets_stake_check
-        CHECK (stake > 0)
-    );
-  `);
-
-  /*
-   * Migration douce si la table V1 existe déjà.
-   */
-  await pool.query(`
-    ALTER TABLE tracked_bets
-    ADD COLUMN IF NOT EXISTS category TEXT;
-  `);
-
-  await pool.query(`
-    UPDATE tracked_bets
-    SET category = 'FUN'
-    WHERE category IS NULL
-       OR TRIM(category) = '';
-  `);
-
-  await pool.query(`
-    ALTER TABLE tracked_bets
-    ALTER COLUMN category SET DEFAULT 'FUN';
-  `);
-
-  await pool.query(`
-    ALTER TABLE tracked_bets
-    ALTER COLUMN category SET NOT NULL;
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_fixture_id
-    ON tracked_bets(fixture_id);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_status
-    ON tracked_bets(status);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_category
-    ON tracked_bets(category);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_kickoff
-    ON tracked_bets(kickoff DESC);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS
-      idx_tracked_bets_created_at
-    ON tracked_bets(created_at DESC);
-  `);
-}
+const TRACKED_BET_SOURCES = new Set([
+  "MANUAL",
+  "SAFE_ENGINE",
+  "FUN_ENGINE",
+  "BRAIN_STUDIO",
+]);
 
 function normalizeTrackedBetStatus(value) {
   const normalized = String(
@@ -27933,16 +27842,162 @@ function normalizeTrackedBetCategory(value) {
     : "FUN";
 }
 
+function normalizeTrackedBetSource(value) {
+  const normalized = String(
+    value || "MANUAL"
+  )
+    .trim()
+    .toUpperCase();
+
+  return TRACKED_BET_SOURCES.has(
+    normalized
+  )
+    ? normalized
+    : "MANUAL";
+}
+
+/*
+ * Contrairement aux anciens marchés Brain Studio,
+ * Paris du jour doit aussi accepter :
+ *
+ * - Arsenal +5.5 corners
+ * - PSG +1.5 buts
+ * - Over 2.75
+ * - BTTS
+ * - handicaps asiatiques
+ * - marchés futurs ajoutés manuellement
+ */
+function normalizeTrackedBetMarketKey(
+  value,
+  marketLabel = ""
+) {
+  const raw = String(
+    value || marketLabel || ""
+  )
+    .trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  return raw
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 200);
+}
+
+function nullableTrackedBetNumber(
+  value
+) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return null;
+  }
+
+  const number = Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
+
+function clampTrackedBetNumber(
+  value,
+  min,
+  max
+) {
+  const number =
+    nullableTrackedBetNumber(value);
+
+  if (number === null) {
+    return null;
+  }
+
+  return Math.max(
+    min,
+    Math.min(max, number)
+  );
+}
+
+function computeTrackedBetFairOdd(
+  probability
+) {
+  const p =
+    nullableTrackedBetNumber(
+      probability
+    );
+
+  if (
+    p === null ||
+    p <= 0 ||
+    p > 100
+  ) {
+    return null;
+  }
+
+  return Number(
+    (100 / p).toFixed(4)
+  );
+}
+
+function computeTrackedBetEV({
+  probability,
+  odd,
+}) {
+  const p =
+    nullableTrackedBetNumber(
+      probability
+    );
+
+  const bookmakerOdd =
+    nullableTrackedBetNumber(odd);
+
+  if (
+    p === null ||
+    p <= 0 ||
+    p > 100 ||
+    bookmakerOdd === null ||
+    bookmakerOdd <= 1
+  ) {
+    return null;
+  }
+
+  return Number(
+    (
+      (
+        (p / 100) *
+        bookmakerOdd -
+        1
+      ) *
+      100
+    ).toFixed(2)
+  );
+}
+
 function computeTrackedBetProfit({
   status,
   odd,
   stake,
 }) {
   const normalizedStatus =
-    normalizeTrackedBetStatus(status);
+    normalizeTrackedBetStatus(
+      status
+    );
 
-  const safeOdd = Number(odd);
-  const safeStake = Number(stake);
+  const safeOdd =
+    Number(odd);
+
+  const safeStake =
+    Number(stake);
 
   if (
     !Number.isFinite(safeOdd) ||
@@ -27951,7 +28006,9 @@ function computeTrackedBetProfit({
     return null;
   }
 
-  if (normalizedStatus === "WIN") {
+  if (
+    normalizedStatus === "WIN"
+  ) {
     return Number(
       (
         safeStake *
@@ -27960,20 +28017,359 @@ function computeTrackedBetProfit({
     );
   }
 
-  if (normalizedStatus === "LOSS") {
+  if (
+    normalizedStatus === "LOSS"
+  ) {
     return Number(
       (-safeStake).toFixed(4)
     );
   }
 
-  if (normalizedStatus === "VOID") {
+  if (
+    normalizedStatus === "VOID" ||
+    normalizedStatus ===
+      "CANCELLED"
+  ) {
     return 0;
   }
 
   return null;
 }
 
-function formatTrackedBet(row = {}) {
+async function ensureTrackedBetsTable() {
+  /*
+   * Création complète pour une nouvelle base.
+   */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tracked_bets (
+      id BIGSERIAL PRIMARY KEY,
+
+      fixture_id BIGINT,
+      kickoff TIMESTAMPTZ,
+
+      league_id BIGINT,
+      league_name TEXT,
+
+      home_team_name TEXT NOT NULL,
+      away_team_name TEXT NOT NULL,
+
+      market_key TEXT NOT NULL,
+      market_label TEXT NOT NULL,
+
+      category TEXT NOT NULL DEFAULT 'FUN',
+
+      odd NUMERIC(10, 4) NOT NULL,
+      stake NUMERIC(12, 4) NOT NULL DEFAULT 1,
+
+      bookmaker TEXT,
+
+      probability NUMERIC(7, 3),
+      fair_odd NUMERIC(10, 4),
+      ev_percent NUMERIC(10, 3),
+      confidence NUMERIC(7, 3),
+
+      analysis_text TEXT,
+
+      published BOOLEAN NOT NULL DEFAULT FALSE,
+
+      source TEXT NOT NULL DEFAULT 'MANUAL',
+
+      display_order INTEGER NOT NULL DEFAULT 0,
+
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      profit NUMERIC(12, 4),
+
+      note TEXT,
+
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      published_at TIMESTAMPTZ,
+      settled_at TIMESTAMPTZ,
+
+      CONSTRAINT tracked_bets_odd_check
+        CHECK (odd > 1),
+
+      CONSTRAINT tracked_bets_stake_check
+        CHECK (stake > 0)
+    );
+  `);
+
+  /*
+   * ========================================================
+   * MIGRATION DOUCE V1 / V2 -> V3
+   * ========================================================
+   *
+   * Aucun ancien pari n'est supprimé.
+   */
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      category TEXT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      probability NUMERIC(7, 3);
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      fair_odd NUMERIC(10, 4);
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      ev_percent NUMERIC(10, 3);
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      confidence NUMERIC(7, 3);
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      analysis_text TEXT;
+  `);
+
+  /*
+   * Les paris V2 étaient déjà publics.
+   *
+   * On les conserve donc comme publiés
+   * lors de la première migration.
+   */
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      published BOOLEAN DEFAULT TRUE;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      source TEXT DEFAULT 'MANUAL';
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      display_order INTEGER DEFAULT 0;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD COLUMN IF NOT EXISTS
+      published_at TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
+    UPDATE tracked_bets
+    SET category = 'FUN'
+    WHERE category IS NULL
+       OR TRIM(category) = '';
+  `);
+
+  await pool.query(`
+    UPDATE tracked_bets
+    SET source = 'MANUAL'
+    WHERE source IS NULL
+       OR TRIM(source) = '';
+  `);
+
+  await pool.query(`
+    UPDATE tracked_bets
+    SET published = TRUE
+    WHERE published IS NULL;
+  `);
+
+  await pool.query(`
+    UPDATE tracked_bets
+    SET display_order = 0
+    WHERE display_order IS NULL;
+  `);
+
+  /*
+   * Première date de publication des
+   * anciens paris publics.
+   */
+  await pool.query(`
+    UPDATE tracked_bets
+    SET published_at = COALESCE(
+      published_at,
+      created_at
+    )
+    WHERE published = TRUE
+      AND published_at IS NULL;
+  `);
+
+  /*
+   * Reconstitue automatiquement les
+   * informations V3 lorsque possible.
+   */
+  await pool.query(`
+    UPDATE tracked_bets
+    SET
+      fair_odd =
+        CASE
+          WHEN probability > 0
+            THEN ROUND(
+              (100.0 / probability)::numeric,
+              4
+            )
+          ELSE fair_odd
+        END,
+
+      ev_percent =
+        CASE
+          WHEN probability > 0
+               AND odd > 1
+            THEN ROUND(
+              (
+                (
+                  probability / 100.0
+                ) * odd - 1
+              ) * 100,
+              3
+            )
+          ELSE ev_percent
+        END
+    WHERE probability IS NOT NULL;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN category
+      SET DEFAULT 'FUN';
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN category
+      SET NOT NULL;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN source
+      SET DEFAULT 'MANUAL';
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN source
+      SET NOT NULL;
+  `);
+
+  /*
+   * IMPORTANT :
+   * nouveaux paris = NON publiés par défaut.
+   */
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN published
+      SET DEFAULT FALSE;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN published
+      SET NOT NULL;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN display_order
+      SET DEFAULT 0;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ALTER COLUMN display_order
+      SET NOT NULL;
+  `);
+
+  /*
+   * L'ancienne contrainte ne connaissait
+   * pas CANCELLED.
+   */
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    DROP CONSTRAINT IF EXISTS
+      tracked_bets_status_check;
+  `);
+
+  await pool.query(`
+    ALTER TABLE tracked_bets
+    ADD CONSTRAINT tracked_bets_status_check
+    CHECK (
+      status IN (
+        'PENDING',
+        'WIN',
+        'LOSS',
+        'VOID',
+        'CANCELLED'
+      )
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_tracked_bets_fixture_id
+    ON tracked_bets(fixture_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_tracked_bets_status
+    ON tracked_bets(status);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_tracked_bets_category
+    ON tracked_bets(category);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_tracked_bets_published
+    ON tracked_bets(published);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_tracked_bets_kickoff
+    ON tracked_bets(kickoff DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      idx_tracked_bets_created_at
+    ON tracked_bets(created_at DESC);
+  `);
+}
+
+function formatTrackedBet(
+  row = {}
+) {
+  const probability =
+    row.probability === null ||
+    row.probability === undefined
+      ? null
+      : Number(row.probability);
+
+  const odd =
+    row.odd === null ||
+    row.odd === undefined
+      ? null
+      : Number(row.odd);
+
   return {
     id: Number(row.id),
 
@@ -28012,10 +28408,7 @@ function formatTrackedBet(row = {}) {
         row.category
       ),
 
-    odd:
-      row.odd === null
-        ? null
-        : Number(row.odd),
+    odd,
 
     stake:
       row.stake === null
@@ -28024,6 +28417,47 @@ function formatTrackedBet(row = {}) {
 
     bookmaker:
       row.bookmaker || "",
+
+    probability,
+
+    fairOdd:
+      row.fair_odd !== null &&
+      row.fair_odd !== undefined
+        ? Number(row.fair_odd)
+        : computeTrackedBetFairOdd(
+            probability
+          ),
+
+    evPercent:
+      row.ev_percent !== null &&
+      row.ev_percent !== undefined
+        ? Number(row.ev_percent)
+        : computeTrackedBetEV({
+            probability,
+            odd,
+          }),
+
+    confidence:
+      row.confidence === null ||
+      row.confidence === undefined
+        ? null
+        : Number(row.confidence),
+
+    analysis:
+      row.analysis_text || "",
+
+    published:
+      row.published === true,
+
+    source:
+      normalizeTrackedBetSource(
+        row.source
+      ),
+
+    displayOrder:
+      Number(
+        row.display_order || 0
+      ),
 
     status:
       normalizeTrackedBetStatus(
@@ -28044,6 +28478,9 @@ function formatTrackedBet(row = {}) {
     updatedAt:
       row.updated_at || null,
 
+    publishedAt:
+      row.published_at || null,
+
     settledAt:
       row.settled_at || null,
   };
@@ -28056,20 +28493,31 @@ function buildTrackedBetStats(
     total: 0,
     pending: 0,
     settled: 0,
+
     wins: 0,
     losses: 0,
     voids: 0,
+    cancelled: 0,
+
     decisions: 0,
+
     totalStake: 0,
     settledStake: 0,
+
     profit: 0,
+
+    winRate: null,
     accuracy: null,
     roi: null,
     averageOdd: null,
+    averageEV: null,
   };
 
   let oddSum = 0;
   let oddCount = 0;
+
+  let evSum = 0;
+  let evCount = 0;
 
   for (const row of rows) {
     const status =
@@ -28088,6 +28536,12 @@ function buildTrackedBetStats(
         ? null
         : Number(row.profit);
 
+    const ev =
+      row.ev_percent === null ||
+      row.ev_percent === undefined
+        ? null
+        : Number(row.ev_percent);
+
     stats.total += 1;
     stats.totalStake += stake;
 
@@ -28099,14 +28553,27 @@ function buildTrackedBetStats(
       oddCount += 1;
     }
 
-    if (status === "PENDING") {
+    if (
+      ev !== null &&
+      Number.isFinite(ev)
+    ) {
+      evSum += ev;
+      evCount += 1;
+    }
+
+    if (
+      status === "PENDING"
+    ) {
       stats.pending += 1;
     }
 
     if (
-      ["WIN", "LOSS", "VOID"].includes(
-        status
-      )
+      [
+        "WIN",
+        "LOSS",
+        "VOID",
+        "CANCELLED",
+      ].includes(status)
     ) {
       stats.settled += 1;
     }
@@ -28133,6 +28600,12 @@ function buildTrackedBetStats(
     }
 
     if (
+      status === "CANCELLED"
+    ) {
+      stats.cancelled += 1;
+    }
+
+    if (
       profit !== null &&
       Number.isFinite(profit)
     ) {
@@ -28140,23 +28613,33 @@ function buildTrackedBetStats(
     }
   }
 
-  stats.accuracy =
+  stats.winRate =
     stats.decisions > 0
       ? Number(
           (
-            (stats.wins /
-              stats.decisions) *
+            (
+              stats.wins /
+              stats.decisions
+            ) *
             100
           ).toFixed(2)
         )
       : null;
 
+  /*
+   * Compatibilité avec l'ancien frontend.
+   */
+  stats.accuracy =
+    stats.winRate;
+
   stats.roi =
     stats.settledStake > 0
       ? Number(
           (
-            (stats.profit /
-              stats.settledStake) *
+            (
+              stats.profit /
+              stats.settledStake
+            ) *
             100
           ).toFixed(2)
         )
@@ -28165,7 +28648,20 @@ function buildTrackedBetStats(
   stats.averageOdd =
     oddCount > 0
       ? Number(
-          (oddSum / oddCount).toFixed(2)
+          (
+            oddSum /
+            oddCount
+          ).toFixed(2)
+        )
+      : null;
+
+  stats.averageEV =
+    evCount > 0
+      ? Number(
+          (
+            evSum /
+            evCount
+          ).toFixed(2)
         )
       : null;
 
@@ -28187,10 +28683,48 @@ function buildTrackedBetStats(
   return stats;
 }
 
+function getParisDateKey(
+  value = new Date()
+) {
+  const date =
+    value instanceof Date
+      ? value
+      : new Date(value);
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return null;
+  }
+
+  return new Intl.DateTimeFormat(
+    "fr-CA",
+    {
+      timeZone:
+        "Europe/Paris",
+
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }
+  ).format(date);
+}
+
 /*
  * ============================================================
- * PUBLIC — résultats des vrais paris
+ * PUBLIC
  * ============================================================
+ *
+ * Exemples :
+ *
+ * /public/tracked-bets
+ * /public/tracked-bets?view=today
+ * /public/tracked-bets?view=upcoming
+ * /public/tracked-bets?view=history
+ *
+ * JAMAIS de pari non publié.
  */
 
 app.get(
@@ -28203,35 +28737,80 @@ app.get(
         await pool.query(`
           SELECT *
           FROM tracked_bets
+          WHERE published = TRUE
           ORDER BY
-            kickoff DESC NULLS LAST,
+            CASE category
+              WHEN 'OPPORTUNITY'
+                THEN 1
+              WHEN 'SAFE'
+                THEN 2
+              WHEN 'FUN'
+                THEN 3
+              ELSE 4
+            END ASC,
+
+            display_order ASC,
+
+            kickoff ASC NULLS LAST,
+
             created_at DESC,
+
             id DESC
+
           LIMIT 3000
         `);
 
-      const rows =
+      let rows =
         result.rows || [];
 
+      const view =
+        String(
+          req.query?.view ||
+          "all"
+        )
+          .trim()
+          .toLowerCase();
+
+      const todayKey =
+        getParisDateKey();
+
+      if (view === "today") {
+        rows = rows.filter(
+          (row) =>
+            row.status ===
+              "PENDING" &&
+            row.kickoff &&
+            getParisDateKey(
+              row.kickoff
+            ) === todayKey
+        );
+      }
+
+      if (view === "upcoming") {
+        const now = Date.now();
+
+        rows = rows.filter(
+          (row) =>
+            row.status ===
+              "PENDING" &&
+            (
+              !row.kickoff ||
+              new Date(
+                row.kickoff
+              ).getTime() >= now
+            )
+        );
+      }
+
+      if (view === "history") {
+        rows = rows.filter(
+          (row) =>
+            row.status !==
+            "PENDING"
+        );
+      }
+
       const categories = {
-        SAFE: buildTrackedBetStats(
-          rows.filter(
-            (row) =>
-              normalizeTrackedBetCategory(
-                row.category
-              ) === "SAFE"
-          )
-        ),
-
-        FUN: buildTrackedBetStats(
-          rows.filter(
-            (row) =>
-              normalizeTrackedBetCategory(
-                row.category
-              ) === "FUN"
-          )
-        ),
-
         OPPORTUNITY:
           buildTrackedBetStats(
             rows.filter(
@@ -28242,10 +28821,40 @@ app.get(
                 "OPPORTUNITY"
             )
           ),
+
+        SAFE:
+          buildTrackedBetStats(
+            rows.filter(
+              (row) =>
+                normalizeTrackedBetCategory(
+                  row.category
+                ) ===
+                "SAFE"
+            )
+          ),
+
+        FUN:
+          buildTrackedBetStats(
+            rows.filter(
+              (row) =>
+                normalizeTrackedBetCategory(
+                  row.category
+                ) ===
+                "FUN"
+            )
+          ),
       };
 
       return res.json({
         ok: true,
+
+        version:
+          "tracked-bets-v3",
+
+        view,
+
+        count:
+          rows.length,
 
         stats:
           buildTrackedBetStats(
@@ -28283,7 +28892,7 @@ app.get(
 
 /*
  * ============================================================
- * ADMIN — liste
+ * ADMIN — LISTE
  * ============================================================
  */
 
@@ -28306,17 +28915,20 @@ app.get(
         await pool.query(`
           SELECT *
           FROM tracked_bets
+
           ORDER BY
-            kickoff DESC NULLS LAST,
             created_at DESC,
             id DESC
+
           LIMIT 3000
         `);
 
       return res.json({
         ok: true,
+
         count:
           result.rows.length,
+
         bets:
           result.rows.map(
             formatTrackedBet
@@ -28332,6 +28944,7 @@ app.get(
         .status(500)
         .json({
           ok: false,
+
           error:
             error?.message ||
             "Impossible de charger les paris suivis.",
@@ -28342,7 +28955,7 @@ app.get(
 
 /*
  * ============================================================
- * ADMIN — ajout
+ * ADMIN — AJOUT
  * ============================================================
  */
 
@@ -28362,32 +28975,28 @@ app.post(
       await ensureTrackedBetsTable();
 
       const fixtureId =
-        req.body?.fixtureId === null ||
-        req.body?.fixtureId === undefined ||
-        req.body?.fixtureId === ""
-          ? null
-          : Number(
-              req.body.fixtureId
-            );
+        nullableTrackedBetNumber(
+          req.body?.fixtureId
+        );
 
       const leagueId =
-        req.body?.leagueId === null ||
-        req.body?.leagueId === undefined ||
-        req.body?.leagueId === ""
-          ? null
-          : Number(
-              req.body.leagueId
-            );
+        nullableTrackedBetNumber(
+          req.body?.leagueId
+        );
 
       const homeTeam =
         String(
           req.body?.homeTeam || ""
-        ).trim();
+        )
+          .trim()
+          .slice(0, 300);
 
       const awayTeam =
         String(
           req.body?.awayTeam || ""
-        ).trim();
+        )
+          .trim()
+          .slice(0, 300);
 
       const leagueName =
         String(
@@ -28396,21 +29005,18 @@ app.post(
           .trim()
           .slice(0, 300);
 
-      const marketKey =
-        normalizeManualOddsMarketKey(
-          req.body?.marketKey || ""
-        );
-
       const marketLabel =
         String(
-          req.body?.marketLabel ||
-            getBilanMarketLabel(
-              {},
-              marketKey
-            )
+          req.body?.marketLabel || ""
         )
           .trim()
           .slice(0, 300);
+
+      const marketKey =
+        normalizeTrackedBetMarketKey(
+          req.body?.marketKey,
+          marketLabel
+        );
 
       const category =
         normalizeTrackedBetCategory(
@@ -28418,10 +29024,14 @@ app.post(
         );
 
       const odd =
-        Number(req.body?.odd);
+        Number(
+          req.body?.odd
+        );
 
       const stake =
-        Number(req.body?.stake ?? 1);
+        Number(
+          req.body?.stake ?? 1
+        );
 
       const bookmaker =
         String(
@@ -28430,6 +29040,29 @@ app.post(
           .trim()
           .slice(0, 200);
 
+      const probability =
+        clampTrackedBetNumber(
+          req.body?.probability,
+          0,
+          100
+        );
+
+      const confidence =
+        clampTrackedBetNumber(
+          req.body?.confidence,
+          0,
+          100
+        );
+
+      const analysisText =
+        String(
+          req.body?.analysis ||
+          req.body?.analysisText ||
+          ""
+        )
+          .trim()
+          .slice(0, 5000);
+
       const note =
         String(
           req.body?.note || ""
@@ -28437,17 +29070,56 @@ app.post(
           .trim()
           .slice(0, 2000);
 
+      const source =
+        normalizeTrackedBetSource(
+          req.body?.source
+        );
+
+      /*
+       * Une création admin NE publie
+       * jamais automatiquement.
+       */
+      const published =
+        req.body?.published === true;
+
+      const displayOrder =
+        Number.isInteger(
+          Number(
+            req.body?.displayOrder
+          )
+        )
+          ? Number(
+              req.body.displayOrder
+            )
+          : 0;
+
       const status =
         normalizeTrackedBetStatus(
           req.body?.status
         );
 
-      const kickoff =
-        req.body?.kickoff
-          ? new Date(
-              req.body.kickoff
-            )
-          : null;
+      let kickoff = null;
+
+      if (req.body?.kickoff) {
+        kickoff =
+          new Date(
+            req.body.kickoff
+          );
+
+        if (
+          Number.isNaN(
+            kickoff.getTime()
+          )
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "Date du match invalide.",
+            });
+        }
+      }
 
       if (
         !homeTeam ||
@@ -28462,13 +29134,23 @@ app.post(
           });
       }
 
-      if (!marketKey) {
+      if (!marketLabel) {
         return res
           .status(400)
           .json({
             ok: false,
             error:
               "Le marché est obligatoire.",
+          });
+      }
+
+      if (!marketKey) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "La clé du marché est invalide.",
           });
       }
 
@@ -28498,20 +29180,16 @@ app.post(
           });
       }
 
-      if (
-        kickoff &&
-        Number.isNaN(
-          kickoff.getTime()
-        )
-      ) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Date du match invalide.",
-          });
-      }
+      const fairOdd =
+        computeTrackedBetFairOdd(
+          probability
+        );
+
+      const evPercent =
+        computeTrackedBetEV({
+          probability,
+          odd,
+        });
 
       const profit =
         computeTrackedBetProfit({
@@ -28540,8 +29218,20 @@ app.post(
 
               odd,
               stake,
-
               bookmaker,
+
+              probability,
+              fair_odd,
+              ev_percent,
+              confidence,
+
+              analysis_text,
+
+              published,
+              published_at,
+
+              source,
+              display_order,
 
               status,
               profit,
@@ -28555,36 +29245,30 @@ app.post(
             )
 
             VALUES (
-              $1,
-              $2,
-
-              $3,
-              $4,
-
-              $5,
-              $6,
-
-              $7,
-              $8,
-
+              $1, $2,
+              $3, $4,
+              $5, $6,
+              $7, $8,
               $9,
-
-              $10,
-              $11,
-
-              $12,
-
-              $13,
-              $14,
-
-              $15,
-
+              $10, $11, $12,
+              $13, $14, $15, $16,
+              $17,
+              $18,
               CASE
-                WHEN $13 = 'PENDING'
+                WHEN $18 = TRUE
+                  THEN NOW()
+                ELSE NULL
+              END,
+              $19,
+              $20,
+              $21,
+              $22,
+              $23,
+              CASE
+                WHEN $21 = 'PENDING'
                   THEN NULL
                 ELSE NOW()
               END,
-
               NOW(),
               NOW()
             )
@@ -28610,8 +29294,19 @@ app.post(
 
             odd,
             stake,
-
             bookmaker || null,
+
+            probability,
+            fairOdd,
+            evPercent,
+            confidence,
+
+            analysisText || null,
+
+            published,
+
+            source,
+            displayOrder,
 
             status,
             profit,
@@ -28624,6 +29319,7 @@ app.post(
         .status(201)
         .json({
           ok: true,
+
           bet:
             formatTrackedBet(
               result.rows[0]
@@ -28639,6 +29335,7 @@ app.post(
         .status(500)
         .json({
           ok: false,
+
           error:
             error?.message ||
             "Impossible d'ajouter le pari.",
@@ -28649,7 +29346,7 @@ app.post(
 
 /*
  * ============================================================
- * ADMIN — modification/résultat
+ * ADMIN — MODIFICATION / PUBLICATION / RÉSULTAT
  * ============================================================
  */
 
@@ -28711,45 +29408,60 @@ app.patch(
       const current =
         currentResult.rows[0];
 
+      const homeTeam =
+        req.body?.homeTeam !==
+        undefined
+          ? String(
+              req.body.homeTeam || ""
+            )
+              .trim()
+              .slice(0, 300)
+          : current.home_team_name;
+
+      const awayTeam =
+        req.body?.awayTeam !==
+        undefined
+          ? String(
+              req.body.awayTeam || ""
+            )
+              .trim()
+              .slice(0, 300)
+          : current.away_team_name;
+
+      const marketLabel =
+        req.body?.marketLabel !==
+        undefined
+          ? String(
+              req.body.marketLabel ||
+              ""
+            )
+              .trim()
+              .slice(0, 300)
+          : current.market_label;
+
+      const marketKey =
+        req.body?.marketKey !==
+          undefined ||
+        req.body?.marketLabel !==
+          undefined
+          ? normalizeTrackedBetMarketKey(
+              req.body?.marketKey ||
+                current.market_key,
+              marketLabel
+            )
+          : current.market_key;
+
       const odd =
         req.body?.odd !==
-          undefined
-          ? Number(
-              req.body.odd
-            )
-          : Number(
-              current.odd
-            );
+        undefined
+          ? Number(req.body.odd)
+          : Number(current.odd);
 
       const stake =
         req.body?.stake !==
-          undefined
-          ? Number(
-              req.body.stake
-            )
-          : Number(
-              current.stake
-            );
-
-      const status =
-        req.body?.status !==
-          undefined
-          ? normalizeTrackedBetStatus(
-              req.body.status
-            )
-          : normalizeTrackedBetStatus(
-              current.status
-            );
-
-      const category =
-        req.body?.category !==
-          undefined
-          ? normalizeTrackedBetCategory(
-              req.body.category
-            )
-          : normalizeTrackedBetCategory(
-              current.category
-            );
+        undefined
+          ? Number(req.body.stake)
+          : Number(current.stake);
 
       if (
         !Number.isFinite(odd) ||
@@ -28777,50 +29489,84 @@ app.patch(
           });
       }
 
-      const profit =
-        computeTrackedBetProfit({
-          status,
-          odd,
-          stake,
-        });
-
-      const homeTeam =
-        req.body?.homeTeam !==
-          undefined
-          ? String(
-              req.body.homeTeam || ""
-            ).trim()
-          : current.home_team_name;
-
-      const awayTeam =
-        req.body?.awayTeam !==
-          undefined
-          ? String(
-              req.body.awayTeam || ""
-            ).trim()
-          : current.away_team_name;
-
-      const marketKey =
-        req.body?.marketKey !==
-          undefined
-          ? normalizeManualOddsMarketKey(
-              req.body.marketKey
+      const category =
+        req.body?.category !==
+        undefined
+          ? normalizeTrackedBetCategory(
+              req.body.category
             )
-          : current.market_key;
+          : normalizeTrackedBetCategory(
+              current.category
+            );
 
-      const marketLabel =
-        req.body?.marketLabel !==
-          undefined
-          ? String(
-              req.body.marketLabel || ""
+      const status =
+        req.body?.status !==
+        undefined
+          ? normalizeTrackedBetStatus(
+              req.body.status
             )
-              .trim()
-              .slice(0, 300)
-          : current.market_label;
+          : normalizeTrackedBetStatus(
+              current.status
+            );
+
+      const probability =
+        req.body?.probability !==
+        undefined
+          ? clampTrackedBetNumber(
+              req.body.probability,
+              0,
+              100
+            )
+          : nullableTrackedBetNumber(
+              current.probability
+            );
+
+      const confidence =
+        req.body?.confidence !==
+        undefined
+          ? clampTrackedBetNumber(
+              req.body.confidence,
+              0,
+              100
+            )
+          : nullableTrackedBetNumber(
+              current.confidence
+            );
+
+      const published =
+        req.body?.published !==
+        undefined
+          ? req.body.published === true
+          : current.published === true;
+
+      const source =
+        req.body?.source !==
+        undefined
+          ? normalizeTrackedBetSource(
+              req.body.source
+            )
+          : normalizeTrackedBetSource(
+              current.source
+            );
+
+      const displayOrder =
+        req.body?.displayOrder !==
+        undefined &&
+        Number.isInteger(
+          Number(
+            req.body.displayOrder
+          )
+        )
+          ? Number(
+              req.body.displayOrder
+            )
+          : Number(
+              current.display_order || 0
+            );
 
       const bookmaker =
         req.body?.bookmaker !==
-          undefined
+        undefined
           ? String(
               req.body.bookmaker || ""
             )
@@ -28828,15 +29574,41 @@ app.patch(
               .slice(0, 200)
           : current.bookmaker;
 
+      const analysisText =
+        req.body?.analysis !==
+          undefined ||
+        req.body?.analysisText !==
+          undefined
+          ? String(
+              req.body?.analysis ??
+              req.body?.analysisText ??
+              ""
+            )
+              .trim()
+              .slice(0, 5000)
+          : current.analysis_text;
+
       const note =
         req.body?.note !==
-          undefined
+        undefined
           ? String(
               req.body.note || ""
             )
               .trim()
               .slice(0, 2000)
           : current.note;
+
+      const leagueName =
+        req.body?.leagueName !==
+        undefined
+          ? String(
+              req.body.leagueName ||
+              ""
+            )
+              .trim()
+              .slice(0, 300) ||
+            null
+          : current.league_name;
 
       let kickoff =
         current.kickoff;
@@ -28846,7 +29618,8 @@ app.patch(
         undefined
       ) {
         if (
-          req.body.kickoff === null ||
+          req.body.kickoff ===
+            null ||
           req.body.kickoff === ""
         ) {
           kickoff = null;
@@ -28875,16 +29648,27 @@ app.patch(
         }
       }
 
-      const leagueName =
-        req.body?.leagueName !==
-          undefined
-          ? String(
-              req.body.leagueName || ""
-            )
-              .trim()
-              .slice(0, 300) ||
-            null
-          : current.league_name;
+      const fairOdd =
+        computeTrackedBetFairOdd(
+          probability
+        );
+
+      /*
+       * EV recalculée AUTOMATIQUEMENT
+       * dès que cote/probabilité changent.
+       */
+      const evPercent =
+        computeTrackedBetEV({
+          probability,
+          odd,
+        });
+
+      const profit =
+        computeTrackedBetProfit({
+          status,
+          odd,
+          stake,
+        });
 
       const result =
         await pool.query(
@@ -28908,18 +29692,44 @@ app.patch(
 
               bookmaker = $11,
 
-              status = $12,
-              profit = $13,
+              probability = $12,
+              fair_odd = $13,
+              ev_percent = $14,
+              confidence = $15,
 
-              note = $14,
+              analysis_text = $16,
+
+              published = $17,
+
+              published_at =
+                CASE
+                  WHEN $17 = TRUE
+                       AND published_at
+                           IS NULL
+                    THEN NOW()
+
+                  WHEN $17 = FALSE
+                    THEN NULL
+
+                  ELSE published_at
+                END,
+
+              source = $18,
+              display_order = $19,
+
+              status = $20,
+              profit = $21,
+
+              note = $22,
 
               settled_at =
                 CASE
-                  WHEN $12 = 'PENDING'
+                  WHEN $20 = 'PENDING'
                     THEN NULL
 
                   WHEN status = 'PENDING'
-                    OR settled_at IS NULL
+                       OR settled_at
+                           IS NULL
                     THEN NOW()
 
                   ELSE settled_at
@@ -28949,6 +29759,18 @@ app.patch(
 
             bookmaker || null,
 
+            probability,
+            fairOdd,
+            evPercent,
+            confidence,
+
+            analysisText || null,
+
+            published,
+
+            source,
+            displayOrder,
+
             status,
             profit,
 
@@ -28958,6 +29780,7 @@ app.patch(
 
       return res.json({
         ok: true,
+
         bet:
           formatTrackedBet(
             result.rows[0]
@@ -28973,6 +29796,7 @@ app.patch(
         .status(500)
         .json({
           ok: false,
+
           error:
             error?.message ||
             "Impossible de modifier le pari.",
@@ -28983,7 +29807,7 @@ app.patch(
 
 /*
  * ============================================================
- * ADMIN — suppression
+ * ADMIN — SUPPRESSION
  * ============================================================
  */
 
@@ -29055,6 +29879,7 @@ app.delete(
         .status(500)
         .json({
           ok: false,
+
           error:
             error?.message ||
             "Impossible de supprimer le pari.",
@@ -29065,7 +29890,7 @@ app.delete(
 
 /*
  * ============================================================
- * ADMIN — stats
+ * ADMIN — STATISTIQUES
  * ============================================================
  */
 
@@ -29090,12 +29915,59 @@ app.get(
           FROM tracked_bets
         `);
 
+      const rows =
+        result.rows || [];
+
       return res.json({
         ok: true,
+
         stats:
           buildTrackedBetStats(
-            result.rows || []
+            rows
           ),
+
+        published:
+          buildTrackedBetStats(
+            rows.filter(
+              (row) =>
+                row.published === true
+            )
+          ),
+
+        categories: {
+          OPPORTUNITY:
+            buildTrackedBetStats(
+              rows.filter(
+                (row) =>
+                  normalizeTrackedBetCategory(
+                    row.category
+                  ) ===
+                  "OPPORTUNITY"
+              )
+            ),
+
+          SAFE:
+            buildTrackedBetStats(
+              rows.filter(
+                (row) =>
+                  normalizeTrackedBetCategory(
+                    row.category
+                  ) ===
+                  "SAFE"
+              )
+            ),
+
+          FUN:
+            buildTrackedBetStats(
+              rows.filter(
+                (row) =>
+                  normalizeTrackedBetCategory(
+                    row.category
+                  ) ===
+                  "FUN"
+              )
+            ),
+        },
       });
     } catch (error) {
       console.error(
@@ -29107,6 +29979,7 @@ app.get(
         .status(500)
         .json({
           ok: false,
+
           error:
             error?.message ||
             "Impossible de calculer les statistiques des paris.",
