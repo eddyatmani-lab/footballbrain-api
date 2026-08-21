@@ -1,6 +1,6 @@
 require("dotenv").config();
 const nodeCrypto = require("crypto");
-const SITE_VISITS_BASELINE = 120;
+const SITE_VISITS_BASELINE = 350;
 function parseEnvironmentBoolean(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
