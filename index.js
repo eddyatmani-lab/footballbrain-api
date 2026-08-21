@@ -25116,462 +25116,1721 @@ function startAutomaticSchedulers() {
 
 /*
  * ============================================================
- * STATISTIQUES PUBLIQUES — VUE PARIEUR
+ * STATISTIQUES PUBLIQUES V2 — PERFORMANCE PRÉDICTIVE
  * ============================================================
- * Cette route expose uniquement des résultats compréhensibles
- * par le public. Elle ne renvoie aucune donnée Learning,
- * Calibration ou coefficient interne de l'IA.
+ *
+ * Objectif :
+ * - dernier marché final retenu par match
+ * - réussite par marché
+ * - réussite par championnat
+ * - réussite par équipe
+ * - croisements championnat -> marchés
+ * - croisements équipe -> marchés
+ *
+ * AUCUNE DONNÉE FINANCIÈRE :
+ * - pas de ROI
+ * - pas de profit
+ * - pas de mise
+ * - pas de cote moyenne
  */
-app.get("/public/statistics/dashboard", async (req, res) => {
-  try {
-    await ensureBilanV3Columns();
-    await ensureDailyTicketTables();
-    await refreshManualOddsProfits();
 
-    const [
-      globalResult,
-      competitionsResult,
-      marketsResult,
-      oddsBandsResult,
-      valueScannerResult,
-      ticketStatsResult,
-    ] = await Promise.all([
-      pool.query(`
-        SELECT
-          COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-          )::INTEGER AS completed_markets,
+function statisticsNormalizeMarketKey(
+  value = ""
+) {
+  const key = String(
+    value || ""
+  )
+    .trim()
+    .toUpperCase()
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .replace(
+      /[^A-Z0-9]/g,
+      ""
+    );
 
-          COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) IS NOT NULL
-          )::INTEGER AS evaluated_markets,
-
-          COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) = TRUE
-          )::INTEGER AS wins,
-
-          COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) = FALSE
-          )::INTEGER AS losses,
-
-          COUNT(*) FILTER (
-            WHERE manual_market_odd IS NOT NULL
-              AND manual_profit_units IS NOT NULL
-          )::INTEGER AS settled_real_bets,
-
-          COALESCE(
-            SUM(manual_stake_units) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-            ),
-            0
-          )::NUMERIC AS total_stake,
-
-          COALESCE(
-            SUM(manual_profit_units) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-            ),
-            0
-          )::NUMERIC AS total_profit,
-
-          ROUND(
-            (
-              SUM(manual_market_odd * manual_stake_units) FILTER (
-                WHERE manual_profit_units IS NOT NULL
-                  AND manual_market_odd > 1
-                  AND manual_stake_units > 0
-              )
-              /
-              NULLIF(
-                SUM(manual_stake_units) FILTER (
-                  WHERE manual_profit_units IS NOT NULL
-                    AND manual_market_odd > 1
-                    AND manual_stake_units > 0
-                ),
-                0
-              )
-            )::NUMERIC,
-            3
-          ) AS average_odd
-        FROM predictions
-      `),
-
-      pool.query(`
-        SELECT
-          COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue') AS competition,
-          COUNT(*)::INTEGER AS volume,
-          COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) IS NOT NULL
-          )::INTEGER AS evaluated,
-          COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) = TRUE
-          )::INTEGER AS wins,
-          COUNT(*) FILTER (
-            WHERE manual_profit_units IS NOT NULL
-          )::INTEGER AS settled_bets,
-          COALESCE(
-            SUM(manual_stake_units) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-            ),
-            0
-          )::NUMERIC AS stake,
-          COALESCE(
-            SUM(manual_profit_units) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-            ),
-            0
-          )::NUMERIC AS profit,
-          ROUND(
-            (
-              SUM(manual_market_odd * manual_stake_units) FILTER (
-                WHERE manual_profit_units IS NOT NULL
-                  AND manual_market_odd > 1
-                  AND manual_stake_units > 0
-              )
-              /
-              NULLIF(
-                SUM(manual_stake_units) FILTER (
-                  WHERE manual_profit_units IS NOT NULL
-                    AND manual_market_odd > 1
-                    AND manual_stake_units > 0
-                ),
-                0
-              )
-            )::NUMERIC,
-            2
-          ) AS average_odd,
-          MAX(fixture_date) AS last_match
-        FROM predictions
-        WHERE result_status = 'COMPLETED'
-        GROUP BY COALESCE(NULLIF(BTRIM(league_name), ''), 'Compétition inconnue')
-        HAVING COUNT(*) FILTER (
-          WHERE COALESCE(official_market_won, won) IS NOT NULL
-        ) > 0
-        ORDER BY volume DESC, competition ASC
-        LIMIT 100
-      `),
-
-      pool.query(`
-        SELECT
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_key), ''),
-            NULLIF(BTRIM(studio_market_key), ''),
-            'UNKNOWN'
-          ) AS market_key,
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_label), ''),
-            NULLIF(BTRIM(studio_market_label), ''),
-            'Marché inconnu'
-          ) AS market_label,
-          COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) IS NOT NULL
-          )::INTEGER AS evaluated,
-          COUNT(*) FILTER (
-            WHERE result_status = 'COMPLETED'
-              AND COALESCE(official_market_won, won) = TRUE
-          )::INTEGER AS wins,
-          COUNT(*) FILTER (
-            WHERE manual_profit_units IS NOT NULL
-          )::INTEGER AS settled_bets,
-          COALESCE(
-            SUM(manual_stake_units) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-            ),
-            0
-          )::NUMERIC AS stake,
-          COALESCE(
-            SUM(manual_profit_units) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-            ),
-            0
-          )::NUMERIC AS profit,
-          ROUND(
-            AVG(manual_market_odd) FILTER (
-              WHERE manual_profit_units IS NOT NULL
-                AND manual_market_odd > 1
-            )::NUMERIC,
-            2
-          ) AS average_odd
-        FROM predictions
-        WHERE result_status = 'COMPLETED'
-        GROUP BY
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_key), ''),
-            NULLIF(BTRIM(studio_market_key), ''),
-            'UNKNOWN'
-          ),
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_label), ''),
-            NULLIF(BTRIM(studio_market_label), ''),
-            'Marché inconnu'
-          )
-        HAVING COUNT(*) FILTER (
-          WHERE COALESCE(official_market_won, won) IS NOT NULL
-        ) > 0
-        ORDER BY evaluated DESC, market_label ASC
-      `),
-
-      pool.query(`
-        SELECT
-          CASE
-            WHEN manual_market_odd < 1.50 THEN '1.01 - 1.49'
-            WHEN manual_market_odd < 2.00 THEN '1.50 - 1.99'
-            WHEN manual_market_odd < 3.00 THEN '2.00 - 2.99'
-            ELSE '3.00 et +'
-          END AS odd_band,
-          CASE
-            WHEN manual_market_odd < 1.50 THEN 1
-            WHEN manual_market_odd < 2.00 THEN 2
-            WHEN manual_market_odd < 3.00 THEN 3
-            ELSE 4
-          END AS sort_order,
-          COUNT(*)::INTEGER AS bets,
-          COUNT(*) FILTER (
-            WHERE official_market_won = TRUE
-          )::INTEGER AS wins,
-          COALESCE(SUM(manual_stake_units), 0)::NUMERIC AS stake,
-          COALESCE(SUM(manual_profit_units), 0)::NUMERIC AS profit,
-          ROUND(AVG(manual_market_odd)::NUMERIC, 2) AS average_odd
-        FROM predictions
-        WHERE manual_market_odd IS NOT NULL
-          AND manual_profit_units IS NOT NULL
-        GROUP BY odd_band, sort_order
-        ORDER BY sort_order ASC
-      `),
-
-      pool.query(`
-        SELECT
-          fixture_id,
-          fixture_date,
-          league_name,
-          home_team_name,
-          away_team_name,
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_key), ''),
-            NULLIF(BTRIM(manual_market_key), ''),
-            NULLIF(BTRIM(studio_market_key), '')
-          ) AS market_key,
-          COALESCE(
-            NULLIF(BTRIM(official_tracked_market_label), ''),
-            NULLIF(BTRIM(studio_market_label), ''),
-            'Marché principal'
-          ) AS market_label,
-          COALESCE(
-            official_tracked_probability,
-            studio_probability
-          )::NUMERIC AS probability,
-          COALESCE(
-            official_tracked_decision_score,
-            studio_decision_score
-          )::NUMERIC AS decision_score,
-          manual_market_odd::NUMERIC AS bookmaker_odd,
-          (
-            (
-              COALESCE(
-                official_tracked_probability,
-                studio_probability
-              ) / 100.0
-            ) * manual_market_odd - 1
-          ) * 100.0 AS value_percent
-        FROM predictions
-        WHERE result_status = 'PENDING'
-          AND fixture_date > NOW()
-          AND manual_market_odd > 1
-          AND COALESCE(
-            official_tracked_probability,
-            studio_probability
-          ) > 0
-          AND COALESCE(
-            NULLIF(BTRIM(manual_market_key), ''),
-            NULLIF(BTRIM(official_tracked_market_key), ''),
-            NULLIF(BTRIM(studio_market_key), '')
-          ) IS NOT NULL
-        ORDER BY value_percent DESC, decision_score DESC NULLS LAST
-        LIMIT 30
-      `),
-
-      pool.query(`
-        SELECT
-          ticket_type,
-          COUNT(*)::INTEGER AS tickets,
-          COUNT(*) FILTER (WHERE result_status = 'WIN')::INTEGER AS wins,
-          COUNT(*) FILTER (WHERE result_status = 'LOSS')::INTEGER AS losses,
-          COALESCE(SUM(stake_units), 0)::NUMERIC AS stake,
-          COALESCE(SUM(profit_units), 0)::NUMERIC AS profit
-        FROM (
-          SELECT
-            'SAFE'::TEXT AS ticket_type,
-            safe_result_status AS result_status,
-            CASE WHEN safe_result_status IN ('WIN', 'LOSS') THEN 1 ELSE 0 END::NUMERIC AS stake_units,
-            COALESCE(safe_profit_units, 0)::NUMERIC AS profit_units
-          FROM daily_ticket_snapshots
-
-          UNION ALL
-
-          SELECT
-            'FUN'::TEXT,
-            fun_result_status,
-            CASE WHEN fun_result_status IN ('WIN', 'LOSS') THEN 1 ELSE 0 END::NUMERIC,
-            COALESCE(fun_profit_units, 0)::NUMERIC
-          FROM daily_ticket_snapshots
-
-          UNION ALL
-
-          SELECT
-            'BEST_VALUE'::TEXT,
-            value_result_status,
-            CASE WHEN value_result_status IN ('WIN', 'LOSS') THEN 1 ELSE 0 END::NUMERIC,
-            COALESCE(value_profit_units, 0)::NUMERIC
-          FROM daily_ticket_snapshots
-        ) ticket_rows
-        WHERE result_status IN ('WIN', 'LOSS')
-        GROUP BY ticket_type
-        ORDER BY ticket_type ASC
-      `),
-    ]);
-
-    const globalRow = globalResult.rows[0] || {};
-    const evaluatedMarkets = Number(globalRow.evaluated_markets || 0);
-    const wins = Number(globalRow.wins || 0);
-    const totalStake = Number(globalRow.total_stake || 0);
-    const totalProfit = Number(globalRow.total_profit || 0);
-
-    const mapPerformanceRow = (row) => {
-      const evaluated = Number(row.evaluated || 0);
-      const rowWins = Number(row.wins || 0);
-      const stake = Number(row.stake || 0);
-      const profit = Number(row.profit || 0);
-
-      return {
-        ...row,
-        volume: Number(row.volume || evaluated || 0),
-        evaluated,
-        wins: rowWins,
-        accuracy: evaluated > 0
-          ? Number(((rowWins / evaluated) * 100).toFixed(1))
-          : null,
-        settledBets: Number(row.settled_bets || row.bets || 0),
-        stake: Number(stake.toFixed(2)),
-        profit: Number(profit.toFixed(2)),
-        roi: stake > 0
-          ? Number(((profit / stake) * 100).toFixed(1))
-          : null,
-        averageOdd: row.average_odd == null
-          ? null
-          : Number(row.average_odd),
-      };
-    };
-
-    const competitions = competitionsResult.rows.map((row) => {
-      const mapped = mapPerformanceRow(row);
-      const settledBets = Number(mapped.settledBets || 0);
-
-      return {
-        ...mapped,
-        name: row.competition,
-        lastMatch: row.last_match || null,
-        sampleQuality:
-          settledBets >= 100
-            ? "excellent"
-            : settledBets >= 50
-              ? "bon"
-              : settledBets >= 20
-                ? "moyen"
-                : "faible",
-      };
-    });
-
-    const markets = marketsResult.rows.map((row) => ({
-      ...mapPerformanceRow(row),
-      key: row.market_key,
-      label: row.market_label,
-    }));
-
-    const oddsBands = oddsBandsResult.rows.map((row) => ({
-      ...mapPerformanceRow(row),
-      band: row.odd_band,
-    }));
-
-    const valueScanner = valueScannerResult.rows.map((row) => ({
-      fixtureId: Number(row.fixture_id),
-      kickoff: row.fixture_date,
-      competition: row.league_name || null,
-      homeTeam: row.home_team_name,
-      awayTeam: row.away_team_name,
-      marketKey: row.market_key,
-      marketLabel: row.market_label,
-      probability: Number(row.probability || 0),
-      decisionScore: Number(row.decision_score || 0),
-      bookmakerOdd: Number(row.bookmaker_odd || 0),
-      valuePercent: Number(Number(row.value_percent || 0).toFixed(1)),
-    }));
-
-    const ticketStats = ticketStatsResult.rows.map((row) => {
-      const tickets = Number(row.tickets || 0);
-      const rowWins = Number(row.wins || 0);
-      const stake = Number(row.stake || 0);
-      const profit = Number(row.profit || 0);
-
-      return {
-        type: row.ticket_type,
-        tickets,
-        wins: rowWins,
-        losses: Number(row.losses || 0),
-        accuracy: tickets > 0
-          ? Number(((rowWins / tickets) * 100).toFixed(1))
-          : null,
-        stake: Number(stake.toFixed(2)),
-        profit: Number(profit.toFixed(2)),
-        roi: stake > 0
-          ? Number(((profit / stake) * 100).toFixed(1))
-          : null,
-      };
-    });
-
-    return res.json({
-      ok: true,
-      generatedAt: new Date().toISOString(),
-      global: {
-        completedMarkets: Number(globalRow.completed_markets || 0),
-        evaluatedMarkets,
-        wins,
-        losses: Number(globalRow.losses || 0),
-        accuracy: evaluatedMarkets > 0
-          ? Number(((wins / evaluatedMarkets) * 100).toFixed(1))
-          : null,
-        settledRealBets: Number(globalRow.settled_real_bets || 0),
-        totalStake: Number(totalStake.toFixed(2)),
-        totalProfit: Number(totalProfit.toFixed(2)),
-        roi: totalStake > 0
-          ? Number(((totalProfit / totalStake) * 100).toFixed(1))
-          : null,
-        averageOdd: globalRow.average_odd == null
-          ? null
-          : Number(globalRow.average_odd),
-      },
-      competitions,
-      markets,
-      oddsBands,
-      valueScanner,
-      ticketStats,
-    });
-  } catch (error) {
-    console.error("ERREUR /public/statistics/dashboard :", error);
-
-    return res.status(500).json({
-      ok: false,
-      error:
-        error?.message ||
-        "Impossible de charger les statistiques publiques.",
-    });
+  if (
+    [
+      "HOME",
+      "HOMEWIN",
+      "1",
+      "DOMICILE",
+      "VICTOIREDOMICILE",
+    ].includes(key)
+  ) {
+    return "HOME";
   }
-});
 
+  if (
+    [
+      "DRAW",
+      "X",
+      "N",
+      "NUL",
+      "MATCHNUL",
+    ].includes(key)
+  ) {
+    return "DRAW";
+  }
+
+  if (
+    [
+      "AWAY",
+      "AWAYWIN",
+      "2",
+      "EXTERIEUR",
+      "VICTOIREEXTERIEUR",
+    ].includes(key)
+  ) {
+    return "AWAY";
+  }
+
+  if (
+    [
+      "OVER25",
+      "OVER250",
+      "OVER2_5",
+      "PLUS25",
+      "PLUSDE25BUTS",
+    ].includes(key)
+  ) {
+    return "OVER25";
+  }
+
+  if (
+    [
+      "UNDER25",
+      "UNDER250",
+      "UNDER2_5",
+      "MOINS25",
+      "MOINSDE25BUTS",
+    ].includes(key)
+  ) {
+    return "UNDER25";
+  }
+
+  if (
+    [
+      "BTTS",
+      "BTTSYES",
+      "GG",
+      "LESDEUXEQUIPESMARQUENT",
+    ].includes(key)
+  ) {
+    return "BTTS_YES";
+  }
+
+  if (
+    [
+      "BTTSNO",
+      "NOBTTS",
+      "NG",
+      "LESDEUXEQUIPESNEMARQUENTPAS",
+    ].includes(key)
+  ) {
+    return "BTTS_NO";
+  }
+
+  return key || "UNKNOWN";
+}
+
+function statisticsMarketLabel(
+  marketKey,
+  fallback = null
+) {
+  const key =
+    statisticsNormalizeMarketKey(
+      marketKey
+    );
+
+  const labels = {
+    HOME:
+      "Victoire domicile",
+
+    DRAW:
+      "Match nul",
+
+    AWAY:
+      "Victoire extérieur",
+
+    OVER25:
+      "Plus de 2,5 buts",
+
+    UNDER25:
+      "Moins de 2,5 buts",
+
+    BTTS_YES:
+      "Les deux équipes marquent",
+
+    BTTS_NO:
+      "Les deux équipes ne marquent pas",
+  };
+
+  return (
+    labels[key] ||
+    fallback ||
+    key ||
+    "Marché inconnu"
+  );
+}
+
+function statisticsNumber(
+  value,
+  fallback = 0
+) {
+  const number =
+    Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
+}
+
+function statisticsAccuracy(
+  wins,
+  evaluated
+) {
+  const safeWins =
+    statisticsNumber(
+      wins
+    );
+
+  const safeEvaluated =
+    statisticsNumber(
+      evaluated
+    );
+
+  if (
+    safeEvaluated <= 0
+  ) {
+    return null;
+  }
+
+  return Number(
+    (
+      (
+        safeWins /
+        safeEvaluated
+      ) *
+      100
+    ).toFixed(1)
+  );
+}
+
+function statisticsSampleQuality(
+  evaluated
+) {
+  const volume =
+    statisticsNumber(
+      evaluated
+    );
+
+  if (volume >= 100) {
+    return "excellent";
+  }
+
+  if (volume >= 50) {
+    return "bon";
+  }
+
+  if (volume >= 20) {
+    return "moyen";
+  }
+
+  return "faible";
+}
+
+function statisticsPeriodStart(
+  period
+) {
+  const normalized =
+    String(
+      period || "all"
+    )
+      .trim()
+      .toLowerCase();
+
+  const now =
+    new Date();
+
+  if (
+    normalized === "7d" ||
+    normalized === "7days"
+  ) {
+    return new Date(
+      now.getTime() -
+        7 *
+          24 *
+          60 *
+          60 *
+          1000
+    );
+  }
+
+  if (
+    normalized === "30d" ||
+    normalized === "30days"
+  ) {
+    return new Date(
+      now.getTime() -
+        30 *
+          24 *
+          60 *
+          60 *
+          1000
+    );
+  }
+
+  if (
+    normalized === "season"
+  ) {
+    /*
+     * Saison football européenne :
+     * 1er juillet -> 30 juin.
+     */
+    const year =
+      now.getMonth() >= 6
+        ? now.getFullYear()
+        : now.getFullYear() -
+          1;
+
+    return new Date(
+      Date.UTC(
+        year,
+        6,
+        1,
+        0,
+        0,
+        0
+      )
+    );
+  }
+
+  return null;
+}
+
+function statisticsMapAggregate(
+  row = {},
+  {
+    name = null,
+    key = null,
+    label = null,
+  } = {}
+) {
+  const evaluated =
+    statisticsNumber(
+      row.evaluated
+    );
+
+  const wins =
+    statisticsNumber(
+      row.wins
+    );
+
+  const losses =
+    statisticsNumber(
+      row.losses,
+      Math.max(
+        0,
+        evaluated - wins
+      )
+    );
+
+  return {
+    ...(name !== null
+      ? {
+          name,
+        }
+      : {}),
+
+    ...(key !== null
+      ? {
+          key,
+        }
+      : {}),
+
+    ...(label !== null
+      ? {
+          label,
+        }
+      : {}),
+
+    evaluated,
+    volume: evaluated,
+
+    wins,
+    losses,
+
+    accuracy:
+      statisticsAccuracy(
+        wins,
+        evaluated
+      ),
+
+    sampleQuality:
+      statisticsSampleQuality(
+        evaluated
+      ),
+
+    lastMatch:
+      row.last_match ||
+      null,
+  };
+}
+
+app.get(
+  "/public/statistics/dashboard",
+  async (req, res) => {
+    try {
+      await ensureBilanV3Columns();
+
+      /*
+       * ======================================================
+       * FILTRES
+       * ======================================================
+       */
+
+      const requestedPeriod =
+        String(
+          req.query?.period ||
+            "all"
+        )
+          .trim()
+          .toLowerCase();
+
+      const validPeriods =
+        new Set([
+          "all",
+          "7d",
+          "30d",
+          "season",
+        ]);
+
+      const period =
+        validPeriods.has(
+          requestedPeriod
+        )
+          ? requestedPeriod
+          : "all";
+
+      const league =
+        String(
+          req.query?.league ||
+            ""
+        ).trim();
+
+      const team =
+        String(
+          req.query?.team ||
+            ""
+        ).trim();
+
+      const requestedMarket =
+        String(
+          req.query?.market ||
+            ""
+        ).trim();
+
+      const market =
+        requestedMarket
+          ? statisticsNormalizeMarketKey(
+              requestedMarket
+            )
+          : "";
+
+      const requestedConfidence =
+        Number(
+          req.query
+            ?.minConfidence
+        );
+
+      const minConfidence =
+        Number.isFinite(
+          requestedConfidence
+        )
+          ? Math.max(
+              0,
+              Math.min(
+                100,
+                requestedConfidence
+              )
+            )
+          : null;
+
+      const periodStart =
+        statisticsPeriodStart(
+          period
+        );
+
+      /*
+       * ======================================================
+       * CONDITIONS SQL
+       * ======================================================
+       */
+
+      const values = [];
+
+      const conditions = [
+        `
+          result_status =
+            'COMPLETED'
+        `,
+        `
+          COALESCE(
+            official_market_won,
+            won
+          ) IS NOT NULL
+        `,
+        `
+          COALESCE(
+            NULLIF(
+              BTRIM(
+                official_tracked_market_key
+              ),
+              ''
+            ),
+            NULLIF(
+              BTRIM(
+                studio_market_key
+              ),
+              ''
+            )
+          ) IS NOT NULL
+        `,
+      ];
+
+      if (periodStart) {
+        values.push(
+          periodStart.toISOString()
+        );
+
+        conditions.push(
+          `fixture_date >= $${values.length}`
+        );
+      }
+
+      if (league) {
+        values.push(league);
+
+        conditions.push(
+          `
+            LOWER(
+              COALESCE(
+                league_name,
+                ''
+              )
+            ) =
+            LOWER(
+              $${values.length}
+            )
+          `
+        );
+      }
+
+      if (team) {
+        values.push(team);
+
+        const position =
+          values.length;
+
+        conditions.push(
+          `
+            (
+              LOWER(
+                COALESCE(
+                  home_team_name,
+                  ''
+                )
+              ) =
+              LOWER(
+                $${position}
+              )
+
+              OR
+
+              LOWER(
+                COALESCE(
+                  away_team_name,
+                  ''
+                )
+              ) =
+              LOWER(
+                $${position}
+              )
+            )
+          `
+        );
+      }
+
+      if (market) {
+        /*
+         * On accepte les variantes historiques
+         * puis on normalise également côté JS.
+         */
+        values.push(market);
+
+        const position =
+          values.length;
+
+        conditions.push(
+          `
+            UPPER(
+              REGEXP_REPLACE(
+                COALESCE(
+                  NULLIF(
+                    BTRIM(
+                      official_tracked_market_key
+                    ),
+                    ''
+                  ),
+                  NULLIF(
+                    BTRIM(
+                      studio_market_key
+                    ),
+                    ''
+                  ),
+                  ''
+                ),
+                '[^A-Za-z0-9]',
+                '',
+                'g'
+              )
+            )
+            =
+            UPPER(
+              REGEXP_REPLACE(
+                $${position},
+                '[^A-Za-z0-9]',
+                '',
+                'g'
+              )
+            )
+          `
+        );
+      }
+
+      if (
+        minConfidence !==
+        null
+      ) {
+        values.push(
+          minConfidence
+        );
+
+        conditions.push(
+          `
+            COALESCE(
+              confidence,
+              studio_decision_score,
+              official_tracked_decision_score
+            ) >=
+            $${values.length}
+          `
+        );
+      }
+
+      const whereClause =
+        conditions.join(
+          "\n AND "
+        );
+
+      /*
+       * ======================================================
+       * SOURCE OFFICIELLE
+       * ======================================================
+       *
+       * Une ligne = décision finale du match.
+       *
+       * official_tracked_market_* prioritaire.
+       * studio_market_* utilisé en secours.
+       */
+
+      const baseCTE = `
+        WITH filtered_predictions AS (
+          SELECT
+            fixture_id,
+            fixture_date,
+
+            league_id,
+
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  league_name
+                ),
+                ''
+              ),
+              'Compétition inconnue'
+            ) AS league_name,
+
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  home_team_name
+                ),
+                ''
+              ),
+              'Équipe domicile'
+            ) AS home_team_name,
+
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  away_team_name
+                ),
+                ''
+              ),
+              'Équipe extérieure'
+            ) AS away_team_name,
+
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  official_tracked_market_key
+                ),
+                ''
+              ),
+              NULLIF(
+                BTRIM(
+                  studio_market_key
+                ),
+                ''
+              ),
+              'UNKNOWN'
+            ) AS market_key,
+
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  official_tracked_market_label
+                ),
+                ''
+              ),
+              NULLIF(
+                BTRIM(
+                  studio_market_label
+                ),
+                ''
+              ),
+              'Marché inconnu'
+            ) AS market_label,
+
+            COALESCE(
+              official_market_won,
+              won
+            ) AS market_won,
+
+            COALESCE(
+              confidence,
+              studio_decision_score,
+              official_tracked_decision_score
+            )::NUMERIC AS confidence
+
+          FROM predictions
+
+          WHERE
+            ${whereClause}
+        )
+      `;
+
+      const [
+        globalResult,
+        marketsResult,
+        competitionsResult,
+        competitionMarketsResult,
+        teamsResult,
+        teamMarketsResult,
+      ] =
+        await Promise.all([
+          /*
+           * GLOBAL
+           */
+          pool.query(
+            `
+              ${baseCTE}
+
+              SELECT
+                COUNT(*)::INTEGER
+                  AS evaluated,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    TRUE
+                )::INTEGER
+                  AS wins,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    FALSE
+                )::INTEGER
+                  AS losses,
+
+                COUNT(
+                  DISTINCT fixture_id
+                )::INTEGER
+                  AS matches
+
+              FROM filtered_predictions
+            `,
+            values
+          ),
+
+          /*
+           * PAR MARCHÉ
+           */
+          pool.query(
+            `
+              ${baseCTE}
+
+              SELECT
+                market_key,
+
+                MAX(
+                  market_label
+                ) AS market_label,
+
+                COUNT(*)::INTEGER
+                  AS evaluated,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    TRUE
+                )::INTEGER
+                  AS wins,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    FALSE
+                )::INTEGER
+                  AS losses,
+
+                MAX(
+                  fixture_date
+                ) AS last_match
+
+              FROM filtered_predictions
+
+              GROUP BY
+                market_key
+
+              ORDER BY
+                evaluated DESC,
+                market_key ASC
+            `,
+            values
+          ),
+
+          /*
+           * PAR CHAMPIONNAT
+           */
+          pool.query(
+            `
+              ${baseCTE}
+
+              SELECT
+                league_name,
+
+                COUNT(*)::INTEGER
+                  AS evaluated,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    TRUE
+                )::INTEGER
+                  AS wins,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    FALSE
+                )::INTEGER
+                  AS losses,
+
+                MAX(
+                  fixture_date
+                ) AS last_match
+
+              FROM filtered_predictions
+
+              GROUP BY
+                league_name
+
+              ORDER BY
+                evaluated DESC,
+                league_name ASC
+            `,
+            values
+          ),
+
+          /*
+           * MARCHÉS PAR CHAMPIONNAT
+           */
+          pool.query(
+            `
+              ${baseCTE}
+
+              SELECT
+                league_name,
+                market_key,
+
+                MAX(
+                  market_label
+                ) AS market_label,
+
+                COUNT(*)::INTEGER
+                  AS evaluated,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    TRUE
+                )::INTEGER
+                  AS wins,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    FALSE
+                )::INTEGER
+                  AS losses,
+
+                MAX(
+                  fixture_date
+                ) AS last_match
+
+              FROM filtered_predictions
+
+              GROUP BY
+                league_name,
+                market_key
+
+              ORDER BY
+                league_name ASC,
+                evaluated DESC
+            `,
+            values
+          ),
+
+          /*
+           * PAR ÉQUIPE
+           *
+           * Le même match entre dans les stats
+           * des deux équipes.
+           */
+          pool.query(
+            `
+              ${baseCTE},
+
+              team_rows AS (
+                SELECT
+                  fixture_id,
+                  fixture_date,
+                  market_key,
+                  market_label,
+                  market_won,
+                  confidence,
+                  league_name,
+
+                  UNNEST(
+                    ARRAY[
+                      home_team_name,
+                      away_team_name
+                    ]
+                  ) AS team_name
+
+                FROM
+                  filtered_predictions
+              )
+
+              SELECT
+                team_name,
+
+                COUNT(*)::INTEGER
+                  AS evaluated,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    TRUE
+                )::INTEGER
+                  AS wins,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    FALSE
+                )::INTEGER
+                  AS losses,
+
+                MAX(
+                  fixture_date
+                ) AS last_match
+
+              FROM team_rows
+
+              GROUP BY
+                team_name
+
+              ORDER BY
+                evaluated DESC,
+                team_name ASC
+            `,
+            values
+          ),
+
+          /*
+           * MARCHÉS PAR ÉQUIPE
+           */
+          pool.query(
+            `
+              ${baseCTE},
+
+              team_rows AS (
+                SELECT
+                  fixture_id,
+                  fixture_date,
+                  market_key,
+                  market_label,
+                  market_won,
+                  confidence,
+                  league_name,
+
+                  UNNEST(
+                    ARRAY[
+                      home_team_name,
+                      away_team_name
+                    ]
+                  ) AS team_name
+
+                FROM
+                  filtered_predictions
+              )
+
+              SELECT
+                team_name,
+                market_key,
+
+                MAX(
+                  market_label
+                ) AS market_label,
+
+                COUNT(*)::INTEGER
+                  AS evaluated,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    TRUE
+                )::INTEGER
+                  AS wins,
+
+                COUNT(*) FILTER (
+                  WHERE market_won =
+                    FALSE
+                )::INTEGER
+                  AS losses,
+
+                MAX(
+                  fixture_date
+                ) AS last_match
+
+              FROM team_rows
+
+              GROUP BY
+                team_name,
+                market_key
+
+              ORDER BY
+                team_name ASC,
+                evaluated DESC
+            `,
+            values
+          ),
+        ]);
+
+      /*
+       * ======================================================
+       * OPTIONS DE FILTRES
+       * ======================================================
+       *
+       * Elles sont calculées sur toute la base terminée,
+       * indépendamment des filtres actifs.
+       */
+
+      const filterOptionsResult =
+        await pool.query(`
+          SELECT
+            ARRAY_AGG(
+              DISTINCT league_name
+              ORDER BY league_name
+            ) FILTER (
+              WHERE
+                league_name IS NOT NULL
+                AND BTRIM(
+                  league_name
+                ) <> ''
+            ) AS leagues,
+
+            ARRAY_AGG(
+              DISTINCT home_team_name
+              ORDER BY home_team_name
+            ) FILTER (
+              WHERE
+                home_team_name IS NOT NULL
+                AND BTRIM(
+                  home_team_name
+                ) <> ''
+            ) AS home_teams,
+
+            ARRAY_AGG(
+              DISTINCT away_team_name
+              ORDER BY away_team_name
+            ) FILTER (
+              WHERE
+                away_team_name IS NOT NULL
+                AND BTRIM(
+                  away_team_name
+                ) <> ''
+            ) AS away_teams
+
+          FROM predictions
+
+          WHERE
+            result_status =
+              'COMPLETED'
+
+            AND COALESCE(
+              official_market_won,
+              won
+            ) IS NOT NULL
+        `);
+
+      const marketOptionsResult =
+        await pool.query(`
+          SELECT DISTINCT
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  official_tracked_market_key
+                ),
+                ''
+              ),
+              NULLIF(
+                BTRIM(
+                  studio_market_key
+                ),
+                ''
+              )
+            ) AS market_key,
+
+            COALESCE(
+              NULLIF(
+                BTRIM(
+                  official_tracked_market_label
+                ),
+                ''
+              ),
+              NULLIF(
+                BTRIM(
+                  studio_market_label
+                ),
+                ''
+              ),
+              'Marché inconnu'
+            ) AS market_label
+
+          FROM predictions
+
+          WHERE
+            result_status =
+              'COMPLETED'
+
+            AND COALESCE(
+              official_market_won,
+              won
+            ) IS NOT NULL
+
+            AND COALESCE(
+              NULLIF(
+                BTRIM(
+                  official_tracked_market_key
+                ),
+                ''
+              ),
+              NULLIF(
+                BTRIM(
+                  studio_market_key
+                ),
+                ''
+              )
+            ) IS NOT NULL
+
+          ORDER BY
+            market_label ASC
+        `);
+
+      /*
+       * ======================================================
+       * FORMATAGE
+       * ======================================================
+       */
+
+      const globalRow =
+        globalResult.rows[0] ||
+        {};
+
+      const globalEvaluated =
+        statisticsNumber(
+          globalRow.evaluated
+        );
+
+      const globalWins =
+        statisticsNumber(
+          globalRow.wins
+        );
+
+      const globalLosses =
+        statisticsNumber(
+          globalRow.losses
+        );
+
+      const markets =
+        marketsResult.rows.map(
+          (row) => {
+            const key =
+              statisticsNormalizeMarketKey(
+                row.market_key
+              );
+
+            return statisticsMapAggregate(
+              row,
+              {
+                key,
+
+                label:
+                  statisticsMarketLabel(
+                    key,
+                    row.market_label
+                  ),
+              }
+            );
+          }
+        );
+
+      /*
+       * Regroupement au cas où deux anciennes
+       * variantes techniques correspondent
+       * au même marché public.
+       */
+      const mergedMarketMap =
+        new Map();
+
+      for (
+        const marketRow of
+        markets
+      ) {
+        const existing =
+          mergedMarketMap.get(
+            marketRow.key
+          );
+
+        if (!existing) {
+          mergedMarketMap.set(
+            marketRow.key,
+            {
+              ...marketRow,
+            }
+          );
+
+          continue;
+        }
+
+        existing.evaluated +=
+          marketRow.evaluated;
+
+        existing.volume =
+          existing.evaluated;
+
+        existing.wins +=
+          marketRow.wins;
+
+        existing.losses +=
+          marketRow.losses;
+
+        existing.accuracy =
+          statisticsAccuracy(
+            existing.wins,
+            existing.evaluated
+          );
+
+        existing.sampleQuality =
+          statisticsSampleQuality(
+            existing.evaluated
+          );
+
+        if (
+          marketRow.lastMatch &&
+          (
+            !existing.lastMatch ||
+            new Date(
+              marketRow.lastMatch
+            ) >
+              new Date(
+                existing.lastMatch
+              )
+          )
+        ) {
+          existing.lastMatch =
+            marketRow.lastMatch;
+        }
+      }
+
+      const mergedMarkets =
+        [
+          ...mergedMarketMap.values(),
+        ].sort(
+          (a, b) =>
+            b.evaluated -
+              a.evaluated ||
+            (
+              b.accuracy ?? -1
+            ) -
+              (
+                a.accuracy ??
+                -1
+              )
+        );
+
+      /*
+       * Marchés par compétition
+       */
+      const competitionMarketMap =
+        new Map();
+
+      for (
+        const row of
+        competitionMarketsResult.rows
+      ) {
+        const competitionName =
+          row.league_name;
+
+        if (
+          !competitionMarketMap.has(
+            competitionName
+          )
+        ) {
+          competitionMarketMap.set(
+            competitionName,
+            []
+          );
+        }
+
+        const key =
+          statisticsNormalizeMarketKey(
+            row.market_key
+          );
+
+        competitionMarketMap
+          .get(
+            competitionName
+          )
+          .push(
+            statisticsMapAggregate(
+              row,
+              {
+                key,
+
+                label:
+                  statisticsMarketLabel(
+                    key,
+                    row.market_label
+                  ),
+              }
+            )
+          );
+      }
+
+      const competitions =
+        competitionsResult.rows.map(
+          (row) => {
+            const name =
+              row.league_name;
+
+            const mapped =
+              statisticsMapAggregate(
+                row,
+                {
+                  name,
+                }
+              );
+
+            return {
+              ...mapped,
+
+              markets:
+                competitionMarketMap.get(
+                  name
+                ) || [],
+            };
+          }
+        );
+
+      /*
+       * Marchés par équipe
+       */
+      const teamMarketMap =
+        new Map();
+
+      for (
+        const row of
+        teamMarketsResult.rows
+      ) {
+        const teamName =
+          row.team_name;
+
+        if (
+          !teamMarketMap.has(
+            teamName
+          )
+        ) {
+          teamMarketMap.set(
+            teamName,
+            []
+          );
+        }
+
+        const key =
+          statisticsNormalizeMarketKey(
+            row.market_key
+          );
+
+        teamMarketMap
+          .get(teamName)
+          .push(
+            statisticsMapAggregate(
+              row,
+              {
+                key,
+
+                label:
+                  statisticsMarketLabel(
+                    key,
+                    row.market_label
+                  ),
+              }
+            )
+          );
+      }
+
+      const teams =
+        teamsResult.rows.map(
+          (row) => {
+            const name =
+              row.team_name;
+
+            const mapped =
+              statisticsMapAggregate(
+                row,
+                {
+                  name,
+                }
+              );
+
+            return {
+              ...mapped,
+
+              markets:
+                teamMarketMap.get(
+                  name
+                ) || [],
+            };
+          }
+        );
+
+      /*
+       * Options filtres
+       */
+      const optionRow =
+        filterOptionsResult
+          .rows[0] || {};
+
+      const teamsSet =
+        new Set([
+          ...(
+            Array.isArray(
+              optionRow.home_teams
+            )
+              ? optionRow
+                  .home_teams
+              : []
+          ),
+
+          ...(
+            Array.isArray(
+              optionRow.away_teams
+            )
+              ? optionRow
+                  .away_teams
+              : []
+          ),
+        ]);
+
+      const marketOptionsMap =
+        new Map();
+
+      for (
+        const row of
+        marketOptionsResult.rows
+      ) {
+        const key =
+          statisticsNormalizeMarketKey(
+            row.market_key
+          );
+
+        if (
+          !key ||
+          key === "UNKNOWN"
+        ) {
+          continue;
+        }
+
+        marketOptionsMap.set(
+          key,
+          {
+            key,
+
+            label:
+              statisticsMarketLabel(
+                key,
+                row.market_label
+              ),
+          }
+        );
+      }
+
+      /*
+       * ======================================================
+       * RÉPONSE PUBLIQUE
+       * ======================================================
+       */
+
+      return res.json({
+        ok: true,
+
+        version:
+          "statistics-v2-predictive",
+
+        generatedAt:
+          new Date().toISOString(),
+
+        filters: {
+          period,
+
+          league:
+            league || null,
+
+          market:
+            market || null,
+
+          team:
+            team || null,
+
+          minConfidence,
+        },
+
+        filterOptions: {
+          periods: [
+            {
+              key: "all",
+              label: "Tout",
+            },
+            {
+              key: "7d",
+              label:
+                "7 derniers jours",
+            },
+            {
+              key: "30d",
+              label:
+                "30 derniers jours",
+            },
+            {
+              key: "season",
+              label:
+                "Saison actuelle",
+            },
+          ],
+
+          leagues:
+            (
+              Array.isArray(
+                optionRow.leagues
+              )
+                ? optionRow
+                    .leagues
+                : []
+            ).sort(
+              (
+                a,
+                b
+              ) =>
+                String(a)
+                  .localeCompare(
+                    String(b),
+                    "fr"
+                  )
+            ),
+
+          teams:
+            [
+              ...teamsSet,
+            ].sort(
+              (
+                a,
+                b
+              ) =>
+                String(a)
+                  .localeCompare(
+                    String(b),
+                    "fr"
+                  )
+            ),
+
+          markets:
+            [
+              ...marketOptionsMap.values(),
+            ].sort(
+              (
+                a,
+                b
+              ) =>
+                a.label.localeCompare(
+                  b.label,
+                  "fr"
+                )
+            ),
+
+          confidenceLevels: [
+            {
+              value: null,
+              label:
+                "Toutes",
+            },
+            {
+              value: 60,
+              label:
+                "60+",
+            },
+            {
+              value: 70,
+              label:
+                "70+",
+            },
+            {
+              value: 80,
+              label:
+                "80+",
+            },
+          ],
+        },
+
+        global: {
+          matches:
+            statisticsNumber(
+              globalRow.matches
+            ),
+
+          evaluatedMarkets:
+            globalEvaluated,
+
+          completedMarkets:
+            globalEvaluated,
+
+          wins:
+            globalWins,
+
+          losses:
+            globalLosses,
+
+          accuracy:
+            statisticsAccuracy(
+              globalWins,
+              globalEvaluated
+            ),
+        },
+
+        markets:
+          mergedMarkets,
+
+        competitions,
+
+        teams,
+
+        consistency: {
+          evaluated:
+            globalEvaluated,
+
+          marketVolume:
+            mergedMarkets.reduce(
+              (
+                total,
+                row
+              ) =>
+                total +
+                statisticsNumber(
+                  row.evaluated
+                ),
+              0
+            ),
+
+          competitionVolume:
+            competitions.reduce(
+              (
+                total,
+                row
+              ) =>
+                total +
+                statisticsNumber(
+                  row.evaluated
+                ),
+              0
+            ),
+
+          /*
+           * Team volume vaut normalement
+           * 2 x le nombre de matchs,
+           * puisque chaque match appartient
+           * aux deux équipes.
+           */
+          teamVolume:
+            teams.reduce(
+              (
+                total,
+                row
+              ) =>
+                total +
+                statisticsNumber(
+                  row.evaluated
+                ),
+              0
+            ),
+        },
+      });
+    } catch (error) {
+      console.error(
+        "ERREUR /public/statistics/dashboard V2 :",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "Impossible de charger les statistiques prédictives.",
+        });
+    }
+  }
+);
 const DEFAULT_BET_QUALIFICATION_CONFIG = Object.freeze({
   safe: {
     minimumBetScore: 85,
