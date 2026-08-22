@@ -8230,6 +8230,27 @@ function resolveSettlementMarket(
       "BTTS_NO",
 
     /*
+     * Buts par équipe
+     */
+    HOME_OVER_0_5: "HOME_OVER_0_5",
+    HOME_OVER05: "HOME_OVER_0_5",
+    HOME_OVER_1_5: "HOME_OVER_1_5",
+    HOME_OVER15: "HOME_OVER_1_5",
+    HOME_UNDER_0_5: "HOME_UNDER_0_5",
+    HOME_UNDER05: "HOME_UNDER_0_5",
+    HOME_UNDER_1_5: "HOME_UNDER_1_5",
+    HOME_UNDER15: "HOME_UNDER_1_5",
+
+    AWAY_OVER_0_5: "AWAY_OVER_0_5",
+    AWAY_OVER05: "AWAY_OVER_0_5",
+    AWAY_OVER_1_5: "AWAY_OVER_1_5",
+    AWAY_OVER15: "AWAY_OVER_1_5",
+    AWAY_UNDER_0_5: "AWAY_UNDER_0_5",
+    AWAY_UNDER05: "AWAY_UNDER_0_5",
+    AWAY_UNDER_1_5: "AWAY_UNDER_1_5",
+    AWAY_UNDER15: "AWAY_UNDER_1_5",
+
+    /*
      * Double chance
      */
     "1X": "1X",
@@ -8415,6 +8436,65 @@ function settlePrediction(
         actualOutcome === "AWAY"
           ? `Victoire à l'extérieur confirmée (${homeGoals}-${awayGoals}).`
           : `L'équipe à l'extérieur n'a pas gagné (${homeGoals}-${awayGoals}).`;
+      break;
+
+    /*
+     * Buts par équipe
+     */
+    case "HOME_OVER_0_5":
+      outcome = homeGoals >= 1 ? "WIN" : "LOSS";
+      explanation =
+        `${homeGoals} but(s) pour l'équipe à domicile : ` +
+        `${outcome === "WIN" ? "+0,5 validé" : "+0,5 non validé"}.`;
+      break;
+
+    case "HOME_OVER_1_5":
+      outcome = homeGoals >= 2 ? "WIN" : "LOSS";
+      explanation =
+        `${homeGoals} but(s) pour l'équipe à domicile : ` +
+        `${outcome === "WIN" ? "+1,5 validé" : "+1,5 non validé"}.`;
+      break;
+
+    case "HOME_UNDER_0_5":
+      outcome = homeGoals === 0 ? "WIN" : "LOSS";
+      explanation =
+        `${homeGoals} but(s) pour l'équipe à domicile : ` +
+        `${outcome === "WIN" ? "-0,5 validé" : "-0,5 non validé"}.`;
+      break;
+
+    case "HOME_UNDER_1_5":
+      outcome = homeGoals <= 1 ? "WIN" : "LOSS";
+      explanation =
+        `${homeGoals} but(s) pour l'équipe à domicile : ` +
+        `${outcome === "WIN" ? "-1,5 validé" : "-1,5 non validé"}.`;
+      break;
+
+    case "AWAY_OVER_0_5":
+      outcome = awayGoals >= 1 ? "WIN" : "LOSS";
+      explanation =
+        `${awayGoals} but(s) pour l'équipe à l'extérieur : ` +
+        `${outcome === "WIN" ? "+0,5 validé" : "+0,5 non validé"}.`;
+      break;
+
+    case "AWAY_OVER_1_5":
+      outcome = awayGoals >= 2 ? "WIN" : "LOSS";
+      explanation =
+        `${awayGoals} but(s) pour l'équipe à l'extérieur : ` +
+        `${outcome === "WIN" ? "+1,5 validé" : "+1,5 non validé"}.`;
+      break;
+
+    case "AWAY_UNDER_0_5":
+      outcome = awayGoals === 0 ? "WIN" : "LOSS";
+      explanation =
+        `${awayGoals} but(s) pour l'équipe à l'extérieur : ` +
+        `${outcome === "WIN" ? "-0,5 validé" : "-0,5 non validé"}.`;
+      break;
+
+    case "AWAY_UNDER_1_5":
+      outcome = awayGoals <= 1 ? "WIN" : "LOSS";
+      explanation =
+        `${awayGoals} but(s) pour l'équipe à l'extérieur : ` +
+        `${outcome === "WIN" ? "-1,5 validé" : "-1,5 non validé"}.`;
       break;
 
     /*
@@ -14084,6 +14164,32 @@ function normalizeStudioMarketKey(
 
     NO_BTTS: "NO_BTTS",
     BTTS_NO: "NO_BTTS",
+
+    HOME_OVER_0_5: "HOME_OVER_0_5",
+    HOME_OVER05: "HOME_OVER_0_5",
+    HOME_O05: "HOME_OVER_0_5",
+    HOME_OVER_1_5: "HOME_OVER_1_5",
+    HOME_OVER15: "HOME_OVER_1_5",
+    HOME_O15: "HOME_OVER_1_5",
+    HOME_UNDER_0_5: "HOME_UNDER_0_5",
+    HOME_UNDER05: "HOME_UNDER_0_5",
+    HOME_U05: "HOME_UNDER_0_5",
+    HOME_UNDER_1_5: "HOME_UNDER_1_5",
+    HOME_UNDER15: "HOME_UNDER_1_5",
+    HOME_U15: "HOME_UNDER_1_5",
+
+    AWAY_OVER_0_5: "AWAY_OVER_0_5",
+    AWAY_OVER05: "AWAY_OVER_0_5",
+    AWAY_O05: "AWAY_OVER_0_5",
+    AWAY_OVER_1_5: "AWAY_OVER_1_5",
+    AWAY_OVER15: "AWAY_OVER_1_5",
+    AWAY_O15: "AWAY_OVER_1_5",
+    AWAY_UNDER_0_5: "AWAY_UNDER_0_5",
+    AWAY_UNDER05: "AWAY_UNDER_0_5",
+    AWAY_U05: "AWAY_UNDER_0_5",
+    AWAY_UNDER_1_5: "AWAY_UNDER_1_5",
+    AWAY_UNDER15: "AWAY_UNDER_1_5",
+    AWAY_U15: "AWAY_UNDER_1_5",
   };
 
   return aliases[normalized] ||
@@ -16072,13 +16178,13 @@ const manualOddAvailable =
   manualMarketOdd > 1;
 
 const marketOdd =
-  isSelectedOutcome
-    ? manualOddAvailable
-      ? manualMarketOdd
-      : prediction.market_odd ??
+  manualOddAvailable
+    ? manualMarketOdd
+    : isSelectedOutcome
+      ? prediction.market_odd ??
         prediction.marketOdd ??
         null
-    : null;
+      : null;
 
 const bookmakerSource =
   manualOddAvailable
@@ -16613,6 +16719,59 @@ app.post(
   }
 );
 
+function poissonProbabilityExactGoals(lambda, goals) {
+  const safeLambda = Number(lambda);
+  const safeGoals = Number(goals);
+
+  if (
+    !Number.isFinite(safeLambda) ||
+    safeLambda < 0 ||
+    !Number.isInteger(safeGoals) ||
+    safeGoals < 0
+  ) {
+    return null;
+  }
+
+  let factorial = 1;
+  for (let index = 2; index <= safeGoals; index += 1) {
+    factorial *= index;
+  }
+
+  return (
+    Math.exp(-safeLambda) *
+    Math.pow(safeLambda, safeGoals) /
+    factorial
+  );
+}
+
+function buildTeamGoalsProbabilities(xg) {
+  const lambda = Number(xg);
+
+  if (!Number.isFinite(lambda) || lambda < 0) {
+    return null;
+  }
+
+  const p0 = poissonProbabilityExactGoals(lambda, 0);
+  const p1 = poissonProbabilityExactGoals(lambda, 1);
+
+  if (!Number.isFinite(p0) || !Number.isFinite(p1)) {
+    return null;
+  }
+
+  const percent = (value) =>
+    Number(
+      Math.max(0, Math.min(100, value * 100)).toFixed(2)
+    );
+
+  return {
+    over05: percent(1 - p0),
+    over15: percent(1 - p0 - p1),
+    under05: percent(p0),
+    under15: percent(p0 + p1),
+    xg: Number(lambda.toFixed(3)),
+  };
+}
+
 function buildAutomaticStudioSnapshot(
   prediction
 ) {
@@ -16763,6 +16922,98 @@ function buildAutomaticStudioSnapshot(
     );
   }
 
+  const homeTeamGoals =
+    buildTeamGoalsProbabilities(
+      prediction.official_xg_home
+    );
+
+  const awayTeamGoals =
+    buildTeamGoalsProbabilities(
+      prediction.official_xg_away
+    );
+
+  if (homeTeamGoals) {
+    markets.push(
+      buildAutomaticStudioMarket({
+        key: "HOME_OVER_0_5",
+        label: `${homeName} marque +0,5 but`,
+        family: "team_goals",
+        probability: homeTeamGoals.over05,
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      }),
+      buildAutomaticStudioMarket({
+        key: "HOME_OVER_1_5",
+        label: `${homeName} marque +1,5 but`,
+        family: "team_goals",
+        probability: homeTeamGoals.over15,
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      }),
+      buildAutomaticStudioMarket({
+        key: "HOME_UNDER_0_5",
+        label: `${homeName} marque -0,5 but`,
+        family: "team_goals",
+        probability: homeTeamGoals.under05,
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      }),
+      buildAutomaticStudioMarket({
+        key: "HOME_UNDER_1_5",
+        label: `${homeName} marque -1,5 but`,
+        family: "team_goals",
+        probability: homeTeamGoals.under15,
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      })
+    );
+  }
+
+  if (awayTeamGoals) {
+    markets.push(
+      buildAutomaticStudioMarket({
+        key: "AWAY_OVER_0_5",
+        label: `${awayName} marque +0,5 but`,
+        family: "team_goals",
+        probability: awayTeamGoals.over05,
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      }),
+      buildAutomaticStudioMarket({
+        key: "AWAY_OVER_1_5",
+        label: `${awayName} marque +1,5 but`,
+        family: "team_goals",
+        probability: awayTeamGoals.over15,
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      }),
+      buildAutomaticStudioMarket({
+        key: "AWAY_UNDER_0_5",
+        label: `${awayName} marque -0,5 but`,
+        family: "team_goals",
+        probability: awayTeamGoals.under05,
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      }),
+      buildAutomaticStudioMarket({
+        key: "AWAY_UNDER_1_5",
+        label: `${awayName} marque -1,5 but`,
+        family: "team_goals",
+        probability: awayTeamGoals.under15,
+        selectedOutcome,
+        prediction,
+        monteCarloModel,
+      })
+    );
+  }
+
   const sortedMarkets =
     [...markets].sort(
       (a, b) => {
@@ -16843,6 +17094,12 @@ function buildAutomaticStudioSnapshot(
       null,
 
     monteCarloModel,
+
+    teamGoalsModel: {
+      source: "poisson-from-official-xg-v1",
+      home: homeTeamGoals,
+      away: awayTeamGoals,
+    },
 
     decisionTrace:
       Array.isArray(
@@ -16929,6 +17186,12 @@ async function rebuildAutomaticStudioSnapshot(
           home_probability,
           draw_probability,
           away_probability,
+
+          official_xg_home,
+          official_xg_away,
+          xg_source,
+          xg_confidence_score,
+          xg_confidence_level,
 
           fair_odd,
           market_odd,
@@ -22741,6 +23004,16 @@ function normalizeManualOddsMarketKey(value = "") {
   }
   if (["BTTS_NO", "NO_BTTS"].includes(key)) return "BTTS_NO";
 
+  if (["HOME_OVER_0_5", "HOME_OVER05", "HOME_O05"].includes(key)) return "HOME_OVER_0_5";
+  if (["HOME_OVER_1_5", "HOME_OVER15", "HOME_O15"].includes(key)) return "HOME_OVER_1_5";
+  if (["HOME_UNDER_0_5", "HOME_UNDER05", "HOME_U05"].includes(key)) return "HOME_UNDER_0_5";
+  if (["HOME_UNDER_1_5", "HOME_UNDER15", "HOME_U15"].includes(key)) return "HOME_UNDER_1_5";
+
+  if (["AWAY_OVER_0_5", "AWAY_OVER05", "AWAY_O05"].includes(key)) return "AWAY_OVER_0_5";
+  if (["AWAY_OVER_1_5", "AWAY_OVER15", "AWAY_O15"].includes(key)) return "AWAY_OVER_1_5";
+  if (["AWAY_UNDER_0_5", "AWAY_UNDER05", "AWAY_U05"].includes(key)) return "AWAY_UNDER_0_5";
+  if (["AWAY_UNDER_1_5", "AWAY_UNDER15", "AWAY_U15"].includes(key)) return "AWAY_UNDER_1_5";
+
   return key;
 }
 
@@ -22774,6 +23047,15 @@ function evaluateManualOddsMarketResult({
   if (key === "UNDER25") return home + away <= 2;
   if (key === "BTTS_YES") return home > 0 && away > 0;
   if (key === "BTTS_NO") return home === 0 || away === 0;
+
+  if (key === "HOME_OVER_0_5") return home >= 1;
+  if (key === "HOME_OVER_1_5") return home >= 2;
+  if (key === "HOME_UNDER_0_5") return home === 0;
+  if (key === "HOME_UNDER_1_5") return home <= 1;
+  if (key === "AWAY_OVER_0_5") return away >= 1;
+  if (key === "AWAY_OVER_1_5") return away >= 2;
+  if (key === "AWAY_UNDER_0_5") return away === 0;
+  if (key === "AWAY_UNDER_1_5") return away <= 1;
 
   return null;
 }
@@ -25234,6 +25516,15 @@ function statisticsNormalizeMarketKey(
     return "BTTS_NO";
   }
 
+  if (["HOMEOVER05", "HOMEOVER0_5", "HOMEO05"].includes(key)) return "HOME_OVER_0_5";
+  if (["HOMEOVER15", "HOMEOVER1_5", "HOMEO15"].includes(key)) return "HOME_OVER_1_5";
+  if (["HOMEUNDER05", "HOMEUNDER0_5", "HOMEU05"].includes(key)) return "HOME_UNDER_0_5";
+  if (["HOMEUNDER15", "HOMEUNDER1_5", "HOMEU15"].includes(key)) return "HOME_UNDER_1_5";
+  if (["AWAYOVER05", "AWAYOVER0_5", "AWAYO05"].includes(key)) return "AWAY_OVER_0_5";
+  if (["AWAYOVER15", "AWAYOVER1_5", "AWAYO15"].includes(key)) return "AWAY_OVER_1_5";
+  if (["AWAYUNDER05", "AWAYUNDER0_5", "AWAYU05"].includes(key)) return "AWAY_UNDER_0_5";
+  if (["AWAYUNDER15", "AWAYUNDER1_5", "AWAYU15"].includes(key)) return "AWAY_UNDER_1_5";
+
   return key || "UNKNOWN";
 }
 
@@ -25267,6 +25558,23 @@ function statisticsMarketLabel(
 
     BTTS_NO:
       "Les deux équipes ne marquent pas",
+
+    HOME_OVER_0_5:
+      "Domicile +0,5 but",
+    HOME_OVER_1_5:
+      "Domicile +1,5 but",
+    HOME_UNDER_0_5:
+      "Domicile -0,5 but",
+    HOME_UNDER_1_5:
+      "Domicile -1,5 but",
+    AWAY_OVER_0_5:
+      "Extérieur +0,5 but",
+    AWAY_OVER_1_5:
+      "Extérieur +1,5 but",
+    AWAY_UNDER_0_5:
+      "Extérieur -0,5 but",
+    AWAY_UNDER_1_5:
+      "Extérieur -1,5 but",
   };
 
   return (
@@ -28458,6 +28766,15 @@ function detailedBilanNormalizeMarketKey(value = "") {
   if (["OVER25", "OVER250", "PLUS25"].includes(compact)) return "OVER25";
   if (["UNDER25", "UNDER250", "MOINS25"].includes(compact)) return "UNDER25";
 
+  if (["HOMEOVER05", "HOMEO05"].includes(compact)) return "HOME_OVER_0_5";
+  if (["HOMEOVER15", "HOMEO15"].includes(compact)) return "HOME_OVER_1_5";
+  if (["HOMEUNDER05", "HOMEU05"].includes(compact)) return "HOME_UNDER_0_5";
+  if (["HOMEUNDER15", "HOMEU15"].includes(compact)) return "HOME_UNDER_1_5";
+  if (["AWAYOVER05", "AWAYO05"].includes(compact)) return "AWAY_OVER_0_5";
+  if (["AWAYOVER15", "AWAYO15"].includes(compact)) return "AWAY_OVER_1_5";
+  if (["AWAYUNDER05", "AWAYU05"].includes(compact)) return "AWAY_UNDER_0_5";
+  if (["AWAYUNDER15", "AWAYU15"].includes(compact)) return "AWAY_UNDER_1_5";
+
   return compact || null;
 }
 
@@ -28471,6 +28788,14 @@ function detailedBilanMarketLabel(key, fallback = null) {
       BTTS_NO: "Les deux équipes ne marquent pas",
       OVER25: "Plus de 2,5 buts",
       UNDER25: "Moins de 2,5 buts",
+      HOME_OVER_0_5: "Domicile +0,5 but",
+      HOME_OVER_1_5: "Domicile +1,5 but",
+      HOME_UNDER_0_5: "Domicile -0,5 but",
+      HOME_UNDER_1_5: "Domicile -1,5 but",
+      AWAY_OVER_0_5: "Extérieur +0,5 but",
+      AWAY_OVER_1_5: "Extérieur +1,5 but",
+      AWAY_UNDER_0_5: "Extérieur -0,5 but",
+      AWAY_UNDER_1_5: "Extérieur -1,5 but",
     }[key] ||
     fallback ||
     key ||
@@ -28494,6 +28819,14 @@ function detailedBilanEvaluateMarket(marketKey, homeGoals, awayGoals) {
   if (key === "BTTS_NO") return home === 0 || away === 0;
   if (key === "OVER25") return home + away >= 3;
   if (key === "UNDER25") return home + away <= 2;
+  if (key === "HOME_OVER_0_5") return home >= 1;
+  if (key === "HOME_OVER_1_5") return home >= 2;
+  if (key === "HOME_UNDER_0_5") return home === 0;
+  if (key === "HOME_UNDER_1_5") return home <= 1;
+  if (key === "AWAY_OVER_0_5") return away >= 1;
+  if (key === "AWAY_OVER_1_5") return away >= 2;
+  if (key === "AWAY_UNDER_0_5") return away === 0;
+  if (key === "AWAY_UNDER_1_5") return away <= 1;
 
   return null;
 }
