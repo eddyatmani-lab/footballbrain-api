@@ -18199,6 +18199,146 @@ app.get(
 );
 
 /*
+ * ============================================================
+ * ADMIN — REBUILD FORCÉ DES MATCHS À VENIR
+ * ============================================================
+ *
+ * À placer APRÈS runAutomaticStudioScheduler(...)
+ * et idéalement juste après la route :
+ * /internal/run-studio-scheduler
+ *
+ * Le traitement est lancé en arrière-plan afin d'éviter
+ * le timeout HTTP pendant un rebuild de nombreux matchs.
+ */
+app.post(
+  "/internal/admin/brainstudio/rebuild-upcoming",
+  async (req, res) => {
+    if (
+      !requireOptionalAdminKey(
+        req,
+        res
+      )
+    ) {
+      return;
+    }
+
+    if (studioSchedulerRunning) {
+      return res
+        .status(409)
+        .json({
+          ok: false,
+          running: true,
+          code:
+            "STUDIO_SCHEDULER_ALREADY_RUNNING",
+          error:
+            "Une reconstruction Brain Studio est déjà en cours.",
+        });
+    }
+
+    const requestedHours =
+      Number(
+        req.body?.hours
+      );
+
+    const requestedLimit =
+      Number(
+        req.body?.limit
+      );
+
+    const hours =
+      Math.max(
+        1,
+        Math.min(
+          24,
+          Number.isFinite(
+            requestedHours
+          )
+            ? requestedHours
+            : 24
+        )
+      );
+
+    const limit =
+      Math.max(
+        1,
+        Math.min(
+          100,
+          Number.isFinite(
+            requestedLimit
+          )
+            ? requestedLimit
+            : 100
+        )
+      );
+
+    /*
+     * Ne pas await :
+     * Railway poursuit le cycle après la réponse HTTP.
+     */
+    runAutomaticStudioScheduler({
+      source:
+        "admin-team-goals-rebuild",
+
+      force: true,
+
+      lookaheadHours:
+        hours,
+
+      refreshMinutes:
+        STUDIO_SCHEDULER_REFRESH_MINUTES,
+
+      limit,
+    }).catch((error) => {
+      console.error(
+        "ERREUR REBUILD ADMIN MATCHS À VENIR :",
+        error
+      );
+    });
+
+    return res
+      .status(202)
+      .json({
+        ok: true,
+        started: true,
+        running: true,
+        hours,
+        limit,
+        message:
+          "Reconstruction Brain Studio lancée en arrière-plan.",
+      });
+  }
+);
+
+app.get(
+  "/internal/admin/brainstudio/rebuild-upcoming-status",
+  async (req, res) => {
+    if (
+      !requireOptionalAdminKey(
+        req,
+        res
+      )
+    ) {
+      return;
+    }
+
+    return res.json({
+      ok: true,
+
+      running:
+        studioSchedulerRunning,
+
+      lastStartedAt:
+        studioSchedulerLastStartedAt,
+
+      lastFinishedAt:
+        studioSchedulerLastFinishedAt,
+
+      summary:
+        studioSchedulerLastSummary,
+    });
+  }
+);
+/*
  * Route de surveillance du scheduler.
  */
 app.get(
