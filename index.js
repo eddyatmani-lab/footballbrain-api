@@ -16122,7 +16122,38 @@ function buildAutomaticStudioMarket({
       .trim()
       .toLowerCase();
 
+  const isTeamGoalsMarket =
+    String(family || "")
+      .trim()
+      .toLowerCase() === "team_goals";
+
+  const upperMarketKey =
+    String(key || "")
+      .trim()
+      .toUpperCase();
+
+  const teamGoalsSide =
+    upperMarketKey.startsWith("HOME_")
+      ? "home"
+      : upperMarketKey.startsWith("AWAY_")
+        ? "away"
+        : null;
+
+  const teamGoalsXg =
+    teamGoalsSide === "home"
+      ? Number(
+          monteCarloModel?.inputs?.xgHome ??
+          prediction?.official_xg_home
+        )
+      : teamGoalsSide === "away"
+        ? Number(
+            monteCarloModel?.inputs?.xgAway ??
+            prediction?.official_xg_away
+          )
+        : null;
+
   const isSelectedOutcome =
+    !isTeamGoalsMarket &&
     normalizedKey ===
     String(
       selectedOutcome || ""
@@ -16180,7 +16211,7 @@ const manualOddAvailable =
 const marketOdd =
   manualOddAvailable
     ? manualMarketOdd
-    : isSelectedOutcome
+    : !isTeamGoalsMarket && isSelectedOutcome
       ? prediction.market_odd ??
         prediction.marketOdd ??
         null
@@ -16194,22 +16225,82 @@ const bookmakerSource =
       ? "API bookmaker"
       : null;
 
-  const value =
-    isSelectedOutcome
-      ? prediction.value_percentage ??
-        prediction.value ??
-        null
+  const calculatedTeamGoalsValue =
+    isTeamGoalsMarket &&
+    marketOdd != null &&
+    Number.isFinite(Number(marketOdd)) &&
+    Number(marketOdd) > 1 &&
+    normalizedProbability > 0
+      ? Number(
+          (
+            (normalizedProbability / 100) *
+              Number(marketOdd) *
+              100 -
+            100
+          ).toFixed(2)
+        )
       : null;
 
+  const value =
+    isTeamGoalsMarket
+      ? calculatedTeamGoalsValue
+      : isSelectedOutcome
+        ? prediction.value_percentage ??
+          prediction.value ??
+          null
+        : null;
+
+  const teamGoalsValueBet =
+    isTeamGoalsMarket &&
+    manualOddAvailable &&
+    Number.isFinite(value) &&
+    value > 0;
+
   const decisionType =
-    isRecommended
-      ? normalizedBetStatus
-      : "NO_BET";
+    isTeamGoalsMarket
+      ? teamGoalsValueBet
+        ? "VALUE_BET"
+        : "NO_BET"
+      : isRecommended
+        ? normalizedBetStatus
+        : "NO_BET";
+
+  const effectiveRecommended =
+    isTeamGoalsMarket
+      ? teamGoalsValueBet
+      : isRecommended;
 
   const decisionGrade =
     getStudioDecisionGrade(
       decisionScore
     );
+
+  const teamGoalsReasons =
+    isTeamGoalsMarket
+      ? [
+          `Marché évalué : ${label}`,
+          `Probabilité Team Goals : ${normalizedProbability}%`,
+          Number.isFinite(teamGoalsXg)
+            ? `xG ${teamGoalsSide === "home" ? "domicile" : "extérieur"} : ${teamGoalsXg.toFixed(3)}`
+            : "xG équipe indisponible",
+          fairOdd != null
+            ? `Cote juste : ${fairOdd}`
+            : "Cote juste indisponible",
+          marketOdd != null
+            ? `Cote marché : ${Number(marketOdd).toFixed(2)}`
+            : "Aucune cote bookmaker spécifique à ce marché",
+          value != null
+            ? `Expected Value : ${Number(value).toFixed(2)}%`
+            : "Expected Value non calculée sans cote spécifique",
+          teamGoalsValueBet
+            ? "Décision Team Goals : VALUE_BET"
+            : "Décision Team Goals : NO_BET",
+        ]
+      : Array.isArray(
+          prediction.decision_trace
+        )
+        ? prediction.decision_trace
+        : [];
 
   return {
     key,
@@ -16341,35 +16432,32 @@ bookmakerOddUpdatedAt:
         decisionType,
 
       label:
-        isRecommended
-          ? prediction.decision ||
-            label
+        effectiveRecommended
+          ? isTeamGoalsMarket
+            ? `Value détectée · ${label}`
+            : prediction.decision || label
           : "Aucun pari recommandé",
 
       shortLabel:
-        isRecommended
+        effectiveRecommended
           ? "Recommandé"
           : "À éviter",
 
       recommendationStrength:
-        isRecommended
+        effectiveRecommended
           ? "strong"
           : "none",
 
       eligibleForPrudentTicket:
-        isRecommended &&
+        effectiveRecommended &&
         confidence >= 70 &&
         riskScore <= 50,
 
       eligibleForFunTicket:
-        isRecommended,
+        effectiveRecommended,
 
       reasons:
-        Array.isArray(
-          prediction.decision_trace
-        )
-          ? prediction.decision_trace
-          : [],
+        teamGoalsReasons,
 
       warnings:
         decisionType === "NO_BET"
@@ -16380,68 +16468,89 @@ bookmakerOddUpdatedAt:
 
       marketConsensus: {
         score:
-          confidence,
+          isTeamGoalsMarket
+            ? decisionScore
+            : confidence,
 
         alignedVotes:
-          isRecommended ? 3 : 1,
+          isTeamGoalsMarket
+            ? [
+                normalizedProbability >= 50,
+                Number.isFinite(teamGoalsXg),
+                riskScore <= 50,
+              ].filter(Boolean).length
+            : effectiveRecommended
+              ? 3
+              : 1,
 
-        totalVotes: 4,
+        totalVotes: 3,
 
-        votes: [
-          {
-            engine:
-              "Railway Probability",
-
-            aligned:
-              isSelectedOutcome,
-
-            strength:
-              normalizedProbability,
-
-            reason:
-              `Probabilité estimée : ${normalizedProbability}%`,
-          },
-
-          {
-            engine:
-              "Monte Carlo",
-
-            aligned:
-              Boolean(
-                monteCarloModel
-                  ?.simulations
-              ),
-
-            strength:
-              monteCarloModel
-                ?.simulations
-                ? 100
-                : 0,
-
-            reason:
-              monteCarloModel
-                ?.simulations
-                ? `${monteCarloModel.simulations} simulations`
-                : "Monte Carlo indisponible",
-          },
-
-          {
-            engine:
-              "Risk Engine",
-
-            aligned:
-              riskScore <= 50,
-
-            strength:
-              100 - riskScore,
-
-            reason:
-              `Risque : ${
-                prediction.risk ||
-                "inconnu"
-              }`,
-          },
-        ],
+        votes:
+          isTeamGoalsMarket
+            ? [
+                {
+                  engine: "Team Goals Probability",
+                  aligned:
+                    normalizedProbability >= 50,
+                  strength:
+                    normalizedProbability,
+                  reason:
+                    `Probabilité du marché : ${normalizedProbability}%`,
+                },
+                {
+                  engine: "xG Model",
+                  aligned:
+                    Number.isFinite(teamGoalsXg),
+                  strength:
+                    Number.isFinite(teamGoalsXg)
+                      ? Math.min(100, Math.round(teamGoalsXg * 50))
+                      : 0,
+                  reason:
+                    Number.isFinite(teamGoalsXg)
+                      ? `xG équipe : ${teamGoalsXg.toFixed(3)}`
+                      : "xG équipe indisponible",
+                },
+                {
+                  engine: "Risk Engine",
+                  aligned:
+                    riskScore <= 50,
+                  strength:
+                    100 - riskScore,
+                  reason:
+                    `Risque : ${prediction.risk || "inconnu"}`,
+                },
+              ]
+            : [
+                {
+                  engine: "Railway Probability",
+                  aligned:
+                    isSelectedOutcome,
+                  strength:
+                    normalizedProbability,
+                  reason:
+                    `Probabilité estimée : ${normalizedProbability}%`,
+                },
+                {
+                  engine: "Monte Carlo",
+                  aligned:
+                    Boolean(monteCarloModel?.simulations),
+                  strength:
+                    monteCarloModel?.simulations ? 100 : 0,
+                  reason:
+                    monteCarloModel?.simulations
+                      ? `${monteCarloModel.simulations} simulations`
+                      : "Monte Carlo indisponible",
+                },
+                {
+                  engine: "Risk Engine",
+                  aligned:
+                    riskScore <= 50,
+                  strength:
+                    100 - riskScore,
+                  reason:
+                    `Risque : ${prediction.risk || "inconnu"}`,
+                },
+              ],
       },
     },
 
